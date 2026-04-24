@@ -600,7 +600,7 @@ class ProwlarrClient:
             api_key: Prowlarr API key (from PROWLARR_API_KEY env var)
             base_url: Prowlarr base URL (default: http://prowlarr-ingest:9696)
         """
-        self.api_key = api_key or os.environ.get("PROWLARR_API_KEY", "")
+        self.api_key = api_key or get_env().get("PROWLARR_API_KEY", "")
         self.base_url = base_url.rstrip("/")
         
         self.client = httpx.Client(
@@ -756,7 +756,7 @@ class JackettClient:
             api_key: Jackett API key (from JACKETT_API_KEY env var)
             base_url: Jackett base URL (default: http://localhost:9117)
         """
-        self.api_key = api_key or os.environ.get("JACKETT_API_KEY", "")
+        self.api_key = api_key or get_env().get("JACKETT_API_KEY", "")
         self.base_url = base_url.rstrip("/")
         
         self.client = httpx.Client(
@@ -1347,8 +1347,6 @@ def migrate_db():
             # VULN-008: Create timestamped backup before migration
             backup_path = DB_PATH.parent / f"torboxed.db.backup.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             try:
-                # Ensure DB is committed before backup
-                conn.execute("COMMIT")
                 shutil.copy2(DB_PATH, backup_path)
                 logger.info("Created database backup: %s", backup_path)
             except (OSError, shutil.Error) as e:
@@ -3670,6 +3668,13 @@ class SyncEngine:
             True if hash exists in account, False otherwise
         """
         return bool(torrent_hash and torrent_hash.lower() in self.account_hashes)
+
+    @staticmethod
+    def _display_title(title: str, content_type: str, season_key: str = "unknown") -> str:
+        """Build display title with optional season suffix."""
+        if content_type == "show" and season_key != "unknown":
+            return f"{title} ({season_key})"
+        return title
     
     def should_filter(self, item: Dict[str, Any]) -> Tuple[bool, str]:
         """Check if item passes filters.
@@ -3689,6 +3694,23 @@ class SyncEngine:
                 return True, f"excluded keyword: {keyword}"
 
         return False, ""
+
+    def _get_filter_config(self) -> Tuple[List[str], int]:
+        """Get excluded sources and min resolution score from config."""
+        excluded_sources = self.config.get("filters", {}).get("exclude", ["CAM", "TS", "HDCAM"])
+        min_resolution_score = self.config.get("filters", {}).get("min_resolution_score", 800)
+        return excluded_sources, min_resolution_score
+
+    def _get_searcher_list(self) -> str:
+        """Build a human-readable list of configured searchers."""
+        searchers = []
+        if self.torbox.searcher_zilean.is_configured():
+            searchers.append("Zilean")
+        if self.torbox.searcher_prowlarr.is_configured():
+            searchers.append("Prowlarr")
+        if self.torbox.searcher_jackett.is_configured():
+            searchers.append("Jackett")
+        return " → ".join(searchers) if searchers else "none configured"
     
     def process_content(self, content: Dict[str, Any], existing_torrents: Dict[str, str]) -> bool:
         """Process a single content item (add or upgrade).
@@ -3758,18 +3780,9 @@ class SyncEngine:
         
         # Search for cached content
         search_query = normalize_search_query(f"{title} {year}" if year else title)
-        # Build list of configured searchers for logging
-        searchers = []
-        if self.torbox.searcher_zilean.is_configured():
-            searchers.append("Zilean")
-        if self.torbox.searcher_prowlarr.is_configured():
-            searchers.append("Prowlarr")
-        if self.torbox.searcher_jackett.is_configured():
-            searchers.append("Jackett")
-        logger.info("Searching indexers for: %s (using: %s)", search_query, 
-                   " → ".join(searchers) if searchers else "none configured")
-        excluded_sources = self.config.get("filters", {}).get("exclude", ["CAM", "TS", "HDCAM"])
-        min_resolution_score = self.config.get("filters", {}).get("min_resolution_score", 800)
+        searcher_list = self._get_searcher_list()
+        logger.info("Searching indexers for: %s (using: %s)", search_query, searcher_list)
+        excluded_sources, min_resolution_score = self._get_filter_config()
         cached = self.torbox.get_cached_torrents(search_query, "movie", excluded_sources, min_resolution_score, imdb_id)
         
         if not cached:
@@ -3816,18 +3829,9 @@ class SyncEngine:
         
         # Search for cached content
         search_query = normalize_search_query(f"{title} {year}" if year else title)
-        # Build list of configured searchers for logging
-        searchers = []
-        if self.torbox.searcher_zilean.is_configured():
-            searchers.append("Zilean")
-        if self.torbox.searcher_prowlarr.is_configured():
-            searchers.append("Prowlarr")
-        if self.torbox.searcher_jackett.is_configured():
-            searchers.append("Jackett")
-        logger.info("Searching indexers for show: %s (using: %s)", search_query,
-                   " → ".join(searchers) if searchers else "none configured")
-        excluded_sources = self.config.get("filters", {}).get("exclude", ["CAM", "TS", "HDCAM"])
-        min_resolution_score = self.config.get("filters", {}).get("min_resolution_score", 800)
+        searcher_list = self._get_searcher_list()
+        logger.info("Searching indexers for show: %s (using: %s)", search_query, searcher_list)
+        excluded_sources, min_resolution_score = self._get_filter_config()
         cached = self.torbox.get_cached_torrents(search_query, "show", excluded_sources, min_resolution_score, imdb_id)
         
         if not cached:
@@ -3980,6 +3984,27 @@ class SyncEngine:
         if skipped_hashes > 0:
             logger.debug("Skipped %d torrent(s) with hash already in account", skipped_hashes)
         
+        # 4. Resolve conflict: if Complete pack was selected alongside individual
+        #    season packs, pick whichever offers better quality to avoid duplicates.
+        if "Complete" in best_per_season:
+            other_keys = [k for k in best_per_season if k != "Complete"]
+            if other_keys:
+                complete_score = best_per_season["Complete"].quality.score
+                # Complete pack covers all seasons, so when it wins,
+                # remove all individual entries (season packs and episodes).
+                season_pack_keys = [k for k in other_keys if re.match(r'^S\d{2}$', k)]
+                if season_pack_keys:
+                    if any(best_per_season[k].quality.score > complete_score
+                           for k in season_pack_keys):
+                        del best_per_season["Complete"]
+                        logger.debug("Preferring individual season packs over lower-quality "
+                                    "complete pack (score: %d)", complete_score)
+                    else:
+                        for k in other_keys:
+                            del best_per_season[k]
+                        logger.debug("Complete pack (score: %d) preferred over individual "
+                                    "season packs", complete_score)
+        
         logger.info("Selected %d torrents: %s", 
                    len(best_per_season), 
                    ", ".join(f"{k}({v.quality.score})" for k, v in best_per_season.items()))
@@ -4032,7 +4057,7 @@ class SyncEngine:
         
         # Check if torrent hash already exists in account (manual add or discovery miss)
         if self._is_hash_in_account(torrent.hash):
-            display_title = f"{title} ({season_key})"
+            display_title = self._display_title(title, "show", season_key)
             logger.info("Already in Torbox: %s (hash match)", display_title)
             log_result("skipped", display_title, {"reason": "already_in_torbox_by_hash", "hash": torrent.hash[:16] if torrent.hash else "unknown"})
             record_processed(imdb_id, title, year, "show", "skipped",
@@ -4054,7 +4079,7 @@ class SyncEngine:
         # Get the torrent to try at current index
         if torrent_index >= len(cached):
             # Exhausted all torrents
-            display_title = f"{title} ({season_key})" if content_type == "show" and season_key != "unknown" else title
+            display_title = self._display_title(title, content_type, season_key)
             logger.error("All %d torrent(s) failed to add for: %s", len(cached), display_title)
             record_processed(imdb_id, title, year, content_type, "failed",
                            "all_torrents_failed", season=season_key)
@@ -4062,7 +4087,7 @@ class SyncEngine:
             return False
 
         torrent = cached[torrent_index]
-        display_title = f"{title} ({season_key})" if content_type == "show" and season_key != "unknown" else title
+        display_title = self._display_title(title, content_type, season_key)
         
         # DUPLICATE PREVENTION: Check if this hash already exists in account
         # This catches torrents that weren't matched during discovery (e.g., database records cleared)
@@ -4088,6 +4113,9 @@ class SyncEngine:
             return False
 
         if new_id:
+            # Track hash in account set to prevent re-adding same hash this run
+            if torrent.hash:
+                self.account_hashes.add(torrent.hash.lower())
             record_processed(
                 imdb_id, title, year, content_type, "added", "success",
                 torbox_id=new_id, magnet=torrent.magnet,
@@ -4127,7 +4155,7 @@ class SyncEngine:
         Tries each torrent in order until one succeeds. If all fail,
         keeps the existing torrent.
         """
-        display_title = f"{title} ({season_key})" if content_type == "show" and season_key != "unknown" else title
+        display_title = self._display_title(title, content_type, season_key)
         current_score = existing.get("quality_score") or 0
         old_id = existing.get("torbox_id")
 
@@ -4181,6 +4209,10 @@ class SyncEngine:
             logger.debug("Removed old torrent: %s", old_id)
         else:
             logger.warning("Failed to remove old torrent: %s (but new one is added)", old_id)
+
+        # Track new hash in account set to prevent re-adding same hash this run
+        if torrent.hash:
+            self.account_hashes.add(torrent.hash.lower())
 
         # Record successful upgrade
         record_processed(
@@ -4714,19 +4746,25 @@ Persistent=true
 WantedBy=timers.target
 """
     
-    logger.info("\nSystemd service file (/etc/systemd/system/%s.service):", service_name)
+    # Write files to /tmp so install instructions are actionable
+    service_path = Path(f"/tmp/{service_name}.service")
+    timer_path = Path(f"/tmp/{service_name}.timer")
+    service_path.write_text(service_content)
+    timer_path.write_text(timer_content)
+    
+    logger.info("\nSystemd service file: %s", service_path)
     logger.info("-"*60)
-    print(service_content)
+    logger.info(service_content.strip())
     logger.info("-"*60)
     
-    logger.info("\nSystemd timer file (/etc/systemd/system/%s.timer):", service_name)
+    logger.info("\nSystemd timer file: %s", timer_path)
     logger.info("-"*60)
-    print(timer_content)
+    logger.info(timer_content.strip())
     logger.info("-"*60)
     
     logger.info("\nTo install:")
-    logger.info("  sudo cp /tmp/%s.service /etc/systemd/system/", service_name)
-    logger.info("  sudo cp /tmp/%s.timer /etc/systemd/system/", service_name)
+    logger.info("  sudo cp %s /etc/systemd/system/", service_path)
+    logger.info("  sudo cp %s /etc/systemd/system/", timer_path)
     logger.info("  sudo systemctl daemon-reload")
     logger.info("  sudo systemctl enable %s.timer", service_name)
     logger.info("  sudo systemctl start %s.timer", service_name)

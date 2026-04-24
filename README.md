@@ -304,6 +304,15 @@ MIT License - use it, modify it, share it freely!
 
 ## 📝 Recent Updates
 
+### 2026-04-24: Bug Fixes & Code Quality
+- **Fixed:** Prowlarr/Jackett API key loading now uses `.env` file (was bypassing lazy loader)
+- **Fixed:** systemd timer setup now writes service files to `/tmp` for install commands
+- **Fixed:** Torrent hash tracking during sync to prevent re-adding same hash within a run
+- **Improved:** Extracted `_display_title()`, `_get_filter_config()`, `_get_searcher_list()` helpers to eliminate code duplication
+- **Improved:** Fixed misleading comment in season conflict resolution logic
+- **Improved:** Removed unnecessary `COMMIT` in database migration
+- **Total Tests:** 182 passing
+
 ### 2026-04-23: Bug Fixes & Code Quality
 - **Fixed:** Empty infohash handling - torrents without valid hashes are now properly filtered out before attempting to add to Torbox
 - **Improved:** All bare `except Exception` clauses converted to specific exception types for better error handling
@@ -311,7 +320,7 @@ MIT License - use it, modify it, share it freely!
 - **Improved:** Code structure - subprocess imports moved to top of file
 - **Added:** Comprehensive test coverage for `check_cached` method (7 new tests)
 - **Added:** Complete test suite for retry/backoff logic (8 new tests)
-- **Total Tests:** 171 passing
+- **Total Tests:** 182 passing
 
 ---
 

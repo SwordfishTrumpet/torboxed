@@ -1444,20 +1444,15 @@ class TestMultiSeasonSync(unittest.TestCase):
         # Group by season
         seasons_map, skip_reason = self.engine._group_by_season(torrents)
         
-        # Should have 3 unique seasons: S01, S02, Complete
-        self.assertEqual(len(seasons_map), 3)
+        # Complete pack (score 3400) and individual packs (also 3400) conflict:
+        # since no individual pack has higher quality, Complete wins.
+        self.assertEqual(len(seasons_map), 1)
         
-        # S01 should have the 1080p version
-        self.assertIn("S01", seasons_map)
-        self.assertEqual(seasons_map["S01"].magnet, "magnet:s01")
-        
-        # S02 should have the 1080p version (higher quality)
-        self.assertIn("S02", seasons_map)
-        self.assertEqual(seasons_map["S02"].magnet, "magnet:s02")
-        self.assertEqual(seasons_map["S02"].quality.resolution, "1080p")
-        
-        # Complete should be present
         self.assertIn("Complete", seasons_map)
+        self.assertEqual(seasons_map["Complete"].magnet, "magnet:complete")
+        
+        self.assertNotIn("S01", seasons_map)
+        self.assertNotIn("S02", seasons_map)
     
     def test_process_show_adds_all_seasons(self):
         """Test that processing a show adds all available seasons."""
@@ -1740,21 +1735,81 @@ class TestMultiSeasonSync(unittest.TestCase):
         
         seasons_map, skip_reason = engine._group_by_season(torrents)
         
-        # Should have Complete pack (priority 1)
+        # Complete pack (score 3400) and individual packs (also 3400) conflict:
+        # since no individual pack has higher quality, Complete wins.
+        # All individual entries are removed since Complete covers the entire show.
         self.assertIn("Complete", seasons_map)
         self.assertEqual(seasons_map["Complete"].magnet, "magnet:complete")
         
-        # Should also have S02 pack (no conflict with Complete, different seasons)
-        self.assertIn("S02", seasons_map)
-        self.assertEqual(seasons_map["S02"].magnet, "magnet:s02")
-        
-        # S01 pack should be used, NOT individual episodes
-        self.assertIn("S01", seasons_map)
-        self.assertEqual(seasons_map["S01"].magnet, "magnet:s01-pack")
-        
-        # Episodes should NOT be in result (S01 pack exists)
+        self.assertNotIn("S02", seasons_map)
+        self.assertNotIn("S01", seasons_map)
         self.assertNotIn("S01E01", seasons_map)
         self.assertNotIn("S01E02", seasons_map)
+    
+    def test_complete_pack_loses_to_higher_quality_individual_packs(self):
+        """Test that a low-quality Complete pack is removed when individual
+        season packs have higher quality (the The Boys bug scenario)."""
+        import torboxed
+        from torboxed import TorrentResult, QualityInfo, SeasonInfo
+        
+        # Complete pack: 720p (score 2900)
+        # Individual packs: 2160p (score 5500)
+        torrents = [
+            TorrentResult(
+                name="Show.Complete.720p.WEB-DL",
+                magnet="magnet:complete-720p",
+                availability=True,
+                size=5000,
+                quality=QualityInfo(resolution="720p", score=2900),
+                season_info=SeasonInfo(seasons=[1], is_complete=True,
+                                       season_label="Complete", is_pack=True)
+            ),
+            TorrentResult(
+                name="Show.S01.2160p.WEB-DL",
+                magnet="magnet:s01-2160p",
+                availability=True,
+                size=2000,
+                quality=QualityInfo(resolution="2160p", score=5500),
+                season_info=SeasonInfo(seasons=[1], is_complete=False,
+                                       season_label="S01", is_pack=True)
+            ),
+            TorrentResult(
+                name="Show.S02.2160p.WEB-DL",
+                magnet="magnet:s02-2160p",
+                availability=True,
+                size=2000,
+                quality=QualityInfo(resolution="2160p", score=5500),
+                season_info=SeasonInfo(seasons=[2], is_complete=False,
+                                       season_label="S02", is_pack=True)
+            ),
+            TorrentResult(
+                name="Show.S05E01.1080p.WEB-DL",
+                magnet="magnet:e05",
+                availability=True,
+                size=500,
+                quality=QualityInfo(resolution="1080p", score=4000),
+                season_info=SeasonInfo(seasons=[5], is_complete=False,
+                                       season_label="S05E01", is_pack=False, episode=1)
+            ),
+        ]
+        
+        from unittest.mock import Mock
+        engine = torboxed.SyncEngine(Mock(), Mock(), {"sources": [], "filters": {}})
+        
+        seasons_map, skip_reason = engine._group_by_season(torrents)
+        
+        # Individual packs (score 5500) beat Complete (score 2900) →
+        # Complete should be removed, individual packs + episodes kept.
+        self.assertNotIn("Complete", seasons_map,
+                        "Complete pack should be removed when individual packs have higher quality")
+        self.assertIn("S01", seasons_map)
+        self.assertEqual(seasons_map["S01"].magnet, "magnet:s01-2160p")
+        self.assertIn("S02", seasons_map)
+        self.assertEqual(seasons_map["S02"].magnet, "magnet:s02-2160p")
+        # Episode for S05 should remain (no season pack for S05, gap-filler)
+        self.assertIn("S05E01", seasons_map)
+        self.assertEqual(seasons_map["S05E01"].magnet, "magnet:e05")
+        self.assertEqual(len(seasons_map), 3)
     
     def test_episodes_only_when_no_pack(self):
         """Test that episodes are used only when no season pack available."""
