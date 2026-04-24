@@ -1,0 +1,32 @@
+[project]
+name = "torboxed"
+version = "1.0.0"
+description = "Sync Trakt.tv curated movies/shows to Torbox with intelligent quality-based auto-upgrades"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = [
+    "httpx>=0.24.0",
+    "guessit>=3.7.0",
+    "python-dotenv>=1.2.1",
+]
+
+[project.optional-dependencies]
+zilean = [
+    "psycopg[binary]>=3.1.0",
+]
+
+[project.scripts]
+torboxed = "torboxed:main"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.4.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]

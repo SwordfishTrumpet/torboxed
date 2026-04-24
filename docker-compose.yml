@@ -1,0 +1,41 @@
+services:
+  # ===========================================================================
+  # TorBoxed - Main sync service
+  # ===========================================================================
+  # Quick Start:
+  # 1. Create .env file with your API keys
+  # 2. Run: docker-compose up --build
+  # 3. For automated sync, uncomment the schedule below
+  #
+  torboxed:
+    build: .
+    container_name: torboxed
+    volumes:
+      - ./data:/data
+      # Mount your .env file (create it first!)
+      - ./.env:/data/.env:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Optional: Zilean database connection
+      # - ZILEAN_DATABASE_URL=postgresql://zilean:zilean_password@zilean-db:5432/zilean
+    # For one-shot runs (manual sync):
+    command: ["--verbose"]  # Add sources to limit what gets synced
+    
+    # For scheduled automated syncing (runs daily at 2 AM):
+    # Uncomment the following lines to enable cron-like scheduling:
+    # command: ["--verbose"]
+    # restart: unless-stopped
+    # labels:
+    #   - "ofelia.enabled=true"
+    #   - "ofelia.job-run.torboxed.schedule=0 0 2 * * *"
+    #   - "ofelia.job-run.torboxed.container=torboxed"
+    
+    networks:
+      - torboxed-network
+      - zilean-network
+
+networks:
+  torboxed-network:
+    driver: bridge
+  zilean-network:
+    external: true
