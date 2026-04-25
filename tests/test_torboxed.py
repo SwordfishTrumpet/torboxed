@@ -17,6 +17,7 @@ from torboxed import (
     load_env, parse_quality, is_better_quality, QualityInfo,
     RESOLUTION_SCORES, SOURCE_SCORES, CODEC_SCORES, AUDIO_SCORES,
     RateLimiter, get_db, init_db, DB_PATH, SyncEngine, TorboxClient,
+    RealDebridClient,
     get_torbox_key, get_trakt_id, get_env, _env_cache,
     run_self_test, show_cron_status, discover_existing_torrents,
     is_max_quality, MAX_QUALITY_SCORE, parse_season_info, SeasonInfo,
@@ -3783,6 +3784,150 @@ class TestCheckCached(unittest.TestCase):
         # abc123 should be False (None value), def456 should be True
         self.assertFalse(result["abc123"])
         self.assertTrue(result["def456"])
+
+
+class TestRealDebridClient(unittest.TestCase):
+    """Test RealDebridClient implementing DebridClient interface."""
+
+    def setUp(self):
+        """Set up mock Real Debrid client."""
+        from torboxed import RealDebridClient
+        self.client = RealDebridClient.__new__(RealDebridClient)
+        self.client.api_key = "test-rd-key"
+        # Mock the rate limiters
+        self.client._limiter = MagicMock()
+        self.client._creation_limiter = MagicMock()
+
+    @patch.object(RealDebridClient, '_request')
+    def test_check_cached_empty_hashes(self, mock_request):
+        """Test check_cached with empty hash list returns empty dict."""
+        result = self.client.check_cached([])
+        
+        self.assertEqual(result, {})
+        mock_request.assert_not_called()
+
+    @patch.object(RealDebridClient, '_request')
+    def test_check_cached_with_cached_torrents(self, mock_request):
+        """Test check_cached returns True for cached torrents."""
+        mock_request.return_value = {
+            "abc123": {"rd": [{"filename": "file1.mkv", "filesize": 1000}]},
+            "def456": {"rd": [{"filename": "file2.mkv", "filesize": 2000}]},
+            "ghi789": {}  # Not cached - no 'rd' key with content
+        }
+        
+        result = self.client.check_cached(["abc123", "def456", "ghi789"])
+        
+        # Should mark abc123 and def456 as cached, ghi789 as not cached
+        self.assertTrue(result["abc123"])
+        self.assertTrue(result["def456"])
+        self.assertFalse(result["ghi789"])
+
+    @patch.object(RealDebridClient, '_request')
+    def test_check_cached_all_not_cached(self, mock_request):
+        """Test check_cached returns False when nothing is cached."""
+        mock_request.return_value = {
+            "abc123": {},
+            "def456": {}
+        }
+        
+        result = self.client.check_cached(["abc123", "def456"])
+        
+        # All hashes should be False (no 'rd' content)
+        self.assertFalse(result["abc123"])
+        self.assertFalse(result["def456"])
+
+    @patch.object(RealDebridClient, '_request')
+    def test_check_cached_case_insensitive(self, mock_request):
+        """Test check_cached handles hash case insensitively."""
+        mock_request.return_value = {
+            "abc123": {"rd": [{"filename": "file1.mkv"}]}
+        }
+        
+        result = self.client.check_cached(["ABC123"])
+        
+        # Should match regardless of case
+        self.assertTrue(result["abc123"])
+
+    @patch.object(RealDebridClient, '_request')
+    def test_check_cached_api_error(self, mock_request):
+        """Test check_cached handles API error gracefully."""
+        mock_request.return_value = None
+        
+        result = self.client.check_cached(["abc123"])
+        
+        # Should return all False on error
+        self.assertFalse(result["abc123"])
+
+    @patch.object(RealDebridClient, '_request')
+    def test_get_my_torrents_normalizes_filename(self, mock_request):
+        """Test get_my_torrents normalizes 'filename' to 'name'."""
+        mock_request.return_value = [
+            {"id": "1", "filename": "Movie.2024.mkv", "hash": "abc123"},
+            {"id": "2", "filename": "Show.S01.mkv", "hash": "def456"}
+        ]
+        
+        result = self.client.get_my_torrents()
+        
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result), 2)
+        # Should have normalized 'filename' to 'name'
+        self.assertEqual(result[0]["name"], "Movie.2024.mkv")
+        self.assertEqual(result[1]["name"], "Show.S01.mkv")
+        # Original filename should still exist
+        self.assertEqual(result[0]["filename"], "Movie.2024.mkv")
+
+    @patch.object(RealDebridClient, '_request')
+    def test_add_torrent_success(self, mock_request):
+        """Test add_torrent returns ID on success."""
+        mock_request.return_value = {"id": "rd12345"}
+        
+        magnet = "magnet:?xt=urn:btih:abc123&dn=Test.Movie"
+        result = self.client.add_torrent(magnet, "Test Movie")
+        
+        self.assertEqual(result, "rd12345")
+        mock_request.assert_called_once()
+        call_args = mock_request.call_args
+        self.assertEqual(call_args[0][0], "POST")  # method
+        self.assertEqual(call_args[0][1], "/torrents/addMagnet")  # path
+        self.assertTrue(call_args[1]["use_creation_limiter"])  # Should use creation limiter
+
+    @patch.object(RealDebridClient, '_request')
+    def test_add_torrent_invalid_magnet(self, mock_request):
+        """Test add_torrent returns None for invalid magnet."""
+        result = self.client.add_torrent("not-a-magnet", "Bad Magnet")
+        
+        self.assertIsNone(result)
+        mock_request.assert_not_called()
+
+    @patch.object(RealDebridClient, '_request')
+    def test_add_torrent_no_id_in_response(self, mock_request):
+        """Test add_torrent returns None when no ID in response."""
+        mock_request.return_value = {"status": "ok"}  # No 'id' field
+        
+        magnet = "magnet:?xt=urn:btih:abc123&dn=Test.Movie"
+        result = self.client.add_torrent(magnet, "Test Movie")
+        
+        self.assertIsNone(result)
+
+    @patch.object(RealDebridClient, '_request')
+    def test_remove_torrent_success(self, mock_request):
+        """Test remove_torrent returns True on success (204 No Content)."""
+        mock_request.return_value = None  # 204 No Content
+        
+        result = self.client.remove_torrent("rd12345")
+        
+        self.assertTrue(result)
+        mock_request.assert_called_once_with("DELETE", "/torrents/delete/rd12345")
+
+    @patch.object(RealDebridClient, '_request')
+    def test_remove_torrent_failure(self, mock_request):
+        """Test remove_torrent returns False on API error."""
+        from torboxed import APIError
+        mock_request.side_effect = APIError("API Error", status_code=500)
+        
+        result = self.client.remove_torrent("rd12345")
+        
+        self.assertFalse(result)
 
 
 class TestMakeRequestWithBackoff(unittest.TestCase):
