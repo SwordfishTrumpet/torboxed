@@ -4192,8 +4192,8 @@ class TestCleanupNoSysExit(unittest.TestCase):
     """Test that cleanup_unmatched_torrents doesn't call sys.exit."""
     
     @patch.dict('os.environ', {}, clear=True)
-    @patch('torboxed.get_torbox_key', return_value=None)
-    def test_returns_gracefully_without_api_key(self, mock_get_key):
+    @patch('torboxed.create_debrid_client', return_value=None)
+    def test_returns_gracefully_without_api_key(self, mock_create_client):
         import torboxed
         result = torboxed.cleanup_unmatched_torrents()
         self.assertIsNone(result)
