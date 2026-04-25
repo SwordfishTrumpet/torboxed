@@ -4034,23 +4034,30 @@ class SyncEngine:
                     logger.debug("Skipped season pack %s - hash already in account", season_key)
         
         # 3. Add individual episodes only if no pack available for that season (lowest priority)
+        # When no season pack is available, collect ALL individual episodes for the season
         for season_num, torrents in episodes.items():
             season_key = f"S{season_num:02d}"
-            # Only add episode if we don't have a season pack for this season
+            # Only add episodes if we don't have a season pack for this season
             if season_key not in best_per_season and torrents:
-                # Find first episode not already in account
+                episodes_added = 0
+                episodes_skipped = 0
+                # Add ALL episodes not already in account (not just the best one)
                 for episode in torrents:
                     if not is_hash_duplicate(episode):
                         # Use episode-specific key (S01E01) instead of season key
                         episode_key = episode.season_info.season_label if episode.season_info else season_key
                         best_per_season[episode_key] = episode
-                        logger.debug("No season pack for %s, using episode: %s (score: %d)",
-                                   season_key, episode.name, episode.quality.score)
-                        break
-                else:
-                    # All episodes are duplicates
-                    skipped_hashes += 1
-                    logger.debug("Skipped episode for %s - hash already in account", season_key)
+                        episodes_added += 1
+                    else:
+                        episodes_skipped += 1
+                
+                if episodes_added > 0:
+                    logger.debug("No season pack for %s, using %d episode(s): best=%s (score: %d)",
+                               season_key, episodes_added, torrents[0].name, torrents[0].quality.score)
+                if episodes_skipped > 0:
+                    skipped_hashes += episodes_skipped
+                    logger.debug("Skipped %d episode(s) for %s - hash already in account", 
+                               episodes_skipped, season_key)
         
         if skipped_hashes > 0:
             logger.debug("Skipped %d torrent(s) with hash already in account", skipped_hashes)
@@ -4110,22 +4117,11 @@ class SyncEngine:
         """
         logger.debug("Processing season %s of %s", season_key, title)
         
-        # Check if this show was already discovered in Torbox (from discovery phase)
-        # This prevents re-adding when only the IMDB ID was matched (not individual seasons)
-        torbox_id = existing_torrents.get(imdb_id)
-        if torbox_id:
-            display_title = self._display_title(title, "show", season_key)
-            logger.info("Already in Torbox: %s (torbox_id: %s)", display_title, torbox_id)
-            record_processed(imdb_id, title, year, "show", "skipped",
-                           "already_in_torbox", torbox_id=torbox_id,
-                           quality_score=torrent.quality.score, season=season_key)
-            self._increment_stats("skipped", "show")
-            return True
-        
-        # Check if this season already processed
+        # FIRST: Check database for this specific season (per-season granularity)
+        # This is the authoritative check - database records are always season-aware
         existing = get_processed_item(imdb_id, season_key)
         
-        # If already have max quality, skip
+        # If already have max quality for this season, skip
         if existing and existing.get("torbox_id"):
             current_score = existing.get("quality_score") or 0
             if is_max_quality(current_score):
@@ -4133,10 +4129,24 @@ class SyncEngine:
                            title, season_key, current_score)
                 return True
         
-        # Check if already in Torbox (database record)
+        # Check if this season is already in Torbox (database record with upgrade potential)
         if existing and existing.get("torbox_id"):
             # For upgrades, pass a single-item list since we only check the best one
             return self._handle_upgrade(imdb_id, title, year, "show", existing, [torrent], season_key)
+        
+        # SECOND: Check if this show was already discovered in Torbox (from discovery phase)
+        # This handles multi-season packs where discovery found the show but this
+        # specific season doesn't have a database record yet (e.g., newly matched season)
+        torbox_id = existing_torrents.get(imdb_id)
+        if torbox_id and not existing:
+            display_title = self._display_title(title, "show", season_key)
+            logger.info("Already in Torbox: %s (torbox_id: %s, discovered in multi-season pack)", 
+                       display_title, torbox_id)
+            record_processed(imdb_id, title, year, "show", "skipped",
+                           "already_in_torbox", torbox_id=torbox_id,
+                           quality_score=torrent.quality.score, season=season_key)
+            self._increment_stats("skipped", "show")
+            return True
         
         # Check if torrent hash already exists in account (manual add or discovery miss)
         if self._is_hash_in_account(torrent.hash):
