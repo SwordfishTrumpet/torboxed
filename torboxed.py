@@ -3580,7 +3580,7 @@ class RealDebridClient(DebridClient):
 
 
 # ============================================================================
-# TORBOX DISCOVERY
+# DEBRID DISCOVERY
 # ============================================================================
 
 def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Dict[str, str], Set[str]]]:
@@ -3660,13 +3660,13 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
         ).fetchall()
     
     # Build lookup structures
-    db_by_torbox_id = {}  # torbox_id -> (imdb_id, season)
+    db_by_debrid_id = {}  # debrid_id -> (imdb_id, season)
     db_by_title_year = {}  # title:year -> list of (imdb_id, season, content_type)
     
     for row in rows:
         # Direct ID lookup (most reliable)
         if row['torbox_id']:
-            db_by_torbox_id[str(row['torbox_id'])] = (row['imdb_id'], row['season'])
+            db_by_debrid_id[str(row['torbox_id'])] = (row['imdb_id'], row['season'])
         
         # Fallback name lookup - group by title+year to handle multi-season shows
         key = f"{row['title'].lower()}:{row['year']}"
@@ -3674,7 +3674,7 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
             db_by_title_year[key] = []
         db_by_title_year[key].append((row['imdb_id'], row['season'], row['content_type']))
     
-    imdb_to_torbox = {}
+    imdb_to_debrid = {}
     account_hashes = set()  # All hashes in account for duplicate prevention
     id_matches = 0
     name_matches = 0
@@ -3682,22 +3682,22 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
     multi_season_updates = []  # Track multi-season packs that need DB updates
     
     for torrent in my_torrents:
-        torbox_id = str(torrent.get("id", ""))
+        debrid_id = str(torrent.get("id", ""))
         torrent_hash = torrent.get("hash", "").lower()
         
         # Collect all hashes for duplicate prevention (even if matching fails)
         if torrent_hash:
             account_hashes.add(torrent_hash)
         
-        if not torbox_id:
+        if not debrid_id:
             continue
         
         # Method 1: Direct ID matching (most reliable)
-        if torbox_id in db_by_torbox_id:
-            imdb_id, season = db_by_torbox_id[torbox_id]
-            imdb_to_torbox[imdb_id] = torbox_id
+        if debrid_id in db_by_debrid_id:
+            imdb_id, season = db_by_debrid_id[debrid_id]
+            imdb_to_debrid[imdb_id] = debrid_id
             id_matches += 1
-            logger.debug("Matched torrent by ID: Torbox ID %s -> IMDB %s (season: %s)", torbox_id, imdb_id, season)
+            logger.debug("Matched torrent by ID: debrid ID %s -> IMDB %s (season: %s)", debrid_id, imdb_id, season)
             continue
         
         # Method 2: Name matching (fallback with multi-season pack support)
@@ -3757,20 +3757,20 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
                                 multi_season_updates.append({
                                     'imdb_id': show_imdb_id,
                                     'season': show_season,
-                                    'torbox_id': torbox_id,
+                                    'torbox_id': debrid_id,
                                     'title': db_title,
                                     'year': db_year or torrent_year or 0
                                 })
                                 matched_seasons.append(show_season)
                     
                     if matched_seasons:
-                        logger.debug("Multi-season pack '%s' matched to %s: %s (Torbox ID: %s)",
-                                    torrent_name, imdb_id, matched_seasons, torbox_id)
+                        logger.debug("Multi-season pack '%s' matched to %s: %s (debrid ID: %s)",
+                                    torrent_name, imdb_id, matched_seasons, debrid_id)
                 
-                imdb_to_torbox[imdb_id] = torbox_id
+                imdb_to_debrid[imdb_id] = debrid_id
                 name_matches += 1
-                logger.debug("Matched torrent by name '%s' to IMDB %s (Torbox ID: %s)",
-                            torrent_name, imdb_id, torbox_id)
+                logger.debug("Matched torrent by name '%s' to IMDB %s (debrid ID: %s)",
+                            torrent_name, imdb_id, debrid_id)
                 matched = True
                 break
         
@@ -3808,7 +3808,7 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
     
     logger.info("Discovered %d existing torrents in account (ID matches: %d, name matches: %d, multi-season updates: %d, total hashes: %d)",
                total_matches, id_matches, name_matches, len(multi_season_updates), len(account_hashes))
-    return imdb_to_torbox, account_hashes
+    return imdb_to_debrid, account_hashes
 
 
 def verify_and_clear_dropped_torrents(existing_torrents: Optional[Tuple[Dict[str, str], Set[str]]]) -> int:
@@ -3834,12 +3834,12 @@ def verify_and_clear_dropped_torrents(existing_torrents: Optional[Tuple[Dict[str
         return 0
     
     # Unpack the tuple
-    imdb_to_torbox, _ = existing_torrents
+    imdb_to_debrid, _ = existing_torrents
     
     logger.debug("Verifying database records against discovered torrents...")
     
-    # Build set of discovered torbox_ids for fast lookup
-    discovered_ids = set(imdb_to_torbox.values())
+    # Build set of discovered debrid IDs for fast lookup
+    discovered_ids = set(imdb_to_debrid.values())
     
     # SAFETY CHECK: Get total tracked torrents count for comparison
     with get_db() as conn:
@@ -3926,20 +3926,20 @@ def cleanup_unmatched_torrents() -> None:
     
     logger.info("Found %d torrents in debrid account", len(my_torrents))
     
-    # Get all torbox_ids from database
+    # Get all debrid IDs from database
     with get_db() as conn:
         rows = conn.execute("SELECT DISTINCT torbox_id FROM processed WHERE torbox_id IS NOT NULL").fetchall()
     
-    db_torbox_ids = {str(row['torbox_id']) for row in rows}
+    db_debrid_ids = {str(row['torbox_id']) for row in rows}
     logger.info("Database has %d tracked torrents", len(db_torbox_ids))
     
     # Find unmatched torrents
     unmatched = []
     for torrent in my_torrents:
-        torbox_id = str(torrent.get("id", ""))
-        if torbox_id and torbox_id not in db_torbox_ids:
+        debrid_id = str(torrent.get("id", ""))
+        if debrid_id and debrid_id not in db_debrid_ids:
             unmatched.append({
-                'id': torbox_id,
+                'id': debrid_id,
                 'name': torrent.get('name', 'Unknown'),
                 'hash': torrent.get('hash', '')[:16] + '...' if torrent.get('hash') else 'N/A'
             })
@@ -4755,7 +4755,7 @@ class SyncEngine:
             logger.info("Prioritizing %d new + %d incomplete items before %d existing items", 
                        len(new_items), len(incomplete_items), len(existing_items))
         
-        # STEP 3: Discover existing torrents in Torbox (AFTER sorting)
+        # STEP 3: Discover existing torrents in debrid account (AFTER sorting)
         # This prevents re-adding duplicates from previous runs during processing
         discovery_result = discover_existing_torrents(self.debrid)
         
