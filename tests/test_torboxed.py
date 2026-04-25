@@ -4733,3 +4733,125 @@ class TestBuildSearchResult(unittest.TestCase):
         )
         
         self.assertEqual(result["imdbId"], "tt1234567")
+
+
+class TestRealDebridSyncIntegration(unittest.TestCase):
+    """End-to-end test with RealDebridClient in the SyncEngine."""
+
+    def setUp(self):
+        """Set up temp DB and mocked clients."""
+        import torboxed
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.test_db_path = Path(self.temp_dir.name) / "test.db"
+        self.original_db_path = torboxed.DB_PATH
+        torboxed.DB_PATH = self.test_db_path
+        torboxed.init_db()
+
+        self.mock_rd = Mock(spec=torboxed.RealDebridClient)
+        self.mock_rd.searcher_zilean = Mock()
+        self.mock_rd.searcher_zilean.is_configured.return_value = False
+        self.mock_rd.searcher_prowlarr = Mock()
+        self.mock_rd.searcher_prowlarr.is_configured.return_value = False
+        self.mock_rd.searcher_jackett = Mock()
+        self.mock_rd.searcher_jackett.is_configured.return_value = False
+        self.mock_rd.get_cached_torrents.return_value = []
+        self.mock_rd.get_my_torrents.return_value = []
+
+        self.mock_trakt = Mock()
+        self.mock_trakt.get_all_content.return_value = [
+            {"imdb_id": "tt1234567", "title": "Test Movie", "year": 2024,
+             "type": "movie", "source": "movies/trending"}
+        ]
+
+        self.config = {
+            "sources": ["movies/trending"],
+            "limits": {"movies": 10, "shows": 10},
+            "filters": {"exclude": ["CAM", "TS", "HDCAM"]},
+        }
+
+    def tearDown(self):
+        import torboxed
+        torboxed.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+
+    def test_sync_with_real_debrid_no_cached_content(self):
+        """Full sync runs without error when no content is cached."""
+        import torboxed
+
+        engine = torboxed.SyncEngine(self.mock_rd, self.mock_trakt, self.config)
+        engine.sync()
+
+        # Verify discovery was attempted
+        self.mock_rd.get_my_torrents.assert_called()
+        # Verify search was attempted for the movie
+        self.mock_rd.get_cached_torrents.assert_called()
+        # Verify no torrent was added (nothing cached)
+        self.mock_rd.add_torrent.assert_not_called()
+
+    def test_sync_with_real_debrid_adds_cached_movie(self):
+        """Sync adds a cached movie with acceptable quality."""
+        import torboxed
+
+        cached_movie = torboxed.TorrentResult(
+            name="Test Movie 2024 1080p BluRay x264",
+            magnet="magnet:?xt=urn:btih:abcdef123456",
+            availability=True,
+            size=5000000000,
+            quality=torboxed.QualityInfo(
+                resolution="1080p", source="Blu-ray", codec="H.264",
+                audio="Unknown", score=3350, label="1080p Blu-ray H.264"
+            ),
+            hash="abcdef123456",
+        )
+        self.mock_rd.get_cached_torrents.return_value = [cached_movie]
+        self.mock_rd.add_torrent.return_value = "RD_TORRENT_123"
+        self.mock_rd.get_my_torrents.return_value = []
+
+        engine = torboxed.SyncEngine(self.mock_rd, self.mock_trakt, self.config)
+        engine.sync()
+
+        self.mock_rd.add_torrent.assert_called_once()
+
+    def test_sync_with_real_debrid_respects_max_quality(self):
+        """Sync skips content already at max quality."""
+        import torboxed
+
+        torboxed.record_processed(
+            "tt1234567", "Test Movie", 2024, "movie",
+            "added", "success", torbox_id="RD_EXISTING",
+            magnet="magnet:existing",
+            quality_score=7250, quality_label="2160p BluRay HEVC"
+        )
+
+        engine = torboxed.SyncEngine(self.mock_rd, self.mock_trakt, self.config)
+        engine.sync()
+
+        # Should NOT search since max quality is already reached
+        self.mock_rd.get_cached_torrents.assert_not_called()
+
+    def test_sync_handles_rate_limit_on_add(self):
+        """Sync gracefully handles RateLimitError during add_torrent."""
+        import torboxed
+
+        cached_movie = torboxed.TorrentResult(
+            name="Test Movie 2024 2160p BluRay HEVC",
+            magnet="magnet:?xt=urn:btih:rate_limit",
+            availability=True,
+            size=8000000000,
+            quality=torboxed.QualityInfo(
+                resolution="2160p", source="Blu-ray", codec="HEVC",
+                audio="Atmos", score=7250, label="2160p Blu-ray HEVC"
+            ),
+            hash="rate_limit",
+        )
+        self.mock_rd.get_cached_torrents.return_value = [cached_movie]
+        self.mock_rd.add_torrent.side_effect = torboxed.RateLimitError(
+            "rate limited", status_code=429
+        )
+
+        engine = torboxed.SyncEngine(self.mock_rd, self.mock_trakt, self.config)
+        engine.sync()
+
+        # Should have attempted to add, but rate limit prevented it
+        self.mock_rd.add_torrent.assert_called()
+        # Should NOT have crashed — RateLimitError is caught by caller
