@@ -3462,7 +3462,7 @@ class RealDebridClient(DebridClient):
         """
         all_torrents: List[Dict[str, Any]] = []
         page = 1
-        limit = 100  # RD default/limit per page
+        limit = 5000  # RD max per page (reduces API calls for large libraries)
 
         try:
             while True:
