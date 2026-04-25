@@ -415,8 +415,8 @@ class TestTorboxExcludedSources(unittest.TestCase):
     def setUp(self):
         """Set up mock Torbox client."""
         from torboxed import TorboxClient
-        self.mock_torbox = MagicMock(spec=TorboxClient)
-        self.mock_torbox.api_key = "test-key"
+        self.mock_debrid = MagicMock(spec=TorboxClient)
+        self.mock_debrid.api_key = "test-key"
     
     def test_default_excluded_sources(self):
         """Test that default excluded sources are CAM, TS, HDCAM."""
@@ -429,7 +429,7 @@ class TestTorboxExcludedSources(unittest.TestCase):
         bluray_item = {"title": "Movie.2024.1080p.BluRay.x264", "availability": True, "magnet": "magnet:bluray"}
         
         # Mock search_torrents to return all items
-        self.mock_torbox.search_torrents.return_value = [cam_item, ts_item, hdcam_item, bluray_item]
+        self.mock_debrid.search_torrents.return_value = [cam_item, ts_item, hdcam_item, bluray_item]
         
         # Create a real TorboxClient but mock the search method
         client = TorboxClient.__new__(TorboxClient)
@@ -501,7 +501,7 @@ class TestSyncEngine(unittest.TestCase):
         init_db()
         
         # Create mock clients
-        self.mock_torbox = Mock()
+        self.mock_debrid = Mock()
         self.mock_trakt = Mock()
         
         # Create SyncEngine with mock clients
@@ -510,7 +510,7 @@ class TestSyncEngine(unittest.TestCase):
             "limits": {"movies": 10, "shows": 10},
             "filters": {"min_year": 2000, "exclude": ["CAM", "TS", "HDCAM"]}
         }
-        self.engine = torboxed.SyncEngine(self.mock_torbox, self.mock_trakt, self.config)
+        self.engine = torboxed.SyncEngine(self.mock_debrid, self.mock_trakt, self.config)
     
     def tearDown(self):
         """Clean up test fixtures."""
@@ -538,11 +538,11 @@ class TestSyncEngine(unittest.TestCase):
         mock_torrent.quality.score = 4000
         mock_torrent.quality.label = "2160p BluRay"
         
-        self.mock_torbox.get_cached_torrents.return_value = [mock_torrent]
+        self.mock_debrid.get_cached_torrents.return_value = [mock_torrent]
         
         # Set up add_torrent to succeed
-        self.mock_torbox.add_torrent.return_value = "new-torrent-id"
-        self.mock_torbox.remove_torrent.return_value = True
+        self.mock_debrid.add_torrent.return_value = "new-torrent-id"
+        self.mock_debrid.remove_torrent.return_value = True
         
         # Process the content
         content = {
@@ -559,7 +559,7 @@ class TestSyncEngine(unittest.TestCase):
         
         # Verify add_torrent was called before remove_torrent
         # (order of calls matters for safety)
-        calls = self.mock_torbox.method_calls
+        calls = self.mock_debrid.method_calls
         add_call_idx = None
         remove_call_idx = None
         
@@ -595,10 +595,10 @@ class TestSyncEngine(unittest.TestCase):
         mock_torrent.quality.score = 4000
         mock_torrent.quality.label = "2160p BluRay"
         
-        self.mock_torbox.get_cached_torrents.return_value = [mock_torrent]
+        self.mock_debrid.get_cached_torrents.return_value = [mock_torrent]
         
         # Set up add_torrent to FAIL
-        self.mock_torbox.add_torrent.return_value = None
+        self.mock_debrid.add_torrent.return_value = None
         
         # Process the content
         content = {
@@ -614,7 +614,7 @@ class TestSyncEngine(unittest.TestCase):
         self.assertFalse(result)
         
         # Verify remove_torrent was NEVER called (old content preserved)
-        self.mock_torbox.remove_torrent.assert_not_called()
+        self.mock_debrid.remove_torrent.assert_not_called()
         
         # Verify failed record was created
         processed = torboxed.get_processed_item("tt7654321")
@@ -733,8 +733,8 @@ class TestTorboxAPIEndpoints(unittest.TestCase):
             
             # Create a SyncEngine with mocked TorboxClient
             engine = SyncEngine.__new__(SyncEngine)
-            mock_torbox = Mock()
-            engine.torbox = mock_torbox
+            mock_debrid = Mock()
+            engine.debrid = mock_debrid
             engine.config = {"filters": {"exclude": ["CAM", "TS", "HDCAM"], "min_resolution_score": 800}}
             engine.telegram = Mock()
             engine.telegram.is_configured.return_value = False
@@ -748,11 +748,11 @@ class TestTorboxAPIEndpoints(unittest.TestCase):
                 quality=QualityInfo(resolution="1080p", source="Blu-ray", codec="H.265", score=4400),
                 season_info=SeasonInfo(seasons=[1], is_complete=False, season_label="S01", is_pack=True)
             )
-            mock_torbox.get_cached_torrents.return_value = [mock_torrent]
+            mock_debrid.get_cached_torrents.return_value = [mock_torrent]
             
             # Mock successful add and remove
-            mock_torbox.add_torrent.return_value = "new-s01-id"
-            mock_torbox.remove_torrent.return_value = True
+            mock_debrid.add_torrent.return_value = "new-s01-id"
+            mock_debrid.remove_torrent.return_value = True
             
             # Process S01 upgrade
             result = engine._process_season(
@@ -764,10 +764,10 @@ class TestTorboxAPIEndpoints(unittest.TestCase):
             self.assertTrue(result)
             
             # Verify add_torrent was called
-            mock_torbox.add_torrent.assert_called_once()
+            mock_debrid.add_torrent.assert_called_once()
             
             # Verify remove_torrent was called with the old torrent ID
-            mock_torbox.remove_torrent.assert_called_once_with("22845381")
+            mock_debrid.remove_torrent.assert_called_once_with("22845381")
             
             # Verify the processed record shows upgraded
             s01_record = torboxed.get_processed_item("tt0098936", "S01")
@@ -856,7 +856,7 @@ class TestWordBoundaryFiltering(unittest.TestCase):
         torboxed.init_db()
 
         # Create mock clients
-        self.mock_torbox = Mock()
+        self.mock_debrid = Mock()
         self.mock_trakt = Mock()
 
         # Create SyncEngine with mock clients and filters
@@ -865,7 +865,7 @@ class TestWordBoundaryFiltering(unittest.TestCase):
             "limits": {"movies": 10, "shows": 10},
             "filters": {"min_year": 2000, "exclude": ["CAM", "TS", "HDCAM"]}
         }
-        self.engine = torboxed.SyncEngine(self.mock_torbox, self.mock_trakt, self.config)
+        self.engine = torboxed.SyncEngine(self.mock_debrid, self.mock_trakt, self.config)
 
     def tearDown(self):
         """Clean up test fixtures."""
@@ -1167,7 +1167,7 @@ class TestDiscoverExistingTorrents(unittest.TestCase):
         torboxed.init_db()
         
         # Create mock Torbox client
-        self.mock_torbox = Mock()
+        self.mock_debrid = Mock()
         
     def tearDown(self):
         """Clean up test fixtures."""
@@ -1187,7 +1187,7 @@ class TestDiscoverExistingTorrents(unittest.TestCase):
         )
         
         # Mock Torbox returning a torrent that should match
-        self.mock_torbox.get_my_torrents.return_value = [
+        self.mock_debrid.get_my_torrents.return_value = [
             {
                 "id": "tb-id-123",
                 "name": "Test.Movie.2024.1080p.BluRay.x264",
@@ -1196,7 +1196,7 @@ class TestDiscoverExistingTorrents(unittest.TestCase):
         ]
         
         # Run discovery
-        result = torboxed.discover_existing_torrents(self.mock_torbox)
+        result = torboxed.discover_existing_torrents(self.mock_debrid)
         
         # Should return tuple of (imdb_to_torbox, account_hashes)
         self.assertIsInstance(result, tuple)
@@ -1220,7 +1220,7 @@ class TestDiscoverExistingTorrents(unittest.TestCase):
         )
         
         # Mock Torbox returning a torrent with different name
-        self.mock_torbox.get_my_torrents.return_value = [
+        self.mock_debrid.get_my_torrents.return_value = [
             {
                 "id": "tb-id-456",
                 "name": "Unrelated.Movie.2024.1080p.BluRay.x264",
@@ -1229,7 +1229,7 @@ class TestDiscoverExistingTorrents(unittest.TestCase):
         ]
         
         # Run discovery
-        result = torboxed.discover_existing_torrents(self.mock_torbox)
+        result = torboxed.discover_existing_torrents(self.mock_debrid)
         
         # Should return tuple with empty dict and set of hashes
         self.assertIsInstance(result, tuple)
@@ -1243,10 +1243,10 @@ class TestDiscoverExistingTorrents(unittest.TestCase):
         import torboxed
         
         # Mock Torbox returning no torrents
-        self.mock_torbox.get_my_torrents.return_value = []
+        self.mock_debrid.get_my_torrents.return_value = []
         
         # Run discovery
-        result = torboxed.discover_existing_torrents(self.mock_torbox)
+        result = torboxed.discover_existing_torrents(self.mock_debrid)
         
         # Should return tuple of empty dict and empty set
         self.assertIsInstance(result, tuple)
@@ -1259,11 +1259,11 @@ class TestDiscoverExistingTorrents(unittest.TestCase):
         import torboxed
         
         # Create a mock torbox client that captures the search query
-        mock_torbox = Mock()
-        mock_torbox.get_cached_torrents.return_value = []
+        mock_debrid = Mock()
+        mock_debrid.get_cached_torrents.return_value = []
         
         # Create SyncEngine with mock
-        engine = torboxed.SyncEngine(mock_torbox, Mock(), {
+        engine = torboxed.SyncEngine(mock_debrid, Mock(), {
             "sources": [],
             "filters": {"exclude": ["CAM", "TS"]}
         })
@@ -1283,8 +1283,8 @@ class TestDiscoverExistingTorrents(unittest.TestCase):
         engine.process_content(content, existing_torrents)
         
         # Verify search was called with title AND year
-        mock_torbox.get_cached_torrents.assert_called_once()
-        call_args = mock_torbox.get_cached_torrents.call_args
+        mock_debrid.get_cached_torrents.assert_called_once()
+        call_args = mock_debrid.get_cached_torrents.call_args
         search_query = call_args[0][0]  # First positional argument
         
         # Should include both title and year
@@ -1308,7 +1308,7 @@ class TestMaxQuality(unittest.TestCase):
         torboxed.init_db()
         
         # Create mock clients
-        self.mock_torbox = Mock()
+        self.mock_debrid = Mock()
         self.mock_trakt = Mock()
         
         # Create SyncEngine with mock clients
@@ -1317,7 +1317,7 @@ class TestMaxQuality(unittest.TestCase):
             "limits": {"movies": 10, "shows": 10},
             "filters": {"min_year": 2000, "exclude": ["CAM", "TS", "HDCAM"]}
         }
-        self.engine = torboxed.SyncEngine(self.mock_torbox, self.mock_trakt, self.config)
+        self.engine = torboxed.SyncEngine(self.mock_debrid, self.mock_trakt, self.config)
         
     def tearDown(self):
         """Clean up test fixtures."""
@@ -1351,7 +1351,7 @@ class TestMaxQuality(unittest.TestCase):
         self.assertTrue(result)
         
         # Verify get_cached_torrents was NOT called (search skipped)
-        self.mock_torbox.get_cached_torrents.assert_not_called()
+        self.mock_debrid.get_cached_torrents.assert_not_called()
     
     def test_search_when_not_max_quality(self):
         """Test that search IS performed when quality is not max."""
@@ -1365,7 +1365,7 @@ class TestMaxQuality(unittest.TestCase):
         )
         
         # Mock search to return no results (so it completes quickly)
-        self.mock_torbox.get_cached_torrents.return_value = []
+        self.mock_debrid.get_cached_torrents.return_value = []
         
         # Process this content
         content = {
@@ -1379,7 +1379,7 @@ class TestMaxQuality(unittest.TestCase):
         result = self.engine.process_content(content, existing_torrents)
         
         # Search SHOULD have been called (quality not max)
-        self.mock_torbox.get_cached_torrents.assert_called_once()
+        self.mock_debrid.get_cached_torrents.assert_called_once()
     
     def test_is_max_quality_threshold(self):
         """Test the is_max_quality function with various scores."""
@@ -1493,7 +1493,7 @@ class TestMultiSeasonSync(unittest.TestCase):
         torboxed.init_db()
         
         # Create mock clients
-        self.mock_torbox = Mock()
+        self.mock_debrid = Mock()
         self.mock_trakt = Mock()
         
         # Create SyncEngine with mock clients
@@ -1502,7 +1502,7 @@ class TestMultiSeasonSync(unittest.TestCase):
             "limits": {"movies": 10, "shows": 10},
             "filters": {"min_year": 2000, "exclude": ["CAM", "TS", "HDCAM"]}
         }
-        self.engine = torboxed.SyncEngine(self.mock_torbox, self.mock_trakt, self.config)
+        self.engine = torboxed.SyncEngine(self.mock_debrid, self.mock_trakt, self.config)
         
     def tearDown(self):
         """Clean up test fixtures."""
@@ -1596,8 +1596,8 @@ class TestMultiSeasonSync(unittest.TestCase):
             ),
         ]
         
-        self.mock_torbox.get_cached_torrents.return_value = mock_torrents
-        self.mock_torbox.add_torrent.side_effect = ["id-s01", "id-s02", "id-s03"]
+        self.mock_debrid.get_cached_torrents.return_value = mock_torrents
+        self.mock_debrid.add_torrent.side_effect = ["id-s01", "id-s02", "id-s03"]
         
         # Process the show
         content = {
@@ -1614,7 +1614,7 @@ class TestMultiSeasonSync(unittest.TestCase):
         self.assertTrue(result)
         
         # Verify add_torrent was called 3 times (once per season)
-        self.assertEqual(self.mock_torbox.add_torrent.call_count, 3)
+        self.assertEqual(self.mock_debrid.add_torrent.call_count, 3)
         
         # Verify all seasons were recorded
         s01_record = torboxed.get_processed_item("tt1234567", "S01")
@@ -1660,8 +1660,8 @@ class TestMultiSeasonSync(unittest.TestCase):
             ),
         ]
         
-        self.mock_torbox.get_cached_torrents.return_value = mock_torrents
-        self.mock_torbox.add_torrent.return_value = "id-s02"
+        self.mock_debrid.get_cached_torrents.return_value = mock_torrents
+        self.mock_debrid.add_torrent.return_value = "id-s02"
         
         # Process the show
         content = {
@@ -1678,7 +1678,7 @@ class TestMultiSeasonSync(unittest.TestCase):
         self.assertTrue(result)
         
         # add_torrent should only be called once (for S02, not S01)
-        self.assertEqual(self.mock_torbox.add_torrent.call_count, 1)
+        self.assertEqual(self.mock_debrid.add_torrent.call_count, 1)
         
         # S01 record should show 'skipped' with current_better 
         # (we checked it but same quality available, so not upgraded)
@@ -1727,9 +1727,9 @@ class TestMultiSeasonSync(unittest.TestCase):
             ),
         ]
         
-        self.mock_torbox.get_cached_torrents.return_value = mock_torrents
-        self.mock_torbox.add_torrent.return_value = "new-s01-id"
-        self.mock_torbox.remove_torrent.return_value = True
+        self.mock_debrid.get_cached_torrents.return_value = mock_torrents
+        self.mock_debrid.add_torrent.return_value = "new-s01-id"
+        self.mock_debrid.remove_torrent.return_value = True
         
         # Process the show
         content = {
@@ -1743,8 +1743,8 @@ class TestMultiSeasonSync(unittest.TestCase):
         result = self.engine.process_content(content, existing_torrents)
         
         # S01 should be upgraded (add + remove)
-        self.mock_torbox.add_torrent.assert_called_once()
-        self.mock_torbox.remove_torrent.assert_called_once_with("existing-s01")
+        self.mock_debrid.add_torrent.assert_called_once()
+        self.mock_debrid.remove_torrent.assert_called_once_with("existing-s01")
         
         # S01 record should show upgraded
         s01_record = torboxed.get_processed_item("tt9999999", "S01")
@@ -4236,9 +4236,9 @@ class TestProcessSeasonWithExistingTorrents(unittest.TestCase):
         torboxed.DB_PATH = self.test_db_path
         torboxed.init_db()
         
-        mock_torbox = Mock()
+        mock_debrid = Mock()
         mock_trakt = Mock()
-        self.engine = torboxed.SyncEngine(mock_torbox, mock_trakt, {
+        self.engine = torboxed.SyncEngine(mock_debrid, mock_trakt, {
             "sources": ["shows/trending"],
             "filters": {"exclude": ["CAM", "TS", "HDCAM"], "min_resolution_score": 800}
         })
@@ -4285,7 +4285,7 @@ class TestProcessSeasonWithExistingTorrents(unittest.TestCase):
             season_info=SeasonInfo(seasons=[1], is_complete=False, season_label="S01", is_pack=True)
         )
         
-        self.engine.torbox.add_torrent.return_value = "new-tb-id"
+        self.engine.debrid.add_torrent.return_value = "new-tb-id"
         
         result = self.engine._process_season(
             "tt9999999", "New Show", 2024, "S01",
@@ -4310,9 +4310,9 @@ class TestHandleNewAdditionFallback(unittest.TestCase):
         torboxed.DB_PATH = self.test_db_path
         torboxed.init_db()
         
-        mock_torbox = Mock()
+        mock_debrid = Mock()
         mock_trakt = Mock()
-        self.engine = torboxed.SyncEngine(mock_torbox, mock_trakt, {
+        self.engine = torboxed.SyncEngine(mock_debrid, mock_trakt, {
             "sources": ["movies/trending"],
             "filters": {"exclude": ["CAM", "TS", "HDCAM"], "min_resolution_score": 800}
         })
@@ -4338,14 +4338,14 @@ class TestHandleNewAdditionFallback(unittest.TestCase):
         )
         cached = [first_torrent, second_torrent]
         
-        self.engine.torbox.add_torrent.side_effect = [None, "new-id-from-fallback"]
+        self.engine.debrid.add_torrent.side_effect = [None, "new-id-from-fallback"]
         
         result = self.engine._handle_new_addition("tt1234567", "Movie", 2024, "movie", cached, 0)
         
         self.assertTrue(result)
-        self.assertEqual(self.engine.torbox.add_torrent.call_count, 2)
-        self.engine.torbox.add_torrent.assert_any_call("magnet:first", "Movie.2024.1080p.BluRay.x264")
-        self.engine.torbox.add_torrent.assert_any_call("magnet:second", "Movie.2024.1080p.WEB-DL.x264")
+        self.assertEqual(self.engine.debrid.add_torrent.call_count, 2)
+        self.engine.debrid.add_torrent.assert_any_call("magnet:first", "Movie.2024.1080p.BluRay.x264")
+        self.engine.debrid.add_torrent.assert_any_call("magnet:second", "Movie.2024.1080p.WEB-DL.x264")
         
         processed = torboxed.get_processed_item("tt1234567")
         self.assertEqual(processed["action"], "added")
@@ -4362,7 +4362,7 @@ class TestHandleNewAdditionFallback(unittest.TestCase):
         )
         cached = [torrent]
         
-        self.engine.torbox.add_torrent.return_value = None
+        self.engine.debrid.add_torrent.return_value = None
         
         result = self.engine._handle_new_addition("tt7654321", "Movie", 2024, "movie", cached, 0)
         
@@ -4468,37 +4468,37 @@ class TestGetSearcherList(unittest.TestCase):
     """TEST-016: _get_searcher_list helper method."""
     
     def test_all_configured(self):
-        mock_torbox = Mock()
-        mock_torbox.searcher_zilean.is_configured.return_value = True
-        mock_torbox.searcher_prowlarr.is_configured.return_value = True
-        mock_torbox.searcher_jackett.is_configured.return_value = True
+        mock_debrid = Mock()
+        mock_debrid.searcher_zilean.is_configured.return_value = True
+        mock_debrid.searcher_prowlarr.is_configured.return_value = True
+        mock_debrid.searcher_jackett.is_configured.return_value = True
         
         engine = SyncEngine.__new__(SyncEngine)
-        engine.torbox = mock_torbox
+        engine.debrid = mock_debrid
         
         result = engine._get_searcher_list()
         self.assertEqual(result, "Zilean → Prowlarr → Jackett")
     
     def test_none_configured(self):
-        mock_torbox = Mock()
-        mock_torbox.searcher_zilean.is_configured.return_value = False
-        mock_torbox.searcher_prowlarr.is_configured.return_value = False
-        mock_torbox.searcher_jackett.is_configured.return_value = False
+        mock_debrid = Mock()
+        mock_debrid.searcher_zilean.is_configured.return_value = False
+        mock_debrid.searcher_prowlarr.is_configured.return_value = False
+        mock_debrid.searcher_jackett.is_configured.return_value = False
         
         engine = SyncEngine.__new__(SyncEngine)
-        engine.torbox = mock_torbox
+        engine.debrid = mock_debrid
         
         result = engine._get_searcher_list()
         self.assertEqual(result, "none configured")
     
     def test_only_zilean(self):
-        mock_torbox = Mock()
-        mock_torbox.searcher_zilean.is_configured.return_value = True
-        mock_torbox.searcher_prowlarr.is_configured.return_value = False
-        mock_torbox.searcher_jackett.is_configured.return_value = False
+        mock_debrid = Mock()
+        mock_debrid.searcher_zilean.is_configured.return_value = True
+        mock_debrid.searcher_prowlarr.is_configured.return_value = False
+        mock_debrid.searcher_jackett.is_configured.return_value = False
         
         engine = SyncEngine.__new__(SyncEngine)
-        engine.torbox = mock_torbox
+        engine.debrid = mock_debrid
         
         result = engine._get_searcher_list()
         self.assertEqual(result, "Zilean")
