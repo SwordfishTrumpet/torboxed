@@ -101,6 +101,7 @@ MAX_LOG_BACKUPS = 3
 # API Endpoints
 TRAKT_BASE_URL = "https://api.trakt.tv"
 TORBOX_BASE_URL = "https://api.torbox.app"
+REAL_DEBRID_BASE_URL = "https://api.real-debrid.com/rest/1.0"
 
 # Rate limiting config
 # Torbox general endpoints: 300/min per API key
@@ -108,6 +109,8 @@ TORBOX_BASE_URL = "https://api.torbox.app"
 # BUG-R4 FIX: Increased from 60.0 to 65.0 to be safer and prevent max retries exceeded
 TORBOX_RATE_LIMIT = 0.2        # 5 req/sec for general endpoints (300/min)
 TORBOX_CREATION_LIMIT = 65.0   # 1 req/min for createtorrent endpoint (65s to be safe)
+REAL_DEBRID_RATE_LIMIT = 1.0         # 1 req/sec (conservative, no public limit documented)
+REAL_DEBRID_CREATION_LIMIT = 65.0     # 1 req/min for addMagnet endpoint
 TRAKT_RATE_LIMIT = 0.6         # ~1.67 requests per second (conservative for Trakt)
 
 # HTTP Timeouts (seconds)
@@ -3272,6 +3275,258 @@ class TorboxClient(DebridClient):
                 logger.warning("Failed to remove torrent %s (API returned failure)", torrent_id)
             return success
         except (APIError, APIResponseError) as e:
+            logger.error("Error removing torrent %s: %s", torrent_id, e)
+            return False
+
+
+# ============================================================================
+# REAL DEBRID CLIENT
+# ============================================================================
+
+class RealDebridClient(DebridClient):
+    """Real Debrid API client implementing the DebridClient interface."""
+
+    def __init__(self, api_key: str):
+        super().__init__()  # Creates searcher_zilean, searcher_prowlarr, searcher_jackett
+        self.api_key = api_key
+        self.client = httpx.Client(
+            base_url=REAL_DEBRID_BASE_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+            },
+            timeout=DEFAULT_TIMEOUT_LONG,
+            verify=True
+        )
+        # Create rate limiters for Real Debrid
+        self._limiter = RateLimiter(REAL_DEBRID_RATE_LIMIT)
+        self._creation_limiter = RateLimiter(REAL_DEBRID_CREATION_LIMIT)
+
+    def _request(self, method: str, path: str, use_creation_limiter: bool = False,
+                 max_retries: int = 3, **kwargs) -> Any:
+        """Make rate-limited request to Real Debrid API.
+
+        Args:
+            method: HTTP method
+            path: API endpoint path
+            use_creation_limiter: Use slower rate limit for addMagnet endpoint
+            max_retries: Max retries for 429 errors
+            **kwargs: Additional request arguments
+
+        Raises:
+            RateLimitError: If rate limited after all retries
+            APIError: For other API errors
+        """
+        retries = 0
+
+        while retries <= max_retries:
+            # Use appropriate rate limiter
+            if use_creation_limiter:
+                self._creation_limiter.wait()
+            else:
+                self._limiter.wait()
+
+            url = f"{REAL_DEBRID_BASE_URL}{path}"
+            response = make_request_with_backoff(self.client, method, url, **kwargs)
+
+            # Handle 429 specially
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                if retry_after:
+                    wait_time = int(retry_after)
+                elif use_creation_limiter:
+                    wait_time = min(60 * (2 ** min(retries, 4)), 300)
+                else:
+                    wait_time = 0
+
+                retries += 1
+                if retries > max_retries:
+                    logger.warning("Rate limit (429) exhausted after %d retries for %s",
+                                  max_retries, path)
+                    raise RateLimitError(
+                        f"Rate limited (429) on {path} after {max_retries} retries",
+                        status_code=429
+                    )
+
+                logger.warning("Rate limited (429) on %s. Waiting %ds before retry (attempt %d/%d)...",
+                              path, wait_time, retries, max_retries)
+                if wait_time > 0:
+                    time.sleep(wait_time)
+                continue
+
+            if response.status_code >= 400:
+                error_text = sanitize_response_error(response)
+                raise APIError(f"Real Debrid API error: {response.status_code} - {error_text}",
+                              status_code=response.status_code)
+
+            # Mark successful request for rate limiting
+            if use_creation_limiter:
+                self._creation_limiter.mark_success()
+            else:
+                self._limiter.mark_success()
+
+            return response.json() if response.text else None
+
+    def check_cached(self, hashes: List[str]) -> Dict[str, bool]:
+        """Check if torrents are cached on Real Debrid.
+
+        Args:
+            hashes: List of torrent hashes to check
+
+        Returns:
+            Dict mapping hash to True/False (cached or not)
+        """
+        if not hashes:
+            return {}
+
+        try:
+            # RD expects hashes separated by '/' in the URL path
+            hash_path = "/".join(normalize_hash(h) for h in hashes)
+            response = self._request(
+                "GET",
+                f"/torrents/instantAvailability/{hash_path}"
+            )
+
+            if response and isinstance(response, dict):
+                result = {}
+                for h in hashes:
+                    h_lower = normalize_hash(h)
+                    # In RD, if hash key exists and has 'rd' field with content, it's cached
+                    hash_data = response.get(h_lower, {})
+                    is_cached = isinstance(hash_data, dict) and bool(hash_data.get("rd"))
+                    result[h_lower] = is_cached
+                return result
+
+            return {h.lower(): False for h in hashes}
+
+        except (APIError, APIResponseError) as e:
+            logger.debug("Cache check traceback:", exc_info=True)
+            logger.debug("Error checking cached torrents: %s", e)
+            return {h.lower(): False for h in hashes}
+
+    def get_my_torrents(self) -> Optional[List[Dict[str, Any]]]:
+        """Get all torrents in user's Real Debrid account.
+
+        Handles pagination to fetch all torrents.
+
+        Returns:
+            List of torrent dicts if successful, None if API call failed.
+            Normalizes 'filename' to 'name' for consistency.
+        """
+        all_torrents: List[Dict[str, Any]] = []
+        page = 1
+        limit = 100  # RD default/limit per page
+
+        try:
+            while True:
+                response = self._request(
+                    "GET",
+                    "/torrents",
+                    params={"page": page, "limit": limit}
+                )
+
+                if response is None:
+                    return None
+
+                # RD returns list directly, not wrapped in {"data": [...]}
+                if not isinstance(response, list):
+                    logger.error("Unexpected response format from Real Debrid: %s", type(response))
+                    return None
+
+                if not response:
+                    break  # No more torrents
+
+                # Normalize keys: RD uses 'filename' instead of 'name'
+                for torrent in response:
+                    if isinstance(torrent, dict):
+                        if "filename" in torrent and "name" not in torrent:
+                            torrent["name"] = torrent["filename"]
+
+                all_torrents.extend(response)
+
+                # If we got fewer than limit, we've reached the end
+                if len(response) < limit:
+                    break
+
+                page += 1
+
+            return all_torrents
+
+        except (APIError, APIResponseError) as e:
+            logger.error("Error getting my torrents: %s", e)
+            return None
+
+    def add_torrent(self, magnet: str, title: str = "") -> Optional[str]:
+        """Add a torrent to Real Debrid by magnet link.
+
+        Args:
+            magnet: Full magnet URI
+            title: Human-readable title for logging
+
+        Returns:
+            Torrent ID if successful, None if failed
+
+        Raises:
+            RateLimitError: If rate limited even after retries
+        """
+        # Validate magnet format
+        if magnet:
+            magnet = magnet.strip()
+        if not magnet or not magnet.startswith("magnet:?xt=urn:btih:"):
+            logger.warning("Invalid magnet format for %s", title[:60] if title else "unknown")
+            return None
+
+        try:
+            # RD uses form-encoded data for addMagnet
+            response = self._request(
+                "POST",
+                "/torrents/addMagnet",
+                use_creation_limiter=True,
+                data={"magnet": magnet}  # Form-encoded
+            )
+
+            if response and isinstance(response, dict):
+                torrent_id = response.get("id")
+                if torrent_id:
+                    logger.info("Added torrent to Real Debrid: %s", title[:60] if title else "unknown")
+                    return str(torrent_id)
+                else:
+                    logger.warning("Failed to add torrent (no ID returned): %s", title[:60] if title else "unknown")
+            else:
+                logger.warning("Failed to add torrent (no response): %s", title[:60] if title else "unknown")
+
+            return None
+
+        except RateLimitError:
+            raise
+        except (APIError, APIResponseError) as e:
+            logger.error("Error adding torrent %s: %s", title[:60] if title else "unknown", e)
+            return None
+
+    def remove_torrent(self, torrent_id: str) -> bool:
+        """Remove a torrent from Real Debrid.
+
+        Args:
+            torrent_id: The Real Debrid torrent identifier
+
+        Returns:
+            True if successfully removed, False otherwise
+        """
+        try:
+            response = self._request(
+                "DELETE",
+                f"/torrents/delete/{torrent_id}"
+            )
+
+            # RD returns 204 No Content on success, which results in None response
+            # from _request since response.text would be empty
+            logger.debug("Removed torrent %s", torrent_id)
+            return True
+
+        except (APIError, APIResponseError) as e:
+            # Handle 404 as already removed
+            if hasattr(e, 'status_code') and e.status_code == 404:
+                logger.debug("Torrent %s not found (already removed)", torrent_id)
+                return True
             logger.error("Error removing torrent %s: %s", torrent_id, e)
             return False
 
