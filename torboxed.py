@@ -5608,12 +5608,8 @@ Examples:
         return
     
     # Check API keys (lazy-loaded)
-    torbox_key = get_torbox_key()
     trakt_id = get_trakt_id()
     
-    if not torbox_key:
-        logger.error("TORBOX_API_KEY not found in .env file")
-        sys.exit(1)
     if not trakt_id:
         logger.error("TRAKT_CLIENT_ID not found in .env file")
         sys.exit(1)
@@ -5633,9 +5629,13 @@ Examples:
         if telegram.is_configured():
             logger.info("Telegram notifications enabled")
         
-        torbox = TorboxClient(torbox_key)
+        debrid = create_debrid_client()
+        if not debrid:
+            logger.error("No debrid service configured. Set TORBOX_API_KEY or REAL_DEBRID_API_KEY in .env")
+            sys.exit(1)
+
         trakt = TraktClient(trakt_id, get_trakt_access_token())
-        engine = SyncEngine(torbox, trakt, config, telegram)
+        engine = SyncEngine(debrid, trakt, config, telegram)
         engine.sync()
         
         # Send sync summary notification
