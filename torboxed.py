@@ -4005,9 +4005,9 @@ def cleanup_unmatched_torrents() -> None:
 class SyncEngine:
     """Main synchronization logic."""
     
-    def __init__(self, torbox_client: TorboxClient, trakt_client: TraktClient,
+    def __init__(self, debrid_client: DebridClient, trakt_client: TraktClient,
                  config: Dict[str, Any], telegram_notifier: Optional[TelegramNotifier] = None):
-        self.torbox = torbox_client
+        self.debrid = debrid_client
         self.trakt = trakt_client
         self.config = config
         self.filters = config.get("filters", {})
@@ -4105,11 +4105,11 @@ class SyncEngine:
     def _get_searcher_list(self) -> str:
         """Build a human-readable list of configured searchers."""
         searchers = []
-        if self.torbox.searcher_zilean.is_configured():
+        if self.debrid.searcher_zilean.is_configured():
             searchers.append("Zilean")
-        if self.torbox.searcher_prowlarr.is_configured():
+        if self.debrid.searcher_prowlarr.is_configured():
             searchers.append("Prowlarr")
-        if self.torbox.searcher_jackett.is_configured():
+        if self.debrid.searcher_jackett.is_configured():
             searchers.append("Jackett")
         return " → ".join(searchers) if searchers else "none configured"
     
@@ -4186,7 +4186,7 @@ class SyncEngine:
         searcher_list = self._get_searcher_list()
         logger.info("Searching indexers for: %s (using: %s)", search_query, searcher_list)
         excluded_sources, min_resolution_score = self._get_filter_config()
-        cached = self.torbox.get_cached_torrents(search_query, "movie", excluded_sources, min_resolution_score, imdb_id)
+        cached = self.debrid.get_cached_torrents(search_query, "movie", excluded_sources, min_resolution_score, imdb_id)
         
         if not cached:
             logger.info("No cached results for: %s", title)
@@ -4237,7 +4237,7 @@ class SyncEngine:
         searcher_list = self._get_searcher_list()
         logger.info("Searching indexers for show: %s (using: %s)", search_query, searcher_list)
         excluded_sources, min_resolution_score = self._get_filter_config()
-        cached = self.torbox.get_cached_torrents(search_query, "show", excluded_sources, min_resolution_score, imdb_id)
+        cached = self.debrid.get_cached_torrents(search_query, "show", excluded_sources, min_resolution_score, imdb_id)
         
         if not cached:
             logger.info("No cached results for: %s", title)
@@ -4561,7 +4561,7 @@ class SyncEngine:
                        torrent_index + 1, len(cached), torrent.quality.label)
 
         try:
-            new_id = self.torbox.add_torrent(torrent.magnet, torrent.name)
+            new_id = self.debrid.add_torrent(torrent.magnet, torrent.name)
         except RateLimitError:
             logger.warning("Rate limit hit when adding %s - will retry next run", display_title)
             log_result("skipped", display_title, {"reason": "rate_limited", "retry": True})
@@ -4644,7 +4644,7 @@ class SyncEngine:
 
         # Add new torrent FIRST (safer - if this fails, we still have old)
         try:
-            new_id = self.torbox.add_torrent(torrent.magnet, torrent.name)
+            new_id = self.debrid.add_torrent(torrent.magnet, torrent.name)
         except RateLimitError:
             logger.warning("Rate limit hit during upgrade for %s - will retry next run", display_title)
             log_result("skipped", display_title, {"reason": "rate_limited", "retry": True})
@@ -4659,7 +4659,7 @@ class SyncEngine:
 
         # New torrent added successfully - now safe to remove old
         logger.debug("New torrent added: %s, removing old: %s", new_id, old_id)
-        if self.torbox.remove_torrent(old_id):
+        if self.debrid.remove_torrent(old_id):
             logger.debug("Removed old torrent: %s", old_id)
         else:
             logger.warning("Failed to remove old torrent: %s (but new one is added)", old_id)
@@ -4758,7 +4758,7 @@ class SyncEngine:
         
         # STEP 3: Discover existing torrents in Torbox (AFTER sorting)
         # This prevents re-adding duplicates from previous runs during processing
-        discovery_result = discover_existing_torrents(self.torbox)
+        discovery_result = discover_existing_torrents(self.debrid)
         
         # Verify and clear dropped torrents (only if discovery succeeded)
         # Safety: If discovery failed (None), we use empty dict and continue
