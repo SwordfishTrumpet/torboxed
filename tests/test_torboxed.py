@@ -17,7 +17,7 @@ from torboxed import (
     load_env, parse_quality, is_better_quality, QualityInfo,
     RESOLUTION_SCORES, SOURCE_SCORES, CODEC_SCORES, AUDIO_SCORES,
     RateLimiter, get_db, init_db, DB_PATH, SyncEngine, TorboxClient,
-    RealDebridClient,
+    RealDebridClient, create_debrid_client,
     get_torbox_key, get_trakt_id, get_env, _env_cache,
     run_self_test, show_cron_status, discover_existing_torrents,
     is_max_quality, MAX_QUALITY_SCORE, parse_season_info, SeasonInfo,
@@ -273,6 +273,88 @@ class TestLoadEnv(unittest.TestCase):
             
             torboxed.ENV_PATH = original_path
             torboxed._env_cache = None
+        finally:
+            os.unlink(tmp_path)
+
+
+class TestDebridFactory(unittest.TestCase):
+    """Test create_debrid_client factory function."""
+
+    def setUp(self):
+        """Patch env to isolate from real .env file."""
+        import torboxed
+        self.original_env_path = torboxed.ENV_PATH
+        self.original_env_cache = torboxed._env_cache
+        torboxed._env_cache = None
+
+    def tearDown(self):
+        import torboxed
+        torboxed.ENV_PATH = self.original_env_path
+        torboxed._env_cache = self.original_env_cache
+
+    def _create_temp_env(self, content):
+        """Helper to create temp .env file and patch ENV_PATH."""
+        import torboxed
+        temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False)
+        temp_file.write(content)
+        temp_file.close()
+        torboxed.ENV_PATH = Path(temp_file.name)
+        torboxed._env_cache = None
+        return temp_file.name
+
+    def test_default_service_is_torbox(self):
+        """Without DEBRID_SERVICE set, creates TorboxClient."""
+        import torboxed
+        tmp_path = self._create_temp_env("TORBOX_API_KEY=test_tb_key\n")
+        try:
+            client = torboxed.create_debrid_client()
+            self.assertIsInstance(client, torboxed.TorboxClient)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_explicit_torbox_service(self):
+        """DEBRID_SERVICE=torbox creates TorboxClient."""
+        import torboxed
+        tmp_path = self._create_temp_env(
+            "DEBRID_SERVICE=torbox\nTORBOX_API_KEY=test_tb_key\n"
+        )
+        try:
+            client = torboxed.create_debrid_client()
+            self.assertIsInstance(client, torboxed.TorboxClient)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_real_debrid_service(self):
+        """DEBRID_SERVICE=real_debrid creates RealDebridClient."""
+        import torboxed
+        tmp_path = self._create_temp_env(
+            "DEBRID_SERVICE=real_debrid\nREAL_DEBRID_API_KEY=test_rd_key\n"
+        )
+        try:
+            client = torboxed.create_debrid_client()
+            self.assertIsInstance(client, torboxed.RealDebridClient)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_no_api_key_returns_none(self):
+        """Missing API key returns None."""
+        import torboxed
+        tmp_path = self._create_temp_env("DEBRID_SERVICE=torbox\n")
+        try:
+            client = torboxed.create_debrid_client()
+            self.assertIsNone(client)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_factory_returns_debrid_client_subclass(self):
+        """Factory return value is a DebridClient instance."""
+        import torboxed
+        tmp_path = self._create_temp_env(
+            "DEBRID_SERVICE=torbox\nTORBOX_API_KEY=test_tb_key\n"
+        )
+        try:
+            client = torboxed.create_debrid_client()
+            self.assertIsInstance(client, torboxed.DebridClient)
         finally:
             os.unlink(tmp_path)
 
