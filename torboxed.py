@@ -3301,6 +3301,8 @@ class RealDebridClient(DebridClient):
         self._limiter = RateLimiter(REAL_DEBRID_RATE_LIMIT)
         self._creation_limiter = RateLimiter(REAL_DEBRID_CREATION_LIMIT)
 
+    CREATION_MAX_RETRIES = 10
+
     def _request(self, method: str, path: str, use_creation_limiter: bool = False,
                  max_retries: int = 3, **kwargs) -> Any:
         """Make rate-limited request to Real Debrid API.
@@ -3316,9 +3318,10 @@ class RealDebridClient(DebridClient):
             RateLimitError: If rate limited after all retries
             APIError: For other API errors
         """
+        effective_max_retries = self.CREATION_MAX_RETRIES if use_creation_limiter else max_retries
         retries = 0
 
-        while retries <= max_retries:
+        while retries <= effective_max_retries:
             # Use appropriate rate limiter
             if use_creation_limiter:
                 self._creation_limiter.wait()
@@ -3339,16 +3342,16 @@ class RealDebridClient(DebridClient):
                     wait_time = 0
 
                 retries += 1
-                if retries > max_retries:
+                if retries > effective_max_retries:
                     logger.warning("Rate limit (429) exhausted after %d retries for %s",
-                                  max_retries, path)
+                                  effective_max_retries, path)
                     raise RateLimitError(
-                        f"Rate limited (429) on {path} after {max_retries} retries",
+                        f"Rate limited (429) on {path} after {effective_max_retries} retries",
                         status_code=429
                     )
 
                 logger.warning("Rate limited (429) on %s. Waiting %ds before retry (attempt %d/%d)...",
-                              path, wait_time, retries, max_retries)
+                              path, wait_time, retries, effective_max_retries)
                 if wait_time > 0:
                     time.sleep(wait_time)
                 continue
