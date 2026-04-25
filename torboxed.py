@@ -4137,8 +4137,16 @@ class SyncEngine:
         # SECOND: Check if this show was already discovered in Torbox (from discovery phase)
         # This handles multi-season packs where discovery found the show but this
         # specific season doesn't have a database record yet (e.g., newly matched season)
+        # 
+        # CRITICAL: Skip this check for episode-level items (S01E01 format).
+        # Discovery matches at the show/season-pack level, not episode level.
+        # If we skip episodes here, they never get added even when they're missing.
         torbox_id = existing_torrents.get(imdb_id)
-        if torbox_id and not existing:
+        is_episode = 'E' in season_key or len(season_key) > 3  # S01E01 vs S01
+        
+        if torbox_id and not existing and not is_episode:
+            # Only skip for season-level items (S01, S02) or complete series
+            # Episode-level items should proceed to hash check or addition
             display_title = self._display_title(title, "show", season_key)
             logger.info("Already in Torbox: %s (torbox_id: %s, discovered in multi-season pack)", 
                        display_title, torbox_id)
