@@ -4343,8 +4343,61 @@ class SyncEngine:
         
         sources = self.config.get("sources", [])
         
-        # Discover existing torrents in Torbox BEFORE Trakt sync
-        # This prevents re-adding duplicates from previous runs
+        logger.info("="*60)
+        logger.info("Starting sync - %s", datetime.now(timezone.utc).isoformat())
+        logger.info("Sources: %s", ", ".join(sources))
+        logger.info("="*60)
+        
+        # STEP 1: Fetch all content from Trakt (NO LIMITS)
+        logger.info("Fetching content from Trakt...")
+        content = self.trakt.get_all_content(sources)
+        logger.info("Found %d items from Trakt", len(content))
+        
+        # STEP 2: Sort so missing/incomplete items come FIRST
+        # Discovery adds items to the database, so we must check state BEFORE
+        # discovery runs. Otherwise everything looks "existing".
+        # 
+        # Prioritize shows that likely need episode collection:
+        # - NEW: not in database at all
+        # - INCOMPLETE: has individual episodes (S01E01) rather than season packs (S01)
+        #   This catches shows like The Pitt where only S02E07 exists and we need more
+        # - EXISTING: has at least one season pack (complete coverage for that season)
+        def _get_priority(item: Dict[str, Any]) -> int:
+            """Return priority tier: 0=new, 1=incomplete, 2=existing."""
+            imdb_id = item.get("imdb_id", "")
+            if not imdb_id:
+                return 0  # No IMDb ID = treat as new
+            
+            if item.get("type") == "show":
+                seasons = get_processed_show_seasons(imdb_id)
+                if not seasons:
+                    return 0  # New show - not in database
+                # Check for individual episodes (S01E01 format vs S01 format)
+                # Any episode-level entry means incomplete season coverage
+                has_episodes = any(
+                    'E' in s.get('season', '') or len(s.get('season', '')) > 3
+                    for s in seasons
+                )
+                if has_episodes:
+                    return 1  # Incomplete - has individual episodes that likely need more
+                return 2  # Existing - only has season-level entries
+            else:
+                # Movies - binary: exists or not
+                return 0 if get_processed_item(imdb_id) is None else 2
+        
+        new_items = [item for item in content if _get_priority(item) == 0]
+        incomplete_items = [item for item in content if _get_priority(item) == 1]
+        existing_items = [item for item in content if _get_priority(item) == 2]
+        
+        content = new_items + incomplete_items + existing_items
+        
+        total_missing = len(new_items) + len(incomplete_items)
+        if total_missing > 0:
+            logger.info("Prioritizing %d new + %d incomplete items before %d existing items", 
+                       len(new_items), len(incomplete_items), len(existing_items))
+        
+        # STEP 3: Discover existing torrents in Torbox (AFTER sorting)
+        # This prevents re-adding duplicates from previous runs during processing
         discovery_result = discover_existing_torrents(self.torbox)
         
         # Verify and clear dropped torrents (only if discovery succeeded)
@@ -4364,33 +4417,6 @@ class SyncEngine:
         
         logger.info("Discovered %d existing torrents in Torbox (%d unique hashes)", 
                    len(existing_torrents), len(self.account_hashes))
-        
-        logger.info("="*60)
-        logger.info("Starting sync - %s", datetime.now(timezone.utc).isoformat())
-        logger.info("Sources: %s", ", ".join(sources))
-        logger.info("="*60)
-        
-        # Fetch all content from Trakt (NO LIMITS)
-        logger.info("Fetching content from Trakt...")
-        content = self.trakt.get_all_content(sources)
-        logger.info("Found %d items from Trakt", len(content))
-        
-        # Sort so missing items (not in processed table) come before upgrades
-        # This ensures new content is added first before spending time on quality checks
-        def _is_new(item: Dict[str, Any]) -> bool:
-            imdb_id = item.get("imdb_id", "")
-            if not imdb_id:
-                return True
-            if item.get("type") == "show":
-                return not get_processed_show_seasons(imdb_id)
-            return get_processed_item(imdb_id) is None
-        
-        missing = [item for item in content if _is_new(item)]
-        existing = [item for item in content if not _is_new(item)]
-        content = missing + existing
-        if missing:
-            logger.info("Prioritizing %d missing items before %d existing items", 
-                       len(missing), len(existing))
         
         # Reset per-run stats
         self._sync_stats = {"added": 0, "upgraded": 0, "skipped": 0, "failed": 0, "movies": 0, "shows": 0}
