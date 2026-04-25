@@ -1307,6 +1307,24 @@ def get_torbox_key() -> Optional[str]:
     return get_env().get("TORBOX_API_KEY")
 
 
+def get_real_debrid_key() -> Optional[str]:
+    """Get Real Debrid API key (lazy-loaded)."""
+    return get_env().get("REAL_DEBRID_API_KEY")
+
+
+def get_debrid_service() -> str:
+    """Get the configured debrid service name (lazy-loaded).
+
+    Returns:
+        "torbox" or "real_debrid". Defaults to "torbox".
+    """
+    service = get_env().get("DEBRID_SERVICE", "torbox").lower().strip()
+    if service not in ("torbox", "real_debrid"):
+        logger.warning("Unknown DEBRID_SERVICE '%s', defaulting to 'torbox'", service)
+        return "torbox"
+    return service
+
+
 def get_trakt_id() -> Optional[str]:
     """Get Trakt Client ID (lazy-loaded)."""
     return get_env().get("TRAKT_CLIENT_ID")
@@ -3532,6 +3550,33 @@ class RealDebridClient(DebridClient):
                 return True
             logger.error("Error removing torrent %s: %s", torrent_id, e)
             return False
+
+
+def create_debrid_client() -> Optional[DebridClient]:
+    """Create the configured debrid client based on DEBRID_SERVICE env var.
+
+    Returns:
+        DebridClient instance (TorboxClient or RealDebridClient),
+        or None if the required API key is not configured.
+    """
+    service = get_debrid_service()
+
+    if service == "real_debrid":
+        api_key = get_real_debrid_key()
+        if not api_key:
+            logger.error("DEBRID_SERVICE=real_debrid but REAL_DEBRID_API_KEY not set in .env")
+            return None
+        logger.info("Using Real Debrid as debrid service")
+        return RealDebridClient(api_key)
+
+    else:
+        # Default: Torbox
+        api_key = get_torbox_key()
+        if not api_key:
+            logger.error("DEBRID_SERVICE=torbox but TORBOX_API_KEY not set in .env")
+            return None
+        logger.info("Using Torbox as debrid service")
+        return TorboxClient(api_key)
 
 
 # ============================================================================
