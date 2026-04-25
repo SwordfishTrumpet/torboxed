@@ -4121,8 +4121,21 @@ class SyncEngine:
         # This is the authoritative check - database records are always season-aware
         existing = get_processed_item(imdb_id, season_key)
         
+        # CRITICAL: Check if record was created by discovery vs actually added.
+        # Discovery creates records with action='skipped' and reason='already_in_torbox' 
+        # or 'multi_season_pack_discovery' - these are PHANTOM records that associate
+        # episodes with a torrent ID but never actually added the individual episode.
+        # We must re-process these to actually add the content.
+        is_phantom_record = False
+        if existing and existing.get("action") == "skipped":
+            reason = existing.get("reason", "")
+            if reason in ("already_in_torbox", "multi_season_pack_discovery", "already_in_account"):
+                is_phantom_record = True
+                logger.debug("Phantom record detected for %s %s - will re-process for actual addition", 
+                           title, season_key)
+        
         # If already have max quality for this season, skip
-        if existing and existing.get("torbox_id"):
+        if existing and existing.get("torbox_id") and not is_phantom_record:
             current_score = existing.get("quality_score") or 0
             if is_max_quality(current_score):
                 logger.info("Max quality reached for %s %s (score: %d) - skipping", 
@@ -4130,7 +4143,8 @@ class SyncEngine:
                 return True
         
         # Check if this season is already in Torbox (database record with upgrade potential)
-        if existing and existing.get("torbox_id"):
+        # Skip phantom records - they need actual addition, not upgrade check
+        if existing and existing.get("torbox_id") and not is_phantom_record:
             # For upgrades, pass a single-item list since we only check the best one
             return self._handle_upgrade(imdb_id, title, year, "show", existing, [torrent], season_key)
         
