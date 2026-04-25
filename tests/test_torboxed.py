@@ -35,6 +35,110 @@ from torboxed import (
 )
 
 
+class TestDebridClientABC(unittest.TestCase):
+    """Test the DebridClient abstract base class."""
+
+    def test_cannot_instantiate_abstract_class(self):
+        """DebridClient cannot be instantiated directly (has abstract methods)."""
+        import torboxed
+        with self.assertRaises(TypeError):
+            torboxed.DebridClient()
+
+    def test_concrete_subclass_must_implement_check_cached(self):
+        """Subclass missing check_cached fails instantiation."""
+        import torboxed
+        from abc import ABC
+
+        class IncompleteClient(torboxed.DebridClient):
+            def get_my_torrents(self): pass
+            def add_torrent(self, magnet, title=""): pass
+            def remove_torrent(self, torrent_id): pass
+
+        with self.assertRaises(TypeError):
+            IncompleteClient()
+
+    def test_concrete_subclass_must_implement_get_my_torrents(self):
+        """Subclass missing get_my_torrents fails instantiation."""
+        import torboxed
+
+        class IncompleteClient(torboxed.DebridClient):
+            def check_cached(self, hashes): pass
+            def add_torrent(self, magnet, title=""): pass
+            def remove_torrent(self, torrent_id): pass
+
+        with self.assertRaises(TypeError):
+            IncompleteClient()
+
+    def test_concrete_subclass_must_implement_add_torrent(self):
+        """Subclass missing add_torrent fails instantiation."""
+        import torboxed
+
+        class IncompleteClient(torboxed.DebridClient):
+            def check_cached(self, hashes): pass
+            def get_my_torrents(self): pass
+            def remove_torrent(self, torrent_id): pass
+
+        with self.assertRaises(TypeError):
+            IncompleteClient()
+
+    def test_concrete_subclass_must_implement_remove_torrent(self):
+        """Subclass missing remove_torrent fails instantiation."""
+        import torboxed
+
+        class IncompleteClient(torboxed.DebridClient):
+            def check_cached(self, hashes): pass
+            def get_my_torrents(self): pass
+            def add_torrent(self, magnet, title=""): pass
+
+        with self.assertRaises(TypeError):
+            IncompleteClient()
+
+    def test_search_infrastructure_created_by_init(self):
+        """DebridClient.__init__ creates searcher sub-clients."""
+        import torboxed
+
+        class FullClient(torboxed.DebridClient):
+            def check_cached(self, hashes): return {}
+            def get_my_torrents(self): return []
+            def add_torrent(self, magnet, title=""): return None
+            def remove_torrent(self, torrent_id): return True
+
+        client = FullClient()
+        self.assertIsNotNone(client.searcher_zilean)
+        self.assertIsNotNone(client.searcher_prowlarr)
+        self.assertIsNotNone(client.searcher_jackett)
+
+    def test_search_torrents_calls_check_cached(self):
+        """search_torrents delegates to subclass check_cached for availability."""
+        import torboxed
+
+        class SearchClient(torboxed.DebridClient):
+            def check_cached(self, hashes):
+                self.last_cache_call = hashes
+                return {"abc123": True}
+
+            def get_my_torrents(self): return []
+            def add_torrent(self, magnet, title=""): return None
+            def remove_torrent(self, torrent_id): return True
+
+        client = SearchClient()
+        client.searcher_zilean = Mock()
+        client.searcher_zilean.is_configured.return_value = True
+        client.searcher_zilean.search.return_value = [{
+            "name": "Test Movie 1080p",
+            "hash": "abc123",
+            "magnet": "magnet:?xt=urn:btih:abc123",
+            "size": 5000000000,
+            "seeds": 10,
+            "peers": 2,
+        }]
+        client.searcher_zilean.search_by_imdb.return_value = []
+
+        result = client.search_torrents("Test Movie", "movie")
+        self.assertEqual(client.last_cache_call, ["abc123"])
+        self.assertTrue(result[0]["availability"])
+
+
 class TestRateLimiter(unittest.TestCase):
     """Test rate limiting functionality."""
     

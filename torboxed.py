@@ -13,6 +13,7 @@ import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Tuple, Set
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
@@ -2671,6 +2672,300 @@ class TraktClient:
         
         logger.info("Collected %d unique items from %d liked lists", len(all_items), len(liked_lists))
         return all_items
+
+
+class DebridClient(ABC):
+    """Abstract base class for debrid service clients.
+
+    Owns the shared torrent search infrastructure (Zilean/Prowlarr/Jackett).
+    Subclasses implement debrid-specific operations: cache checking, account
+    listing, magnet adding, and torrent removal.
+
+    Template method pattern: search_torrents() runs the shared search
+    pipeline, calling the subclass's check_cached() for availability.
+    """
+
+    def __init__(self):
+        # Shared search backends (independent of any debrid service)
+        self.searcher_zilean = ZileanClient()
+        self.searcher_prowlarr = ProwlarrClient()
+        self.searcher_jackett = JackettClient()
+
+    @abstractmethod
+    def check_cached(self, hashes: List[str]) -> Dict[str, bool]:
+        """Check which torrent hashes are instantly available.
+
+        Args:
+            hashes: List of torrent hashes (lowercase hex strings).
+
+        Returns:
+            Dict mapping each hash to True (available) or False (not available).
+        """
+        ...
+
+    @abstractmethod
+    def get_my_torrents(self) -> Optional[List[Dict[str, Any]]]:
+        """Fetch all torrents currently in the debrid account.
+
+        Returns:
+            List of torrent dicts if successful, None if API call failed.
+            Each dict must contain at least: "id", "name", "hash".
+        """
+        ...
+
+    @abstractmethod
+    def add_torrent(self, magnet: str, title: str = "") -> Optional[str]:
+        """Add a torrent by magnet link to the debrid service.
+
+        Args:
+            magnet: Full magnet URI (must pass format validation).
+            title: Human-readable title for logging.
+
+        Returns:
+            Torrent ID string if successful, None if failed.
+
+        Raises:
+            RateLimitError: If rate limited after all retries.
+        """
+        ...
+
+    @abstractmethod
+    def remove_torrent(self, torrent_id: str) -> bool:
+        """Remove a torrent from the debrid account.
+
+        Args:
+            torrent_id: The service-specific torrent identifier.
+
+        Returns:
+            True if successfully removed, False otherwise.
+        """
+        ...
+
+    # ---- Concrete shared methods ----
+
+    def find_existing_by_hash(self, torrent_hash: str) -> Optional[Dict[str, Any]]:
+        """Check if a torrent already exists in account by hash."""
+        my_torrents = self.get_my_torrents()
+        if not my_torrents:
+            return None
+        for torrent in my_torrents:
+            if torrent.get("hash", "").lower() == torrent_hash.lower():
+                return torrent
+        return None
+
+    def search_torrents(self, query: str, search_type: str = "movie",
+                        imdb_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Search for torrents via Zilean database with Prowlarr/Jackett fallback.
+
+        Flow:
+        1. Search Zilean database by IMDb ID (if available) or title
+        2. Fallback to Prowlarr if Zilean not configured or no results
+        3. Fallback to Jackett if Prowlarr not configured or no results
+        4. Check which torrents are cached via subclass check_cached()
+        5. Return torrents with availability info
+
+        Args:
+            query: Search query string (title).
+            search_type: Type of content ('movie' or 'show').
+            imdb_id: Optional IMDb ID for more accurate search.
+
+        Returns:
+            List of torrent dicts with availability info.
+        """
+        # Determine which searchers are available
+        zilean_available = getattr(self, 'searcher_zilean', None) and self.searcher_zilean.is_configured()
+        prowlarr_available = getattr(self, 'searcher_prowlarr', None) and self.searcher_prowlarr.is_configured()
+        jackett_available = getattr(self, 'searcher_jackett', None) and self.searcher_jackett.is_configured()
+
+        services = []
+        if zilean_available:
+            services.append("Zilean")
+        if prowlarr_available:
+            services.append("Prowlarr")
+        if jackett_available:
+            services.append("Jackett")
+
+        if services:
+            logger.info("Searching for: %s (%s) via %s", query, search_type, " → ".join(services))
+        else:
+            logger.info("Searching for: %s (%s) - no searchers configured!", query, search_type)
+
+        all_search_results = []
+
+        category = None
+        prowlarr_categories = None
+        if search_type == "movie":
+            category = "movie"
+            prowlarr_categories = [2000]
+        elif search_type == "show":
+            category = "tvSeries"
+            prowlarr_categories = [5000]
+
+        # Try Zilean first (if configured)
+        if zilean_available:
+            try:
+                if imdb_id:
+                    logger.debug("Searching Zilean by IMDb ID: %s", imdb_id)
+                    imdb_results = self.searcher_zilean.search_by_imdb(
+                        imdb_id, category=category, limit=SEARCH_LIMIT_IMDB)
+                    if imdb_results:
+                        logger.info("Zilean found %d torrents by IMDb ID: %s",
+                                     len(imdb_results), imdb_id)
+                        all_search_results.extend(imdb_results)
+
+                if not all_search_results:
+                    logger.debug("Searching Zilean by title: %s", query)
+                    title_results = self.searcher_zilean.search(
+                        query, category=category, limit=SEARCH_LIMIT_TITLE)
+                    if title_results:
+                        logger.info("Zilean found %d torrents by title: %s",
+                                     len(title_results), query)
+                        all_search_results.extend(title_results)
+
+            except (OSError, ValueError) as e:
+                logger.debug("Zilean search traceback:", exc_info=True)
+                logger.warning("Zilean search failed, will try Prowlarr fallback: %s", e)
+        else:
+            logger.debug("Zilean not configured, using Prowlarr")
+
+        # Fallback to Prowlarr
+        if not all_search_results and prowlarr_available:
+            logger.debug("Searching Prowlarr as fallback: %s", query)
+            prowlarr_results = self.searcher_prowlarr.search(
+                query, categories=prowlarr_categories, limit=SEARCH_LIMIT_TITLE)
+            if prowlarr_results:
+                logger.info("Prowlarr found %d torrents for: %s",
+                             len(prowlarr_results), query)
+                all_search_results.extend(prowlarr_results)
+
+        # Fallback to Jackett
+        if not all_search_results and jackett_available:
+            logger.debug("Searching Jackett as fallback: %s", query)
+            jackett_results = self.searcher_jackett.search(
+                query, limit=SEARCH_LIMIT_TITLE)
+            if jackett_results:
+                logger.info("Jackett found %d torrents for: %s",
+                             len(jackett_results), query)
+                all_search_results.extend(jackett_results)
+
+        if not all_search_results:
+            logger.warning("No torrents found for: %s", query)
+            return []
+
+        # Remove duplicates by hash
+        seen_hashes = set()
+        unique_results = []
+        for torrent in all_search_results:
+            hash_value = torrent.get("hash", "").lower()
+            if hash_value and hash_value not in seen_hashes:
+                seen_hashes.add(hash_value)
+                unique_results.append(torrent)
+
+        if len(unique_results) < len(all_search_results):
+            logger.debug("Removed %d duplicate torrents",
+                          len(all_search_results) - len(unique_results))
+
+        all_search_results = unique_results
+
+        # Get hashes and check availability via subclass
+        hashes = [t.get("hash", "").lower() for t in all_search_results if t.get("hash")]
+
+        if not hashes:
+            logger.warning("No hashes found in search results for: %s", query)
+            return []
+
+        cached_status = self.check_cached(hashes)
+
+        results = []
+        cached_count = 0
+        for torrent in all_search_results:
+            hash_value = torrent.get("hash", "").lower()
+            is_cached = cached_status.get(hash_value, False)
+            if is_cached:
+                cached_count += 1
+
+            results.append({
+                "title": torrent.get("name", ""),
+                "name": torrent.get("name", ""),
+                "hash": hash_value,
+                "magnet": torrent.get("magnet", ""),
+                "size": torrent.get("size", 0),
+                "availability": is_cached,
+                "seeders": torrent.get("seeds", 0),
+                "leechers": torrent.get("peers", 0),
+            })
+
+        logger.info("Found %d torrents from Zilean/Prowlarr/Jackett, %d cached",
+                     len(results), cached_count)
+        return results
+
+    def get_cached_torrents(self, query: str, content_type: str = "movie",
+                            excluded_sources: Optional[List[str]] = None,
+                            min_resolution_score: int = 800,
+                            imdb_id: Optional[str] = None) -> List[TorrentResult]:
+        """Search and return only cached (instantly available) torrents.
+
+        Template method — uses search_torrents() with subclass check_cached().
+        Filters results by quality and resolution thresholds.
+        """
+        if excluded_sources is None:
+            excluded_sources = ["CAM", "TS", "HDCAM"]
+
+        results = self.search_torrents(query, content_type, imdb_id)
+        cached = []
+
+        excluded_lower = [excl.lower() for excl in excluded_sources]
+        skipped_low_res = 0
+
+        for item in results:
+            if item.get("availability", False):
+                name = item.get("title", item.get("name", "Unknown"))
+                quality = parse_quality(name)
+
+                if any(excl in quality.source.lower() for excl in excluded_lower):
+                    continue
+                if any(excl in name.lower() for excl in excluded_lower):
+                    continue
+
+                resolution_score = RESOLUTION_SCORES.get(quality.resolution, 0)
+                if resolution_score < min_resolution_score:
+                    # Special case: complete series packs with unknown resolution but large size
+                    if resolution_score == 0 and content_type == "show":
+                        size = item.get("size", 0)
+                        season_info = parse_season_info(name)
+                        if (season_info and season_info.is_complete and
+                                size >= COMPLETE_PACK_MIN_SIZE):
+                            pass  # Allow through
+                        else:
+                            skipped_low_res += 1
+                            continue
+                    else:
+                        skipped_low_res += 1
+                        continue
+
+                magnet = item.get("magnet", "").strip()
+                if not magnet:
+                    continue
+
+                cached.append(TorrentResult(
+                    name=name,
+                    magnet=magnet,
+                    availability=True,
+                    size=item.get("size", 0),
+                    quality=quality,
+                    hash=item.get("hash", ""),
+                    seeders=item.get("seeders", 0),
+                    leechers=item.get("leechers", 0),
+                    season_info=parse_season_info(name),
+                ))
+
+        if cached:
+            logger.info("Found %d cached torrents for: %s (skipped %d low-res)",
+                         len(cached), query, skipped_low_res)
+        else:
+            logger.info("No cached torrents found for: %s", query)
+
+        return cached
 
 
 class TorboxClient:
