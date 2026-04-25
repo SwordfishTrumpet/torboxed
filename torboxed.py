@@ -3583,36 +3583,36 @@ class RealDebridClient(DebridClient):
 # TORBOX DISCOVERY
 # ============================================================================
 
-def discover_existing_torrents(torbox_client: TorboxClient) -> Optional[Tuple[Dict[str, str], Set[str]]]:
-    """Discover all torrents currently in Torbox account.
+def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Dict[str, str], Set[str]]]:
+    """Discover all torrents currently in the debrid account.
     
-    Returns mapping of IMDB ID to Torbox torrent ID by:
+    Returns mapping of IMDB ID to debrid torrent ID by:
     1. First trying direct ID matching (reliable)
     2. Then falling back to name matching for any unmatched items
     
     Also returns a set of all torrent hashes in the account for duplicate prevention.
     
     Args:
-        torbox_client: TorboxClient instance
+        debrid_client: DebridClient instance
         
     Returns:
-        Tuple of (imdb_id -> torbox_id mapping, set of all hashes in account),
+        Tuple of (imdb_id -> debrid_id mapping, set of all hashes in account),
         or None if API call failed,
         or ({}, set()) if account is empty
     """
-    logger.info("Discovering existing torrents in Torbox account...")
-    my_torrents = torbox_client.get_my_torrents()
+    logger.info("Discovering existing torrents in debrid account...")
+    my_torrents = debrid_client.get_my_torrents()
     
     # Check if API call failed (None) vs empty account ([])
     if my_torrents is None:
-        logger.error("Failed to discover torrents - Torbox API error")
+        logger.error("Failed to discover torrents - debrid API error")
         return None
     
     if not my_torrents:
-        logger.info("No torrents found in Torbox account (empty account)")
+        logger.info("No torrents found in debrid account (empty)")
         return {}, set()
     
-    logger.info("Found %d torrents in Torbox account", len(my_torrents))
+    logger.info("Found %d torrents in debrid account", len(my_torrents))
 
     # DUPLICATE DETECTION: Find and remove duplicate hashes
     hash_to_torrents = {}
@@ -3634,7 +3634,7 @@ def discover_existing_torrents(torbox_client: TorboxClient) -> Optional[Tuple[Di
                 dup_id = dup.get("id")
                 dup_name = dup.get("name", "Unknown")[:50]
                 try:
-                    if torbox_client.remove_torrent(dup_id):
+                    if debrid_client.remove_torrent(dup_id):
                         logger.info("Removed duplicate torrent: %s (ID: %s)", dup_name, dup_id)
                         removed_count += 1
                     else:
@@ -3646,7 +3646,7 @@ def discover_existing_torrents(torbox_client: TorboxClient) -> Optional[Tuple[Di
         if removed_count > 0:
             logger.info("Removed %d duplicate torrent(s) from account", removed_count)
             # Re-fetch the torrent list after cleanup
-            my_torrents = torbox_client.get_my_torrents()
+            my_torrents = debrid_client.get_my_torrents()
             if my_torrents is None:
                 logger.error("Failed to re-fetch torrents after cleanup")
                 return None
@@ -3804,9 +3804,9 @@ def discover_existing_torrents(torbox_client: TorboxClient) -> Optional[Tuple[Di
     
     total_matches = id_matches + name_matches
     if unmatched:
-        logger.debug("%d torrents in Torbox could not be matched to database (manual adds)", len(unmatched))
+        logger.debug("%d torrents could not be matched to database (manual adds)", len(unmatched))
     
-    logger.info("Discovered %d existing torrents in Torbox (ID matches: %d, name matches: %d, multi-season updates: %d, total hashes: %d)",
+    logger.info("Discovered %d existing torrents in account (ID matches: %d, name matches: %d, multi-season updates: %d, total hashes: %d)",
                total_matches, id_matches, name_matches, len(multi_season_updates), len(account_hashes))
     return imdb_to_torbox, account_hashes
 
@@ -3893,7 +3893,7 @@ def verify_and_clear_dropped_torrents(existing_torrents: Optional[Tuple[Dict[str
 
 
 def cleanup_unmatched_torrents() -> None:
-    """Remove torrents from Torbox that can't be matched to the database.
+    """Remove torrents from the debrid account that can't be matched to the database.
     
     Unmatched torrents are problematic because:
     1. They can't be tracked for quality upgrades
@@ -3907,25 +3907,24 @@ def cleanup_unmatched_torrents() -> None:
     """
     logger.info("Scanning for unmatched torrents...")
     
-    # Get API key
-    torbox_key = get_torbox_key()
-    if not torbox_key:
-        logger.error("TORBOX_API_KEY not found in .env file")
+    # Create debrid client using factory
+    debrid_client = create_debrid_client()
+    if not debrid_client:
+        logger.error("Failed to create debrid client. Check TORBOX_API_KEY or REAL_DEBRID_API_KEY in .env file")
         return
     
-    # Get all torrents from Torbox
-    torbox = TorboxClient(torbox_key)
-    my_torrents = torbox.get_my_torrents()
+    # Get all torrents from debrid account
+    my_torrents = debrid_client.get_my_torrents()
     
     if my_torrents is None:
-        logger.error("Failed to fetch torrents from Torbox")
+        logger.error("Failed to fetch torrents from debrid account")
         return
     
     if not my_torrents:
-        logger.info("No torrents in Torbox account")
+        logger.info("No torrents in debrid account")
         return
     
-    logger.info("Found %d torrents in Torbox account", len(my_torrents))
+    logger.info("Found %d torrents in debrid account", len(my_torrents))
     
     # Get all torbox_ids from database
     with get_db() as conn:
@@ -3962,7 +3961,7 @@ def cleanup_unmatched_torrents() -> None:
         print()
     
     print(f"{'='*80}")
-    print(f"Total: {len(unmatched)} torrents will be REMOVED from Torbox")
+    print(f"Total: {len(unmatched)} torrents will be REMOVED from debrid account")
     print(f"{'='*80}")
     
     # Require confirmation
@@ -3979,7 +3978,7 @@ def cleanup_unmatched_torrents() -> None:
     
     for t in unmatched:
         try:
-            if torbox.remove_torrent(t['id']):
+            if debrid_client.remove_torrent(t['id']):
                 print(f"  ✓ Removed: {t['name'][:50]}...")
                 removed_count += 1
             else:
