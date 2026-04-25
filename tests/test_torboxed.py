@@ -607,7 +607,7 @@ class TestSyncEngine(unittest.TestCase):
         # Create a processed item with lower quality
         torboxed.record_processed(
             "tt1234567", "Test Movie", 2024, "movie", "added", "success",
-            torbox_id="old-torrent-id", magnet="magnet:old",
+            debrid_id="old-torrent-id", magnet="magnet:old",
             quality_score=2500, quality_label="1080p BluRay"
         )
         
@@ -664,7 +664,7 @@ class TestSyncEngine(unittest.TestCase):
         # Create a processed item with lower quality
         torboxed.record_processed(
             "tt7654321", "Test Movie 2", 2024, "movie", "added", "success",
-            torbox_id="old-torrent-id", magnet="magnet:old",
+            debrid_id="old-torrent-id", magnet="magnet:old",
             quality_score=2500, quality_label="1080p BluRay"
         )
         
@@ -808,7 +808,7 @@ class TestTorboxAPIEndpoints(unittest.TestCase):
             # This matches the real scenario: "Upgrade detected for Twin Peaks (S01): 0 -> 4400"
             torboxed.record_processed(
                 "tt0098936", "Twin Peaks", 1990, "show", "added", "success",
-                torbox_id="22845381", magnet="magnet:existing",
+                debrid_id="22845381", magnet="magnet:existing",
                 quality_score=0, quality_label="Unknown",
                 season="S01"
             )
@@ -880,7 +880,7 @@ class TestTimezoneAwareDatetime(unittest.TestCase):
             # Record a processed item
             torboxed.record_processed(
                 "tt9999999", "Test Timezone", 2024, "movie",
-                "added", "success", torbox_id="test-id", magnet="magnet:test",
+                "added", "success", debrid_id="test-id", magnet="magnet:test",
                 quality_score=2500, quality_label="1080p"
             )
 
@@ -1264,7 +1264,7 @@ class TestDiscoverExistingTorrents(unittest.TestCase):
         # Add a processed item to database
         torboxed.record_processed(
             "tt1234567", "Test Movie", 2024, "movie", "added", "success",
-            torbox_id="tb-id-123", magnet="magnet:test",
+            debrid_id="tb-id-123", magnet="magnet:test",
             quality_score=2500, quality_label="1080p BluRay"
         )
         
@@ -1297,7 +1297,7 @@ class TestDiscoverExistingTorrents(unittest.TestCase):
         # Add a processed item to database
         torboxed.record_processed(
             "tt1234567", "Different Movie", 2024, "movie", "added", "success",
-            torbox_id="tb-id-123", magnet="magnet:test",
+            debrid_id="tb-id-123", magnet="magnet:test",
             quality_score=2500, quality_label="1080p BluRay"
         )
         
@@ -1414,7 +1414,7 @@ class TestMaxQuality(unittest.TestCase):
         # Record an item with max quality (score >= 7000)
         torboxed.record_processed(
             "tt9999999", "Max Quality Movie", 2024, "movie", "added", "success",
-            torbox_id="tb-max", magnet="magnet:max",
+            debrid_id="tb-max", magnet="magnet:max",
             quality_score=7250, quality_label="2160p BluRay HEVC DTS-HD MA"
         )
         
@@ -1442,7 +1442,7 @@ class TestMaxQuality(unittest.TestCase):
         # Record an item with good but not max quality (score < 7000)
         torboxed.record_processed(
             "tt8888888", "Good Quality Movie", 2024, "movie", "added", "success",
-            torbox_id="tb-good", magnet="magnet:good",
+            debrid_id="tb-good", magnet="magnet:good",
             quality_score=4000, quality_label="1080p BluRay H264"
         )
         
@@ -1717,7 +1717,7 @@ class TestMultiSeasonSync(unittest.TestCase):
         # Record S01 as already added
         torboxed.record_processed(
             "tt7654321", "Test Show", 2020, "show", "added", "success",
-            torbox_id="existing-s01", magnet="magnet:existing",
+            debrid_id="existing-s01", magnet="magnet:existing",
             quality_score=3400, quality_label="1080p WEB-DL",
             season="S01"
         )
@@ -1776,7 +1776,7 @@ class TestMultiSeasonSync(unittest.TestCase):
         # Record S01 with 720p quality (upgradeable)
         torboxed.record_processed(
             "tt9999999", "Test Show", 2020, "show", "added", "success",
-            torbox_id="existing-s01", magnet="magnet:existing",
+            debrid_id="existing-s01", magnet="magnet:existing",
             quality_score=2400, quality_label="720p WEB-DL",
             season="S01"
         )
@@ -1784,7 +1784,7 @@ class TestMultiSeasonSync(unittest.TestCase):
         # Record S02 with 1080p quality (not upgradeable)
         torboxed.record_processed(
             "tt9999999", "Test Show", 2020, "show", "added", "success",
-            torbox_id="existing-s02", magnet="magnet:existing-s02",
+            debrid_id="existing-s02", magnet="magnet:existing-s02",
             quality_score=3400, quality_label="1080p WEB-DL",
             season="S02"
         )
@@ -2044,12 +2044,12 @@ class TestMultiSeasonSync(unittest.TestCase):
         # Record multiple seasons
         torboxed.record_processed(
             "tt6666666", "Test Show", 2019, "show", "added", "success",
-            torbox_id="id-s01", magnet="magnet:s01",
+            debrid_id="id-s01", magnet="magnet:s01",
             quality_score=3400, season="S01"
         )
         torboxed.record_processed(
             "tt6666666", "Test Show", 2019, "show", "added", "success",
-            torbox_id="id-s02", magnet="magnet:s02",
+            debrid_id="id-s02", magnet="magnet:s02",
             quality_score=3400, season="S02"
         )
         
@@ -2076,17 +2076,17 @@ class TestMultiSeasonSync(unittest.TestCase):
         # Record multiple seasons
         torboxed.record_processed(
             "tt5555555", "Multi Season Show", 2019, "show", "added", "success",
-            torbox_id="id-s01", magnet="magnet:s01",
+            debrid_id="id-s01", magnet="magnet:s01",
             quality_score=3400, season="S01"
         )
         torboxed.record_processed(
             "tt5555555", "Multi Season Show", 2019, "show", "added", "success",
-            torbox_id="id-s02", magnet="magnet:s02",
+            debrid_id="id-s02", magnet="magnet:s02",
             quality_score=3400, season="S02"
         )
         torboxed.record_processed(
             "tt5555555", "Multi Season Show", 2019, "show", "added", "success",
-            torbox_id="id-s03", magnet="magnet:s03",
+            debrid_id="id-s03", magnet="magnet:s03",
             quality_score=3400, season="S03"
         )
         
@@ -4351,8 +4351,8 @@ class TestProcessSeasonWithExistingTorrents(unittest.TestCase):
         self.assertTrue(result)
         processed = torboxed.get_processed_item("tt1234567", "S01")
         self.assertEqual(processed["action"], "skipped")
-        self.assertEqual(processed["reason"], "already_in_torbox")
-        self.assertEqual(processed["torbox_id"], "tb-discovery-match")
+        self.assertEqual(processed["reason"], "already_in_debrid")
+        self.assertEqual(processed["debrid_id"], "tb-discovery-match")
     
     def test_proceeds_when_not_in_existing_torrents(self):
         """Test that _process_season proceeds normally when IMDB ID not in existing_torrents."""
@@ -4377,7 +4377,7 @@ class TestProcessSeasonWithExistingTorrents(unittest.TestCase):
         self.assertTrue(result)
         processed = torboxed.get_processed_item("tt9999999", "S01")
         self.assertEqual(processed["action"], "added")
-        self.assertEqual(processed["torbox_id"], "new-tb-id")
+        self.assertEqual(processed["debrid_id"], "new-tb-id")
 
 
 class TestHandleNewAdditionFallback(unittest.TestCase):
@@ -4431,7 +4431,7 @@ class TestHandleNewAdditionFallback(unittest.TestCase):
         
         processed = torboxed.get_processed_item("tt1234567")
         self.assertEqual(processed["action"], "added")
-        self.assertEqual(processed["torbox_id"], "new-id-from-fallback")
+        self.assertEqual(processed["debrid_id"], "new-id-from-fallback")
     
     def test_all_torrents_fail(self):
         """Test that _handle_new_addition records failure when all torrents fail."""
@@ -4639,7 +4639,7 @@ class TestVerifyAndClearDroppedTorrents(unittest.TestCase):
         for i in range(10):
             torboxed.record_processed(
                 f"tt000000{i}", f"Movie {i}", 2024, "movie", "added", "success",
-                torbox_id=f"tb-id-{i}", magnet=f"magnet:{i}",
+                debrid_id=f"tb-id-{i}", magnet=f"magnet:{i}",
                 quality_score=2500, quality_label="1080p"
             )
         
@@ -4656,12 +4656,12 @@ class TestVerifyAndClearDroppedTorrents(unittest.TestCase):
         # Add 2 tracked torrents to database
         torboxed.record_processed(
             "tt0000000", "Movie 0", 2024, "movie", "added", "success",
-            torbox_id="tb-id-0", magnet="magnet:0",
+            debrid_id="tb-id-0", magnet="magnet:0",
             quality_score=2500, quality_label="1080p"
         )
         torboxed.record_processed(
             "tt0000001", "Movie 1", 2024, "movie", "added", "success",
-            torbox_id="tb-id-1", magnet="magnet:1",
+            debrid_id="tb-id-1", magnet="magnet:1",
             quality_score=2500, quality_label="1080p"
         )
         
@@ -4818,7 +4818,7 @@ class TestRealDebridSyncIntegration(unittest.TestCase):
 
         torboxed.record_processed(
             "tt1234567", "Test Movie", 2024, "movie",
-            "added", "success", torbox_id="RD_EXISTING",
+            "added", "success", debrid_id="RD_EXISTING",
             magnet="magnet:existing",
             quality_score=7250, quality_label="2160p BluRay HEVC"
         )
@@ -4855,3 +4855,759 @@ class TestRealDebridSyncIntegration(unittest.TestCase):
         # Should have attempted to add, but rate limit prevented it
         self.mock_rd.add_torrent.assert_called()
         # Should NOT have crashed — RateLimitError is caught by caller
+
+
+class TestZileanClientMethods(unittest.TestCase):
+    """Test ZileanClient methods that weren't directly tested."""
+    
+    def setUp(self):
+        """Set up mock Zilean client."""
+        from torboxed import ZileanClient
+        self.client = ZileanClient.__new__(ZileanClient)
+        self.client.database_url = "postgresql://test:test@localhost/test"
+    
+    def test_is_configured_without_psycopg(self):
+        """Test is_configured returns False when psycopg not available."""
+        import torboxed
+        from torboxed import ZileanClient
+        
+        # Save original psycopg
+        original_psycopg = torboxed.psycopg
+        
+        try:
+            # Simulate psycopg not being available
+            torboxed.psycopg = None
+            
+            client = ZileanClient.__new__(ZileanClient)
+            client.database_url = "postgresql://test:test@localhost/test"
+            
+            # Should return False when psycopg is None
+            self.assertFalse(client.is_configured())
+        finally:
+            # Restore original
+            torboxed.psycopg = original_psycopg
+    
+    def test_is_configured_without_database_url(self):
+        """Test is_configured returns False when no database URL."""
+        from torboxed import ZileanClient
+        
+        client = ZileanClient.__new__(ZileanClient)
+        client.database_url = None
+        
+        # Should return False when no database_url
+        self.assertFalse(client.is_configured())
+    
+    def test_close_with_no_connection(self):
+        """Test close handles when no connection exists."""
+        from torboxed import ZileanClient
+        
+        client = ZileanClient.__new__(ZileanClient)
+        client._connection = None
+        
+        # Should not raise error
+        client.close()
+        
+        # Connection should still be None
+        self.assertIsNone(client._connection)
+    
+    def test_row_to_dict_conversion(self):
+        """Test _row_to_dict converts database row correctly."""
+        from torboxed import ZileanClient
+        
+        client = ZileanClient.__new__(ZileanClient)
+        
+        # Mock database row (tuple format)
+        row = (
+            "abc123" * 7,  # infoHash (40 chars)
+            "Test.Movie.2024.1080p.BluRay",  # rawTitle
+            "Test Movie",  # parsedTitle
+            "tt1234567",  # imdbId
+            "movie",  # category
+            2024,  # year
+            "1080p",  # resolution
+            "BluRay",  # quality
+            "H.264",  # codec
+            1500000000,  # size
+            "2024-01-01",  # ingestedAt
+            None,  # seasons
+            False,  # complete
+            "AAC",  # audio
+        )
+        
+        result = client._row_to_dict(row)
+        
+        self.assertEqual(result["infoHash"], "abc123" * 7)
+        self.assertEqual(result["rawTitle"], "Test.Movie.2024.1080p.BluRay")
+        self.assertEqual(result["parsedTitle"], "Test Movie")
+        self.assertEqual(result["imdbId"], "tt1234567")
+        self.assertEqual(result["category"], "movie")
+        self.assertEqual(result["year"], 2024)
+
+
+class TestProwlarrClientMethods(unittest.TestCase):
+    """Test ProwlarrClient methods that weren't directly tested."""
+    
+    def setUp(self):
+        """Set up mock Prowlarr client."""
+        from torboxed import ProwlarrClient
+        self.client = ProwlarrClient.__new__(ProwlarrClient)
+        self.client.api_key = "test_api_key"
+        self.client.base_url = "http://prowlarr-ingest:9696"
+    
+    def test_is_configured_true(self):
+        """Test is_configured returns True when API key exists."""
+        self.assertTrue(self.client.is_configured())
+    
+    def test_is_configured_false(self):
+        """Test is_configured returns False when no API key."""
+        self.client.api_key = ""
+        self.assertFalse(self.client.is_configured())
+    
+    def test_is_configured_none(self):
+        """Test is_configured returns False when API key is None."""
+        self.client.api_key = None
+        self.assertFalse(self.client.is_configured())
+
+
+class TestJackettClientMethods(unittest.TestCase):
+    """Test JackettClient methods that weren't directly tested."""
+    
+    def setUp(self):
+        """Set up mock Jackett client."""
+        from torboxed import JackettClient
+        self.client = JackettClient.__new__(JackettClient)
+        self.client.api_key = "test_api_key"
+        self.client.base_url = "http://localhost:9117"
+    
+    def test_is_configured_true(self):
+        """Test is_configured returns True when API key exists."""
+        self.assertTrue(self.client.is_configured())
+    
+    def test_is_configured_false(self):
+        """Test is_configured returns False when no API key."""
+        self.client.api_key = ""
+        self.assertFalse(self.client.is_configured())
+    
+    def test_is_configured_none(self):
+        """Test is_configured returns False when API key is None."""
+        self.client.api_key = None
+        self.assertFalse(self.client.is_configured())
+
+
+class TestTorboxClientMethods(unittest.TestCase):
+    """Test TorboxClient methods that weren't directly tested."""
+    
+    def setUp(self):
+        """Set up mock Torbox client."""
+        from torboxed import TorboxClient
+        self.client = TorboxClient.__new__(TorboxClient)
+        self.client.api_key = "test-key"
+    
+    def test_get_search_engines_empty_response(self):
+        """Test get_search_engines handles empty response."""
+        from torboxed import TorboxClient
+        
+        with patch.object(TorboxClient, '_request', return_value=None):
+            result = self.client.get_search_engines()
+            self.assertEqual(result, [])
+    
+    def test_get_search_engines_success(self):
+        """Test get_search_engines returns list of engines."""
+        from torboxed import TorboxClient
+        
+        mock_response = {
+            "data": [
+                {"id": 1, "name": "1337x"},
+                {"id": 2, "name": "Knaben"},
+            ]
+        }
+        
+        with patch.object(TorboxClient, '_request', return_value=mock_response):
+            result = self.client.get_search_engines()
+            self.assertEqual(len(result), 2)
+            self.assertEqual(result[0]["name"], "1337x")
+
+
+class TestRealDebridClientMethods(unittest.TestCase):
+    """Test RealDebridClient methods that weren't directly tested."""
+    
+    def setUp(self):
+        """Set up mock Real Debrid client."""
+        from torboxed import RealDebridClient
+        self.client = RealDebridClient.__new__(RealDebridClient)
+        self.client.api_key = "test-rd-key"
+
+
+class TestDebridClientFindExisting(unittest.TestCase):
+    """Test DebridClient.find_existing_by_hash method."""
+    
+    def test_find_existing_by_hash_found(self):
+        """Test find_existing_by_hash returns torrent when hash matches."""
+        import torboxed
+        
+        mock_debrid = Mock()
+        mock_debrid.get_my_torrents.return_value = [
+            {"id": "1", "name": "Movie1", "hash": "abc123"},
+            {"id": "2", "name": "Movie2", "hash": "def456"},
+        ]
+        
+        # Create a concrete implementation for testing
+        class TestDebrid(torboxed.DebridClient):
+            def check_cached(self, hashes): return {}
+            def get_my_torrents(self): return mock_debrid.get_my_torrents()
+            def add_torrent(self, magnet, title=""): return None
+            def remove_torrent(self, torrent_id): return True
+        
+        client = TestDebrid()
+        result = client.find_existing_by_hash("abc123")
+        
+        self.assertIsNotNone(result)
+        self.assertEqual(result["id"], "1")
+        self.assertEqual(result["hash"], "abc123")
+    
+    def test_find_existing_by_hash_not_found(self):
+        """Test find_existing_by_hash returns None when hash doesn't match."""
+        import torboxed
+        
+        mock_debrid = Mock()
+        mock_debrid.get_my_torrents.return_value = [
+            {"id": "1", "name": "Movie1", "hash": "abc123"},
+        ]
+        
+        class TestDebrid(torboxed.DebridClient):
+            def check_cached(self, hashes): return {}
+            def get_my_torrents(self): return mock_debrid.get_my_torrents()
+            def add_torrent(self, magnet, title=""): return None
+            def remove_torrent(self, torrent_id): return True
+        
+        client = TestDebrid()
+        result = client.find_existing_by_hash("xyz789")
+        
+        self.assertIsNone(result)
+    
+    def test_find_existing_by_hash_empty_list(self):
+        """Test find_existing_by_hash returns None when no torrents."""
+        import torboxed
+        
+        class TestDebrid(torboxed.DebridClient):
+            def check_cached(self, hashes): return {}
+            def get_my_torrents(self): return []
+            def add_torrent(self, magnet, title=""): return None
+            def remove_torrent(self, torrent_id): return True
+        
+        client = TestDebrid()
+        result = client.find_existing_by_hash("abc123")
+        
+        self.assertIsNone(result)
+
+
+class TestDatabaseHelperFunctions(unittest.TestCase):
+    """Test database helper functions that weren't directly tested."""
+    
+    def setUp(self):
+        """Create temporary database for each test."""
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.test_db_path = Path(self.temp_dir.name) / "test.db"
+        
+        import torboxed
+        self.original_db_path = torboxed.DB_PATH
+        torboxed.DB_PATH = self.test_db_path
+        torboxed.init_db()
+    
+    def tearDown(self):
+        """Clean up temporary database."""
+        import torboxed
+        torboxed.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+    
+    def test_is_processed_true(self):
+        """Test is_processed returns True when item exists."""
+        import torboxed
+        
+        # Add an item
+        torboxed.record_processed(
+            "tt1234567", "Test Movie", 2024, "movie", "added", "success",
+            debrid_id="tb-123", magnet="magnet:test",
+            quality_score=2500, quality_label="1080p"
+        )
+        
+        # Should return True
+        self.assertTrue(torboxed.is_processed("tt1234567"))
+    
+    def test_is_processed_false(self):
+        """Test is_processed returns False when item doesn't exist."""
+        import torboxed
+        
+        # Should return False for non-existent item
+        self.assertFalse(torboxed.is_processed("tt9999999"))
+    
+    def test_is_processed_with_season(self):
+        """Test is_processed with season parameter."""
+        import torboxed
+        
+        # Add a show season
+        torboxed.record_processed(
+            "tt1234567", "Test Show", 2024, "show", "added", "success",
+            debrid_id="tb-123", magnet="magnet:test",
+            quality_score=2500, quality_label="1080p",
+            season="S01"
+        )
+        
+        # Should return True for S01
+        self.assertTrue(torboxed.is_processed("tt1234567", "S01"))
+        # Should return False for S02
+        self.assertFalse(torboxed.is_processed("tt1234567", "S02"))
+
+
+class TestValidateResponse(unittest.TestCase):
+    """Test validate_response and validate_list_response functions."""
+    
+    def test_validate_response_success(self):
+        """Test validate_response with valid data."""
+        from torboxed import validate_response
+        
+        data = {"key1": "value1", "key2": "value2"}
+        result = validate_response(data, ["key1", "key2"])
+        
+        self.assertEqual(result, data)
+    
+    def test_validate_response_missing_keys(self):
+        """Test validate_response raises error when keys missing."""
+        from torboxed import validate_response, APIResponseError
+        
+        data = {"key1": "value1"}
+        
+        with self.assertRaises(APIResponseError):
+            validate_response(data, ["key1", "key2"])
+    
+    def test_validate_response_none_data(self):
+        """Test validate_response raises error when data is None."""
+        from torboxed import validate_response, APIResponseError
+        
+        with self.assertRaises(APIResponseError):
+            validate_response(None, ["key1"])
+    
+    def test_validate_response_non_dict(self):
+        """Test validate_response raises error when data is not dict."""
+        from torboxed import validate_response, APIResponseError
+        
+        with self.assertRaises(APIResponseError):
+            validate_response("not a dict", ["key1"])
+    
+    def test_validate_list_response_success(self):
+        """Test validate_list_response with valid list."""
+        from torboxed import validate_list_response
+        
+        data = [{"id": 1}, {"id": 2}]
+        result = validate_list_response(data)
+        
+        self.assertEqual(result, data)
+    
+    def test_validate_list_response_none(self):
+        """Test validate_list_response returns empty list for None."""
+        from torboxed import validate_list_response
+        
+        result = validate_list_response(None)
+        
+        self.assertEqual(result, [])
+    
+    def test_validate_list_response_non_list(self):
+        """Test validate_list_response raises error for non-list."""
+        from torboxed import validate_list_response, APIResponseError
+        
+        with self.assertRaises(APIResponseError):
+            validate_list_response("not a list")
+
+
+class TestStatsFunctions(unittest.TestCase):
+    """Test get_stats and get_recent functions."""
+    
+    def setUp(self):
+        """Create temporary database for each test."""
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.test_db_path = Path(self.temp_dir.name) / "test.db"
+        
+        import torboxed
+        self.original_db_path = torboxed.DB_PATH
+        torboxed.DB_PATH = self.test_db_path
+        torboxed.init_db()
+    
+    def tearDown(self):
+        """Clean up temporary database."""
+        import torboxed
+        torboxed.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+    
+    def test_get_stats_empty(self):
+        """Test get_stats with empty database."""
+        import torboxed
+        
+        stats = torboxed.get_stats()
+        
+        self.assertEqual(stats["total"], 0)
+        self.assertEqual(stats["by_action"], {})
+        self.assertEqual(stats["by_type"], {})
+        self.assertEqual(stats["recent_upgrades"], [])
+    
+    def test_get_stats_with_data(self):
+        """Test get_stats with data in database."""
+        import torboxed
+        
+        # Add some items
+        torboxed.record_processed(
+            "tt1111111", "Movie 1", 2024, "movie", "added", "success",
+            debrid_id="tb-1", magnet="magnet:1",
+            quality_score=2500, quality_label="1080p"
+        )
+        torboxed.record_processed(
+            "tt2222222", "Movie 2", 2023, "movie", "upgraded", "quality_better",
+            debrid_id="tb-2", magnet="magnet:2",
+            quality_score=3500, quality_label="2160p",
+            replaced_id="tb-old", replaced_score=2500
+        )
+        
+        stats = torboxed.get_stats()
+        
+        self.assertEqual(stats["total"], 2)
+        self.assertEqual(stats["by_action"]["added"], 1)
+        self.assertEqual(stats["by_action"]["upgraded"], 1)
+        self.assertEqual(stats["by_type"]["movie"], 2)
+        self.assertEqual(len(stats["recent_upgrades"]), 1)
+        self.assertEqual(stats["recent_upgrades"][0]["title"], "Movie 2")
+    
+    def test_get_recent_empty(self):
+        """Test get_recent with empty database."""
+        import torboxed
+        
+        items = torboxed.get_recent()
+        
+        self.assertEqual(items, [])
+    
+    def test_get_recent_with_limit(self):
+        """Test get_recent with limit parameter."""
+        import torboxed
+        
+        # Add items
+        for i in range(5):
+            torboxed.record_processed(
+                f"tt{i:07d}", f"Movie {i}", 2024, "movie", "added", "success",
+                debrid_id=f"tb-{i}", magnet=f"magnet:{i}",
+                quality_score=2500, quality_label="1080p"
+            )
+        
+        # Get only 3 items
+        items = torboxed.get_recent(limit=3)
+        
+        self.assertEqual(len(items), 3)
+    
+    def test_get_recent_returns_ordered(self):
+        """Test get_recent returns items in reverse chronological order."""
+        import torboxed
+        
+        # Add items with small delay
+        torboxed.record_processed(
+            "tt1111111", "First Movie", 2024, "movie", "added", "success",
+            debrid_id="tb-1", magnet="magnet:1",
+            quality_score=2500, quality_label="1080p"
+        )
+        
+        torboxed.record_processed(
+            "tt2222222", "Second Movie", 2024, "movie", "added", "success",
+            debrid_id="tb-2", magnet="magnet:2",
+            quality_score=2500, quality_label="1080p"
+        )
+        
+        items = torboxed.get_recent()
+        
+        # Second movie should be first (most recent)
+        self.assertEqual(items[0]["title"], "Second Movie")
+        self.assertEqual(items[1]["title"], "First Movie")
+
+
+class TestShowStatsFunctions(unittest.TestCase):
+    """Test show_stats and show_recent output functions."""
+    
+    def setUp(self):
+        """Create temporary database for each test."""
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.test_db_path = Path(self.temp_dir.name) / "test.db"
+        
+        import torboxed
+        self.original_db_path = torboxed.DB_PATH
+        torboxed.DB_PATH = self.test_db_path
+        torboxed.init_db()
+    
+    def tearDown(self):
+        """Clean up temporary database."""
+        import torboxed
+        torboxed.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+    
+    def test_show_stats_logs_output(self):
+        """Test show_stats logs statistics."""
+        import torboxed
+        from unittest.mock import patch
+        
+        # Add an item
+        torboxed.record_processed(
+            "tt1111111", "Test Movie", 2024, "movie", "added", "success",
+            debrid_id="tb-1", magnet="magnet:1",
+            quality_score=2500, quality_label="1080p"
+        )
+        
+        with patch.object(torboxed.logger, 'info') as mock_info:
+            torboxed.show_stats()
+            
+            # Verify info was logged
+            self.assertTrue(mock_info.called)
+            # Check that stats title was logged
+            log_messages = [str(call) for call in mock_info.call_args_list]
+            self.assertTrue(any("Statistics" in msg for msg in log_messages))
+    
+    def test_show_recent_logs_output(self):
+        """Test show_recent logs recent items."""
+        import torboxed
+        from unittest.mock import patch
+        
+        # Add items
+        torboxed.record_processed(
+            "tt1111111", "Test Movie", 2024, "movie", "added", "success",
+            debrid_id="tb-1", magnet="magnet:1",
+            quality_score=2500, quality_label="1080p"
+        )
+        
+        with patch.object(torboxed.logger, 'info') as mock_info:
+            torboxed.show_recent(limit=5)
+            
+            # Verify info was logged
+            self.assertTrue(mock_info.called)
+
+
+class TestSetupLogging(unittest.TestCase):
+    """Test setup_logging function."""
+    
+    def test_setup_logging_returns_logger(self):
+        """Test setup_logging returns configured logger."""
+        import torboxed
+        
+        logger = torboxed.setup_logging(verbose=False, log_to_file=False)
+        
+        self.assertIsNotNone(logger)
+        self.assertEqual(logger.name, "torboxed")
+    
+    def test_setup_logging_verbose(self):
+        """Test setup_logging with verbose=True."""
+        import torboxed
+        import logging
+        
+        logger = torboxed.setup_logging(verbose=True, log_to_file=False)
+        
+        # Check that DEBUG level is set for console
+        self.assertEqual(logger.level, logging.DEBUG)
+    
+    def test_setup_logging_file_handler(self):
+        """Test setup_logging with file handler."""
+        import torboxed
+        import logging
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "test.log"
+            
+            # Temporarily override log path
+            original_log_path = torboxed.LOG_PATH
+            torboxed.LOG_PATH = log_path
+            
+            try:
+                logger = torboxed.setup_logging(verbose=False, log_to_file=True)
+                
+                # Log a message
+                logger.info("Test message")
+                
+                # Close handlers to flush
+                for handler in logger.handlers:
+                    handler.close()
+                
+                # Check log file was created
+                if log_path.exists():
+                    content = log_path.read_text()
+                    self.assertIn("Test message", content)
+            finally:
+                torboxed.LOG_PATH = original_log_path
+
+
+class TestLogResult(unittest.TestCase):
+    """Test log_result function."""
+    
+    def test_log_result_with_details(self):
+        """Test log_result with details."""
+        import torboxed
+        from unittest.mock import patch
+        
+        with patch.object(torboxed.logger, 'info') as mock_info:
+            torboxed.log_result("added", "Test Movie", {"quality": "1080p", "score": 2500})
+            
+            mock_info.assert_called_once()
+            # Check the formatted message (call_args[0] are positional args, get the formatted string)
+            call_args = mock_info.call_args
+            # The log call uses format string with separate args, check the args
+            self.assertIn("ADDED", str(call_args))
+            self.assertIn("Test Movie", str(call_args))
+    
+    def test_log_result_without_details(self):
+        """Test log_result without details."""
+        import torboxed
+        from unittest.mock import patch
+        
+        with patch.object(torboxed.logger, 'info') as mock_info:
+            torboxed.log_result("skipped", "Test Movie")
+            
+            mock_info.assert_called_once()
+            call_args = mock_info.call_args
+            self.assertIn("SKIPPED", str(call_args))
+
+
+class TestGetDebridService(unittest.TestCase):
+    """Test get_debrid_service function."""
+    
+    def test_default_to_torbox(self):
+        """Test get_debrid_service defaults to torbox."""
+        import torboxed
+        from unittest.mock import patch
+        
+        with patch.object(torboxed, 'get_env') as mock_get_env:
+            mock_get_env.return_value = {}
+            
+            result = torboxed.get_debrid_service()
+            
+            self.assertEqual(result, "torbox")
+    
+    def test_explicit_torbox(self):
+        """Test get_debrid_service with explicit torbox."""
+        import torboxed
+        from unittest.mock import patch
+        
+        with patch.object(torboxed, 'get_env') as mock_get_env:
+            mock_get_env.return_value = {"DEBRID_SERVICE": "torbox"}
+            
+            result = torboxed.get_debrid_service()
+            
+            self.assertEqual(result, "torbox")
+    
+    def test_real_debrid(self):
+        """Test get_debrid_service with real_debrid."""
+        import torboxed
+        from unittest.mock import patch
+        
+        with patch.object(torboxed, 'get_env') as mock_get_env:
+            mock_get_env.return_value = {"DEBRID_SERVICE": "real_debrid"}
+            
+            result = torboxed.get_debrid_service()
+            
+            self.assertEqual(result, "real_debrid")
+    
+    def test_unknown_service_defaults_to_torbox(self):
+        """Test get_debrid_service with unknown service defaults to torbox."""
+        import torboxed
+        from unittest.mock import patch
+        
+        with patch.object(torboxed, 'get_env') as mock_get_env, \
+             patch.object(torboxed.logger, 'warning') as mock_warning:
+            mock_get_env.return_value = {"DEBRID_SERVICE": "unknown_service"}
+            
+            result = torboxed.get_debrid_service()
+            
+            self.assertEqual(result, "torbox")
+            mock_warning.assert_called_once()
+
+
+class TestGetEnvFunctions(unittest.TestCase):
+    """Test get_env and related functions."""
+    
+    def setUp(self):
+        """Clear env cache before each test."""
+        import torboxed
+        torboxed._env_cache = None
+    
+    def test_get_env_lazy_loads(self):
+        """Test get_env lazy loads environment."""
+        import torboxed
+        from unittest.mock import patch
+        
+        with patch.object(torboxed, 'load_env') as mock_load_env:
+            mock_load_env.return_value = {"TORBOX_API_KEY": "test_key"}
+            
+            # First call should load
+            result = torboxed.get_env()
+            self.assertEqual(result["TORBOX_API_KEY"], "test_key")
+            mock_load_env.assert_called_once()
+            
+            # Second call should use cache
+            mock_load_env.reset_mock()
+            result2 = torboxed.get_env()
+            self.assertEqual(result2["TORBOX_API_KEY"], "test_key")
+            mock_load_env.assert_not_called()
+
+
+class TestLoadEnv(unittest.TestCase):
+    """Test load_env function edge cases."""
+    
+    def test_load_env_missing_file(self):
+        """Test load_env with missing file."""
+        import torboxed
+        
+        # Save original path
+        original_path = torboxed.ENV_PATH
+        
+        try:
+            # Point to non-existent file
+            torboxed.ENV_PATH = Path("/nonexistent/path/.env")
+            
+            result = torboxed.load_env()
+            
+            self.assertEqual(result, {})
+        finally:
+            torboxed.ENV_PATH = original_path
+
+
+class TestAPIErrorClasses(unittest.TestCase):
+    """Test API error exception classes."""
+    
+    def test_api_error_with_status_code(self):
+        """Test APIError with status code."""
+        from torboxed import APIError
+        
+        error = APIError("Test error", status_code=500)
+        
+        self.assertEqual(str(error), "Test error")
+        self.assertEqual(error.status_code, 500)
+        self.assertIsNone(error.retry_after)
+    
+    def test_api_error_with_retry_after(self):
+        """Test APIError with retry_after."""
+        from torboxed import APIError
+        
+        error = APIError("Rate limited", status_code=429, retry_after=60)
+        
+        self.assertEqual(error.status_code, 429)
+        self.assertEqual(error.retry_after, 60)
+    
+    def test_rate_limit_error_is_api_error(self):
+        """Test RateLimitError is subclass of APIError."""
+        from torboxed import RateLimitError, APIError
+        
+        error = RateLimitError("Rate limited", status_code=429)
+        
+        self.assertIsInstance(error, APIError)
+        self.assertEqual(error.status_code, 429)
+    
+    def test_api_response_error_is_api_error(self):
+        """Test APIResponseError is subclass of APIError."""
+        from torboxed import APIResponseError, APIError
+        
+        error = APIResponseError("Invalid response")
+        
+        self.assertIsInstance(error, APIError)
+
+
+if __name__ == "__main__":
+    unittest.main()

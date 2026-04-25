@@ -1504,6 +1504,32 @@ def migrate_db():
                 logger.error("Failed to add telegram_settings column: %s", e)
                 # Don't raise - this is non-critical
         
+        # Migration 3: Add debrid_service column and rename torbox_id to debrid_id
+        cursor = conn.execute("PRAGMA table_info(processed)")
+        processed_columns = [row[1] for row in cursor.fetchall()]
+        
+        if "debrid_service" not in processed_columns:
+            logger.info("Migrating database schema to support multiple debrid services...")
+            try:
+                # Add debrid_service column with default 'torbox' for backward compatibility
+                conn.execute("ALTER TABLE processed ADD COLUMN debrid_service TEXT DEFAULT 'torbox'")
+                
+                # Rename torbox_id to debrid_id if torbox_id exists
+                if "torbox_id" in processed_columns and "debrid_id" not in processed_columns:
+                    conn.execute("ALTER TABLE processed RENAME COLUMN torbox_id TO debrid_id")
+                    logger.info("Renamed torbox_id to debrid_id")
+                elif "torbox_id" not in processed_columns and "debrid_id" not in processed_columns:
+                    # Neither column exists, add debrid_id
+                    conn.execute("ALTER TABLE processed ADD COLUMN debrid_id TEXT")
+                
+                conn.commit()
+                logger.info("Added debrid_service column and updated debrid_id column")
+                migrations_performed = True
+            except sqlite3.Error as e:
+                logger.debug("Debrid service migration traceback:", exc_info=True)
+                logger.error("Failed to add debrid_service column: %s", e)
+                # Don't raise - this is non-critical
+        
         return migrations_performed
 
 
@@ -1528,7 +1554,8 @@ def init_db():
                 content_type TEXT CHECK(content_type IN ('movie', 'show')),
                 action TEXT CHECK(action IN ('added', 'upgraded', 'skipped', 'failed')),
                 reason TEXT,
-                torbox_id TEXT,
+                debrid_service TEXT DEFAULT 'torbox',
+                debrid_id TEXT,
                 magnet TEXT,
                 quality_score INTEGER,
                 quality_label TEXT,
@@ -1542,6 +1569,8 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_type ON processed(content_type);
             CREATE INDEX IF NOT EXISTS idx_processed_at ON processed(processed_at);
             CREATE INDEX IF NOT EXISTS idx_imdb_id ON processed(imdb_id);
+            CREATE INDEX IF NOT EXISTS idx_debrid_service ON processed(debrid_service);
+            CREATE INDEX IF NOT EXISTS idx_debrid_id ON processed(debrid_id);
             
             -- Insert default config if empty
             INSERT OR IGNORE INTO config (id, sources, limits, quality_prefs, filters, telegram_settings)
@@ -1628,21 +1657,27 @@ def get_processed_show_seasons(imdb_id: str) -> List[Dict[str, Any]]:
 
 
 def record_processed(imdb_id: str, title: str, year: int, content_type: str,
-                     action: str, reason: str, torbox_id: Optional[str] = None,
+                     action: str, reason: str, debrid_id: Optional[str] = None,
                      magnet: Optional[str] = None, quality_score: Optional[int] = None,
                      quality_label: Optional[str] = None, replaced_id: Optional[str] = None,
-                     replaced_score: Optional[int] = None, season: str = "unknown"):
+                     replaced_score: Optional[int] = None, season: str = "unknown",
+                     debrid_service: Optional[str] = None):
     """Record what we did.
     
     For TV shows, includes season identifier to track each season separately.
+    Tracks debrid service to support multiple debrid providers.
     """
+    # Default to current service if not specified
+    if debrid_service is None:
+        debrid_service = get_debrid_service()
+    
     with get_db() as conn:
         conn.execute('''
             INSERT OR REPLACE INTO processed 
-            (imdb_id, season, title, year, content_type, action, reason, torbox_id, magnet, 
+            (imdb_id, season, title, year, content_type, action, reason, debrid_service, debrid_id, magnet, 
              quality_score, quality_label, replaced_id, replaced_score, processed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (imdb_id, season, title, year, content_type, action, reason, torbox_id, magnet,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (imdb_id, season, title, year, content_type, action, reason, debrid_service, debrid_id, magnet,
               quality_score, quality_label, replaced_id, replaced_score, datetime.now(timezone.utc).isoformat()))
         conn.commit()
 
@@ -3656,7 +3691,7 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
     # For shows, we need season info to handle multi-season packs
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT imdb_id, title, year, torbox_id, season, content_type FROM processed WHERE torbox_id IS NOT NULL"
+            "SELECT imdb_id, title, year, debrid_id, season, content_type FROM processed WHERE debrid_id IS NOT NULL"
         ).fetchall()
     
     # Build lookup structures
@@ -3665,8 +3700,8 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
     
     for row in rows:
         # Direct ID lookup (most reliable)
-        if row['torbox_id']:
-            db_by_debrid_id[str(row['torbox_id'])] = (row['imdb_id'], row['season'])
+        if row['debrid_id']:
+            db_by_debrid_id[str(row['debrid_id'])] = (row['imdb_id'], row['season'])
         
         # Fallback name lookup - group by title+year to handle multi-season shows
         key = f"{row['title'].lower()}:{row['year']}"
@@ -3757,7 +3792,7 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
                                 multi_season_updates.append({
                                     'imdb_id': show_imdb_id,
                                     'season': show_season,
-                                    'torbox_id': debrid_id,
+                                    'debrid_id': debrid_id,
                                     'title': db_title,
                                     'year': db_year or torrent_year or 0
                                 })
@@ -3782,23 +3817,23 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
         logger.info("Updating %d additional season records for multi-season packs...", len(multi_season_updates))
         with get_db() as conn:
             for update in multi_season_updates:
-                # Only update if this season doesn't already have this torbox_id
-                existing = conn.execute(
-                    "SELECT torbox_id FROM processed WHERE imdb_id=? AND season=?",
-                    (update['imdb_id'], update['season'])
-                ).fetchone()
-                
-                if not existing or not existing['torbox_id']:
-                    conn.execute('''
-                        INSERT OR REPLACE INTO processed 
-                        (imdb_id, season, title, year, content_type, action, reason, torbox_id, 
-                         quality_score, quality_label, processed_at)
-                        VALUES (?, ?, ?, ?, 'show', 'added', 'multi_season_pack_discovery', ?, 
-                                NULL, NULL, ?)
-                    ''', (update['imdb_id'], update['season'], update['title'], update['year'], 
-                          update['torbox_id'], datetime.now(timezone.utc).isoformat()))
-                    logger.debug("Updated season %s for %s with torbox_id %s", 
-                                update['season'], update['imdb_id'], update['torbox_id'])
+                    # Only update if this season doesn't already have this debrid_id
+                    existing = conn.execute(
+                        "SELECT debrid_id FROM processed WHERE imdb_id=? AND season=?",
+                        (update['imdb_id'], update['season'])
+                    ).fetchone()
+                    
+                    if not existing or not existing['debrid_id']:
+                        conn.execute('''
+                            INSERT OR REPLACE INTO processed 
+                            (imdb_id, season, title, year, content_type, action, reason, debrid_service, debrid_id, 
+                             quality_score, quality_label, processed_at)
+                            VALUES (?, ?, ?, ?, 'show', 'added', 'multi_season_pack_discovery', ?, ?, 
+                                    NULL, NULL, ?)
+                        ''', (update['imdb_id'], update['season'], update['title'], update['year'], 
+                              update.get('debrid_service', 'torbox'), update['debrid_id'], datetime.now(timezone.utc).isoformat()))
+                        logger.debug("Updated season %s for %s with debrid_id %s", 
+                                    update['season'], update['imdb_id'], update['debrid_id'])
         
         logger.info("Updated database with %d multi-season pack associations", len(multi_season_updates))
     
@@ -3814,9 +3849,9 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
 def verify_and_clear_dropped_torrents(existing_torrents: Optional[Tuple[Dict[str, str], Set[str]]]) -> int:
     """Verify database records against discovered torrents and clear dropped ones.
     
-    Compares all processed items with torbox_id against the discovered torrents
-    from Torbox. If a torrent is in the database but NOT in the discovery results,
-    it means Torbox dropped it and we need to re-add it.
+    Compares all processed items with debrid_id against the discovered torrents
+    from the debrid account. If a torrent is in the database but NOT in the discovery results,
+    it means the debrid service dropped it and we need to re-add it.
     
     SAFETY: Only clears records if discovery succeeded. If existing_torrents is None
     (API failure), returns 0 without clearing anything.
@@ -3844,7 +3879,7 @@ def verify_and_clear_dropped_torrents(existing_torrents: Optional[Tuple[Dict[str
     # SAFETY CHECK: Get total tracked torrents count for comparison
     with get_db() as conn:
         total_tracked = conn.execute(
-            "SELECT COUNT(DISTINCT torbox_id) FROM processed WHERE torbox_id IS NOT NULL"
+            "SELECT COUNT(DISTINCT debrid_id) FROM processed WHERE debrid_id IS NOT NULL"
         ).fetchone()[0]
     
     # SAFETY CHECK: If we discovered significantly fewer torrents than tracked, 
@@ -3857,26 +3892,26 @@ def verify_and_clear_dropped_torrents(existing_torrents: Optional[Tuple[Dict[str
         )
         return 0
     
-    # Get all processed items with torbox_id from database
+    # Get all processed items with debrid_id from database
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT imdb_id, season, title, torbox_id FROM processed WHERE torbox_id IS NOT NULL"
+            "SELECT imdb_id, season, title, debrid_id FROM processed WHERE debrid_id IS NOT NULL"
         ).fetchall()
     
     cleared_count = 0
     dropped_items = []
     
     for row in rows:
-        db_torbox_id = row["torbox_id"]
+        db_debrid_id = row["debrid_id"]
         imdb_id = row["imdb_id"]
         season = row["season"]
         title = row["title"]
         
-        # Check if this torbox_id is still in the account
-        if db_torbox_id not in discovered_ids:
-            # Torrent was dropped from Torbox - clear the record
-            logger.info("Detected dropped torrent: %s (season: %s, torbox_id: %s)",
-                       title, season, db_torbox_id)
+        # Check if this debrid_id is still in the account
+        if db_debrid_id not in discovered_ids:
+            # Torrent was dropped from debrid account - clear the record
+            logger.info("Detected dropped torrent: %s (season: %s, debrid_id: %s)",
+                       title, season, db_debrid_id)
             
             # Reset this item (will force re-processing)
             reset_count = reset_item(imdb_id, season if season != "unknown" else None)
@@ -3928,10 +3963,10 @@ def cleanup_unmatched_torrents() -> None:
     
     # Get all debrid IDs from database
     with get_db() as conn:
-        rows = conn.execute("SELECT DISTINCT torbox_id FROM processed WHERE torbox_id IS NOT NULL").fetchall()
+        rows = conn.execute("SELECT DISTINCT debrid_id FROM processed WHERE debrid_id IS NOT NULL").fetchall()
     
-    db_debrid_ids = {str(row['torbox_id']) for row in rows}
-    logger.info("Database has %d tracked torrents", len(db_torbox_ids))
+    db_debrid_ids = {str(row['debrid_id']) for row in rows}
+    logger.info("Database has %d tracked torrents", len(db_debrid_ids))
     
     # Find unmatched torrents
     unmatched = []
@@ -4162,7 +4197,7 @@ class SyncEngine:
         existing = get_processed_item(imdb_id, "unknown")
         
         # If already have max quality, skip searching entirely
-        if existing and existing.get("torbox_id"):
+        if existing and existing.get("debrid_id"):
             current_score = existing.get("quality_score") or 0
             if is_max_quality(current_score):
                 logger.info("Max quality reached for %s (score: %d) - skipping search", 
@@ -4170,12 +4205,12 @@ class SyncEngine:
                 log_result("skipped", title, {"reason": "max_quality", "score": current_score})
                 return True
         
-        # Check if already exists in Torbox (from discovery phase)
-        torbox_id = existing_torrents.get(imdb_id)
-        if torbox_id:
-            logger.info("Already in Torbox: %s (torbox_id: %s)", title, torbox_id)
+        # Check if already exists in debrid account (from discovery phase)
+        debrid_id = existing_torrents.get(imdb_id)
+        if debrid_id:
+            logger.info("Already in debrid account: %s (debrid_id: %s)", title, debrid_id)
             record_processed(imdb_id, title, year, "movie", "skipped", 
-                           "already_in_torbox", torbox_id=torbox_id,
+                           "already_in_debrid", debrid_id=debrid_id,
                            quality_score=(existing or {}).get("quality_score") or 0)
             self._increment_stats("skipped", "movie")
             return True
@@ -4200,7 +4235,7 @@ class SyncEngine:
         logger.info("Best quality found: %s (score: %d)", best.quality.label, best.quality.score)
         
         # Check if already have this movie
-        if existing and existing.get("torbox_id"):
+        if existing and existing.get("debrid_id"):
             return self._handle_upgrade(imdb_id, title, year, "movie", existing, cached)
         
         # Check if best torrent's hash already exists in account (manual add or discovery miss)
@@ -4472,37 +4507,41 @@ class SyncEngine:
                            title, season_key)
         
         # If already have max quality for this season, skip
-        if existing and existing.get("torbox_id") and not is_phantom_record:
+        if existing and existing.get("debrid_id") and not is_phantom_record:
             current_score = existing.get("quality_score") or 0
             if is_max_quality(current_score):
-                logger.info("Max quality reached for %s %s (score: %d) - skipping", 
-                           title, season_key, current_score)
+                logger.info("Max quality reached for %s (score: %d) - skipping search", 
+                           display_title, current_score)
+                log_result("skipped", display_title, {"reason": "max_quality", "score": current_score})
+                record_processed(imdb_id, title, year, content_type, "skipped", 
+                               "max_quality", debrid_id=existing.get("debrid_id"),
+                               quality_score=current_score, season=season_key)
                 return True
         
-        # Check if this season is already in Torbox (database record with upgrade potential)
+        # Check if this season is already in debrid account (database record with upgrade potential)
         # Skip phantom records - they need actual addition, not upgrade check
-        if existing and existing.get("torbox_id") and not is_phantom_record:
+        if existing and existing.get("debrid_id") and not is_phantom_record:
             # For upgrades, pass a single-item list since we only check the best one
             return self._handle_upgrade(imdb_id, title, year, "show", existing, [torrent], season_key)
         
-        # SECOND: Check if this show was already discovered in Torbox (from discovery phase)
+        # SECOND: Check if this show was already discovered in debrid account (from discovery phase)
         # This handles multi-season packs where discovery found the show but this
         # specific season doesn't have a database record yet (e.g., newly matched season)
         # 
         # CRITICAL: Skip this check for episode-level items (S01E01 format).
         # Discovery matches at the show/season-pack level, not episode level.
         # If we skip episodes here, they never get added even when they're missing.
-        torbox_id = existing_torrents.get(imdb_id)
+        debrid_id = existing_torrents.get(imdb_id)
         is_episode = 'E' in season_key or len(season_key) > 3  # S01E01 vs S01
         
-        if torbox_id and not existing and not is_episode:
+        if debrid_id and not existing and not is_episode:
             # Only skip for season-level items (S01, S02) or complete series
             # Episode-level items should proceed to hash check or addition
             display_title = self._display_title(title, "show", season_key)
-            logger.info("Already in Torbox: %s (torbox_id: %s, discovered in multi-season pack)", 
-                       display_title, torbox_id)
+            logger.info("Already in debrid account: %s (debrid_id: %s, discovered in multi-season pack)", 
+                       display_title, debrid_id)
             record_processed(imdb_id, title, year, "show", "skipped",
-                           "already_in_torbox", torbox_id=torbox_id,
+                           "already_in_debrid", debrid_id=debrid_id,
                            quality_score=torrent.quality.score, season=season_key)
             self._increment_stats("skipped", "show")
             return True
@@ -4510,10 +4549,10 @@ class SyncEngine:
         # Check if torrent hash already exists in account (manual add or discovery miss)
         if self._is_hash_in_account(torrent.hash):
             display_title = self._display_title(title, "show", season_key)
-            logger.info("Already in Torbox: %s (hash match)", display_title)
-            log_result("skipped", display_title, {"reason": "already_in_torbox_by_hash", "hash": torrent.hash[:16] if torrent.hash else "unknown"})
+            logger.info("Already in debrid account: %s (hash match)", display_title)
+            log_result("skipped", display_title, {"reason": "already_in_debrid_by_hash", "hash": torrent.hash[:16] if torrent.hash else "unknown"})
             record_processed(imdb_id, title, year, "show", "skipped",
-                           "already_in_torbox_by_hash",
+                           "already_in_debrid_by_hash",
                            quality_score=torrent.quality.score, season=season_key)
             self._increment_stats("skipped", "show")
             return True
@@ -4573,7 +4612,7 @@ class SyncEngine:
                 self.account_hashes.add(torrent.hash.lower())
             record_processed(
                 imdb_id, title, year, content_type, "added", "success",
-                torbox_id=new_id, magnet=torrent.magnet,
+                debrid_id=new_id, magnet=torrent.magnet,
                 quality_score=torrent.quality.score, quality_label=torrent.quality.label,
                 season=season_key
             )
@@ -4608,7 +4647,7 @@ class SyncEngine:
         """
         display_title = self._display_title(title, content_type, season_key)
         current_score = existing.get("quality_score") or 0
-        old_id = existing.get("torbox_id")
+        old_id = existing.get("debrid_id")
 
         # Check if we've exhausted all torrents
         if torrent_index >= len(cached):
@@ -4630,7 +4669,7 @@ class SyncEngine:
                         display_title, current_score, torrent.quality.score)
             log_result("skipped", display_title, {"reason": "current_better", "score": current_score})
             record_processed(imdb_id, title, year, content_type, "skipped",
-                           "current_better", torbox_id=old_id,
+                           "current_better", debrid_id=old_id,
                            quality_score=current_score, season=season_key)
             return False
 
@@ -4670,7 +4709,7 @@ class SyncEngine:
         # Record successful upgrade
         record_processed(
             imdb_id, title, year, content_type, "upgraded", "quality_better",
-            torbox_id=new_id, magnet=torrent.magnet,
+            debrid_id=new_id, magnet=torrent.magnet,
             quality_score=torrent.quality.score, quality_label=torrent.quality.label,
             replaced_id=old_id, replaced_score=current_score,
             season=season_key
