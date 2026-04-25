@@ -23,11 +23,15 @@ from torboxed import (
     TorrentResult, get_processed_show_seasons, reset_item,
     TraktClient,
     # Security functions
-    sanitize_error_text, _validate_cron_expression, get_lock_path,
+    sanitize_error_text, sanitize_response_error, _validate_cron_expression, get_lock_path,
     validate_db_path, validate_log_path, RateLimitedLogHandler,
     check_and_acquire_lock,
     # Telegram notifications
-    TelegramNotifier, get_telegram_notifier, get_telegram_bot_token, get_telegram_chat_id
+    TelegramNotifier, get_telegram_notifier, get_telegram_bot_token, get_telegram_chat_id,
+    # Search helpers
+    build_search_result, normalize_search_query, encode_magnet_link, normalize_hash,
+    # Constants
+    COMPLETE_PACK_MIN_SIZE
 )
 
 
@@ -3971,6 +3975,430 @@ class TestTraktFetchByCategory(unittest.TestCase):
 
 
 
-if __name__ == "__main__":
-    # Run tests with verbosity
-    unittest.main(verbosity=2)
+class TestProcessSeasonWithExistingTorrents(unittest.TestCase):
+    """TEST-012: _process_season uses existing_torrents to skip discovery matches."""
+    
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.test_db_path = Path(self.temp_dir.name) / "test.db"
+        
+        import torboxed
+        self.original_db_path = torboxed.DB_PATH
+        torboxed.DB_PATH = self.test_db_path
+        torboxed.init_db()
+        
+        mock_torbox = Mock()
+        mock_trakt = Mock()
+        self.engine = torboxed.SyncEngine(mock_torbox, mock_trakt, {
+            "sources": ["shows/trending"],
+            "filters": {"exclude": ["CAM", "TS", "HDCAM"], "min_resolution_score": 800}
+        })
+    
+    def tearDown(self):
+        import torboxed
+        torboxed.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+    
+    def test_skips_when_imdb_id_in_existing_torrents(self):
+        """Test that _process_season skips when IMDB ID found in existing_torrents."""
+        import torboxed
+        
+        mock_torrent = TorrentResult(
+            name="Test.Show.S01.1080p.BluRay",
+            magnet="magnet:s01",
+            availability=True,
+            size=50000,
+            quality=torboxed.QualityInfo(resolution="1080p", source="Blu-ray", codec="H.264", score=3500),
+            season_info=SeasonInfo(seasons=[1], is_complete=False, season_label="S01", is_pack=True)
+        )
+        
+        result = self.engine._process_season(
+            "tt1234567", "Test Show", 2024, "S01",
+            mock_torrent, {"tt1234567": "tb-discovery-match"}
+        )
+        
+        self.assertTrue(result)
+        processed = torboxed.get_processed_item("tt1234567", "S01")
+        self.assertEqual(processed["action"], "skipped")
+        self.assertEqual(processed["reason"], "already_in_torbox")
+        self.assertEqual(processed["torbox_id"], "tb-discovery-match")
+    
+    def test_proceeds_when_not_in_existing_torrents(self):
+        """Test that _process_season proceeds normally when IMDB ID not in existing_torrents."""
+        import torboxed
+        
+        mock_torrent = TorrentResult(
+            name="New.Show.S01.1080p.BluRay",
+            magnet="magnet:new-s01",
+            availability=True,
+            size=50000,
+            quality=torboxed.QualityInfo(resolution="1080p", source="Blu-ray", codec="H.264", score=3500),
+            season_info=SeasonInfo(seasons=[1], is_complete=False, season_label="S01", is_pack=True)
+        )
+        
+        self.engine.torbox.add_torrent.return_value = "new-tb-id"
+        
+        result = self.engine._process_season(
+            "tt9999999", "New Show", 2024, "S01",
+            mock_torrent, {}  # Empty existing_torrents
+        )
+        
+        self.assertTrue(result)
+        processed = torboxed.get_processed_item("tt9999999", "S01")
+        self.assertEqual(processed["action"], "added")
+        self.assertEqual(processed["torbox_id"], "new-tb-id")
+
+
+class TestHandleNewAdditionFallback(unittest.TestCase):
+    """TEST-013: _handle_new_addition falls back to next torrent if first fails."""
+    
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.test_db_path = Path(self.temp_dir.name) / "test.db"
+        
+        import torboxed
+        self.original_db_path = torboxed.DB_PATH
+        torboxed.DB_PATH = self.test_db_path
+        torboxed.init_db()
+        
+        mock_torbox = Mock()
+        mock_trakt = Mock()
+        self.engine = torboxed.SyncEngine(mock_torbox, mock_trakt, {
+            "sources": ["movies/trending"],
+            "filters": {"exclude": ["CAM", "TS", "HDCAM"], "min_resolution_score": 800}
+        })
+    
+    def tearDown(self):
+        import torboxed
+        torboxed.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+    
+    def test_fallback_to_second_torrent_when_first_fails(self):
+        """Test that _handle_new_addition tries second torrent when first fails."""
+        import torboxed
+        
+        first_torrent = TorrentResult(
+            name="Movie.2024.1080p.BluRay.x264", magnet="magnet:first",
+            availability=True, size=10000,
+            quality=torboxed.QualityInfo(resolution="1080p", source="Blu-ray", codec="H.264", score=3500)
+        )
+        second_torrent = TorrentResult(
+            name="Movie.2024.1080p.WEB-DL.x264", magnet="magnet:second",
+            availability=True, size=8000,
+            quality=torboxed.QualityInfo(resolution="1080p", source="WEB-DL", codec="H.264", score=3400)
+        )
+        cached = [first_torrent, second_torrent]
+        
+        self.engine.torbox.add_torrent.side_effect = [None, "new-id-from-fallback"]
+        
+        result = self.engine._handle_new_addition("tt1234567", "Movie", 2024, "movie", cached, 0)
+        
+        self.assertTrue(result)
+        self.assertEqual(self.engine.torbox.add_torrent.call_count, 2)
+        self.engine.torbox.add_torrent.assert_any_call("magnet:first", "Movie.2024.1080p.BluRay.x264")
+        self.engine.torbox.add_torrent.assert_any_call("magnet:second", "Movie.2024.1080p.WEB-DL.x264")
+        
+        processed = torboxed.get_processed_item("tt1234567")
+        self.assertEqual(processed["action"], "added")
+        self.assertEqual(processed["torbox_id"], "new-id-from-fallback")
+    
+    def test_all_torrents_fail(self):
+        """Test that _handle_new_addition records failure when all torrents fail."""
+        import torboxed
+        
+        torrent = TorrentResult(
+            name="Movie.2024.1080p.BluRay.x264", magnet="magnet:fail",
+            availability=True, size=10000,
+            quality=torboxed.QualityInfo(resolution="1080p", source="Blu-ray", codec="H.264", score=3500)
+        )
+        cached = [torrent]
+        
+        self.engine.torbox.add_torrent.return_value = None
+        
+        result = self.engine._handle_new_addition("tt7654321", "Movie", 2024, "movie", cached, 0)
+        
+        self.assertFalse(result)
+        processed = torboxed.get_processed_item("tt7654321")
+        self.assertEqual(processed["action"], "failed")
+        self.assertEqual(processed["reason"], "all_torrents_failed")
+
+
+class TestNormalizeSearchQuery(unittest.TestCase):
+    """TEST-014: normalize_search_query edge cases."""
+    
+    def test_basic_normalization(self):
+        query = "Spider-Man: Beyond the Spider-Verse"
+        result = normalize_search_query(query)
+        self.assertEqual(result, "Spider Man Beyond the Spider Verse")
+    
+    def test_accents_removed(self):
+        query = "Pok\u00e9mon Detective Pikachu"
+        result = normalize_search_query(query)
+        self.assertNotIn("\u00e9", result)
+    
+    def test_multiple_colons(self):
+        query = "Star Wars: Episode IV: A New Hope"
+        result = normalize_search_query(query)
+        self.assertEqual(result, "Star Wars Episode IV A New Hope")
+    
+    def test_commas_removed(self):
+        query = "The Good, the Bad and the Ugly"
+        result = normalize_search_query(query)
+        self.assertNotIn(",", result)
+    
+    def test_multiple_spaces_collapsed(self):
+        query = "Movie   2024   BluRay"
+        result = normalize_search_query(query)
+        self.assertEqual(result, "Movie 2024 BluRay")
+    
+    def test_hyphens_replaced(self):
+        query = "Wolf-Hall Season 1"
+        result = normalize_search_query(query)
+        self.assertNotIn("-", result)
+
+
+class TestParseSeasonInfoCompleteSeries(unittest.TestCase):
+    """TEST-015: parse_season_info with complete series + specific season range."""
+    
+    def test_complete_without_specific_seasons(self):
+        """Test 'Complete' keyword without season numbers."""
+        info = parse_season_info("Show.Complete.1080p.BluRay")
+        
+        self.assertIsNotNone(info)
+        self.assertTrue(info.is_complete)
+        self.assertEqual(info.season_label, "Complete")
+        self.assertEqual(info.seasons, [0])
+    
+    def test_complete_with_season_range(self):
+        """Test 'Complete S01-S05' format."""
+        info = parse_season_info("Show.Complete.S01.S05.1080p.BluRay")
+        
+        self.assertIsNotNone(info)
+        self.assertTrue(info.is_complete)
+    
+    def test_multi_season_pack_without_complete(self):
+        """Test multi-season pack without 'Complete' keyword."""
+        info = parse_season_info("Show.S01.S05.1080p.BluRay")
+        
+        self.assertIsNotNone(info)
+        self.assertFalse(info.is_complete)
+        self.assertEqual(info.season_label, "S01-S05")
+        self.assertEqual(info.seasons, [1, 5])
+    
+    def test_single_episode_not_pack(self):
+        """Test single episode is detected as not a pack."""
+        info = parse_season_info("Show.S01E05.1080p.BluRay")
+        
+        self.assertIsNotNone(info)
+        self.assertFalse(info.is_pack)
+        self.assertEqual(info.episode, 5)
+        self.assertEqual(info.season_label, "S01E05")
+
+
+class TestDisplayTitleHelper(unittest.TestCase):
+    """TEST-016: _display_title helper method."""
+    
+    def test_movie_title_no_season(self):
+        title = SyncEngine._display_title("The Matrix", "movie", "unknown")
+        self.assertEqual(title, "The Matrix")
+    
+    def test_show_title_with_season(self):
+        title = SyncEngine._display_title("Breaking Bad", "show", "S03")
+        self.assertEqual(title, "Breaking Bad (S03)")
+    
+    def test_show_title_unknown_season(self):
+        title = SyncEngine._display_title("Breaking Bad", "show", "unknown")
+        self.assertEqual(title, "Breaking Bad")
+    
+    def test_complete_season_pack(self):
+        title = SyncEngine._display_title("Breaking Bad", "show", "Complete")
+        self.assertEqual(title, "Breaking Bad (Complete)")
+
+
+class TestGetSearcherList(unittest.TestCase):
+    """TEST-016: _get_searcher_list helper method."""
+    
+    def test_all_configured(self):
+        mock_torbox = Mock()
+        mock_torbox.searcher_zilean.is_configured.return_value = True
+        mock_torbox.searcher_prowlarr.is_configured.return_value = True
+        mock_torbox.searcher_jackett.is_configured.return_value = True
+        
+        engine = SyncEngine.__new__(SyncEngine)
+        engine.torbox = mock_torbox
+        
+        result = engine._get_searcher_list()
+        self.assertEqual(result, "Zilean → Prowlarr → Jackett")
+    
+    def test_none_configured(self):
+        mock_torbox = Mock()
+        mock_torbox.searcher_zilean.is_configured.return_value = False
+        mock_torbox.searcher_prowlarr.is_configured.return_value = False
+        mock_torbox.searcher_jackett.is_configured.return_value = False
+        
+        engine = SyncEngine.__new__(SyncEngine)
+        engine.torbox = mock_torbox
+        
+        result = engine._get_searcher_list()
+        self.assertEqual(result, "none configured")
+    
+    def test_only_zilean(self):
+        mock_torbox = Mock()
+        mock_torbox.searcher_zilean.is_configured.return_value = True
+        mock_torbox.searcher_prowlarr.is_configured.return_value = False
+        mock_torbox.searcher_jackett.is_configured.return_value = False
+        
+        engine = SyncEngine.__new__(SyncEngine)
+        engine.torbox = mock_torbox
+        
+        result = engine._get_searcher_list()
+        self.assertEqual(result, "Zilean")
+
+
+class TestGetFilterConfig(unittest.TestCase):
+    """TEST-016: _get_filter_config helper method."""
+    
+    def test_default_values(self):
+        engine = SyncEngine.__new__(SyncEngine)
+        engine.config = {"filters": {}}
+        
+        excluded, min_score = engine._get_filter_config()
+        # When exclude is not in filters, defaults to ["CAM", "TS", "HDCAM"]
+        self.assertEqual(excluded, ["CAM", "TS", "HDCAM"])
+        self.assertEqual(min_score, 800)
+    
+    def test_custom_values(self):
+        engine = SyncEngine.__new__(SyncEngine)
+        engine.config = {"filters": {"exclude": ["CAM", "TS"], "min_resolution_score": 1500}}
+        
+        excluded, min_score = engine._get_filter_config()
+        self.assertEqual(excluded, ["CAM", "TS"])
+        self.assertEqual(min_score, 1500)
+
+
+class TestVerifyAndClearDroppedTorrents(unittest.TestCase):
+    """TEST-017: verify_and_clear_dropped_torrents safety threshold."""
+    
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.test_db_path = Path(self.temp_dir.name) / "test.db"
+        
+        import torboxed
+        self.original_db_path = torboxed.DB_PATH
+        torboxed.DB_PATH = self.test_db_path
+        torboxed.init_db()
+    
+    def tearDown(self):
+        import torboxed
+        torboxed.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+    
+    def test_returns_zero_when_discovery_failed(self):
+        """Test that None discovery result returns 0."""
+        import torboxed
+        
+        result = torboxed.verify_and_clear_dropped_torrents(None)
+        self.assertEqual(result, 0)
+    
+    def test_skips_when_discovery_below_threshold(self):
+        """Test that verification skips when discovery is incomplete."""
+        import torboxed
+        
+        # Add several tracked torrents to database
+        for i in range(10):
+            torboxed.record_processed(
+                f"tt000000{i}", f"Movie {i}", 2024, "movie", "added", "success",
+                torbox_id=f"tb-id-{i}", magnet=f"magnet:{i}",
+                quality_score=2500, quality_label="1080p"
+            )
+        
+        # Discovery found only 2 of 10 (20% - below 95% threshold)
+        imdb_to_torbox = {"tt0000000": "tb-id-0", "tt0000001": "tb-id-1"}
+        
+        result = torboxed.verify_and_clear_dropped_torrents((imdb_to_torbox, set()))
+        self.assertEqual(result, 0)
+    
+    def test_clears_when_discovery_above_threshold(self):
+        """Test that verification clears dropped torrents when discovery is complete."""
+        import torboxed
+        
+        # Add 2 tracked torrents to database
+        torboxed.record_processed(
+            "tt0000000", "Movie 0", 2024, "movie", "added", "success",
+            torbox_id="tb-id-0", magnet="magnet:0",
+            quality_score=2500, quality_label="1080p"
+        )
+        torboxed.record_processed(
+            "tt0000001", "Movie 1", 2024, "movie", "added", "success",
+            torbox_id="tb-id-1", magnet="magnet:1",
+            quality_score=2500, quality_label="1080p"
+        )
+        
+        # Discovery found only 1 of 2 - but that's 1/2=50%, below 95%
+        imdb_to_torbox = {"tt0000000": "tb-id-0"}
+        
+        result = torboxed.verify_and_clear_dropped_torrents((imdb_to_torbox, set()))
+        # 1 found of 2 tracked = 50%, below 95% threshold -> should skip
+        self.assertEqual(result, 0)
+
+
+class TestSanitizeResponseError(unittest.TestCase):
+    """Test sanitize_response_error wrapper function."""
+    
+    def test_sanitizes_normal_response(self):
+        """Test that API key in response text is redacted."""
+        resp = Mock()
+        resp.text = '{"error": "api_key=secret123"}'
+        
+        result = sanitize_response_error(resp)
+        self.assertNotIn("secret123", result)
+        self.assertIn("***REDACTED***", result)
+    
+    def test_handles_missing_text(self):
+        """Test that response without text attribute doesn't crash."""
+        resp = Mock(spec=[])  # No text attribute
+        
+        result = sanitize_response_error(resp)
+        self.assertEqual(result, "<unable to decode response>")
+
+
+class TestBuildSearchResult(unittest.TestCase):
+    """Test build_search_result shared helper."""
+    
+    def test_build_with_basic_fields(self):
+        result = build_search_result(
+            name="Test Movie 2024",
+            infohash="a" * 40,
+            size=1500000000,
+            seeders=10,
+            leechers=2,
+            source="test-indexer"
+        )
+        
+        self.assertEqual(result["title"], "Test Movie 2024")
+        self.assertEqual(result["name"], "Test Movie 2024")
+        self.assertEqual(result["hash"], "a" * 40)
+        self.assertIn("magnet:?xt=urn:btih:", result["magnet"])
+        self.assertEqual(result["size"], 1500000000)
+        self.assertEqual(result["seeds"], 10)
+        self.assertEqual(result["peers"], 2)
+        self.assertEqual(result["source"], "test-indexer")
+        self.assertEqual(result["imdbId"], "")
+    
+    def test_build_with_magnet_override(self):
+        result = build_search_result(
+            name="Test",
+            infohash="b" * 40,
+            magnet_link="magnet:?xt=urn:btih:bbbb&dn=test"
+        )
+        
+        self.assertEqual(result["magnet"], "magnet:?xt=urn:btih:bbbb&dn=test")
+    
+    def test_build_with_imdb_id(self):
+        result = build_search_result(
+            name="Test",
+            infohash="c" * 40,
+            imdb_id="tt1234567"
+        )
+        
+        self.assertEqual(result["imdbId"], "tt1234567")

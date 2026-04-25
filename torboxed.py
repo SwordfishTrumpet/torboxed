@@ -123,6 +123,10 @@ TORBOX_LIST_LIMIT = 5000       # Max torrents per request from Torbox mylist
 # If we discover fewer than 95% of tracked torrents, skip clearing to avoid false positives
 DISCOVERY_COMPLETENESS_THRESHOLD = 0.95
 
+# Complete series pack minimum size threshold (bytes)
+# Large complete packs with unknown resolution metadata may still be high quality
+COMPLETE_PACK_MIN_SIZE = 10 * 1024**3  # 10 GB
+
 # Trakt pagination
 TRAKT_PER_PAGE = 100           # Maximum items per page (Trakt API max)
 
@@ -168,6 +172,25 @@ def sanitize_error_text(text: str) -> str:
         sanitized = re.sub(pattern, replacement, sanitized, flags=re.IGNORECASE)
     
     return sanitized[:500]  # Truncate after sanitization
+
+
+def sanitize_response_error(response: Any) -> str:
+    """Safely extract and sanitize error text from an HTTP response.
+    
+    VULN-005 Fix: Shared helper for sanitizing error text from HTTP responses.
+    Handles UnicodeDecodeError and missing text attributes gracefully.
+    
+    Args:
+        response: HTTP response object with .text attribute
+        
+    Returns:
+        Sanitized error text string
+    """
+    try:
+        raw_error = response.text[:1000] if response.text else ""
+        return sanitize_error_text(raw_error)
+    except (UnicodeDecodeError, AttributeError):
+        return "<unable to decode response>"
 
 
 def validate_db_path(path: Path) -> Path:
@@ -702,22 +725,16 @@ class ProwlarrClient:
                 
                 # Build magnet link
                 magnet_url = item.get("magnetUrl", "")
-                if magnet_url:
-                    magnet_link = magnet_url
-                else:
-                    magnet_link = encode_magnet_link(name, infohash)
                 
-                results.append({
-                    "title": name,
-                    "name": name,
-                    "hash": normalize_hash(infohash),
-                    "magnet": magnet_link,
-                    "size": size,
-                    "seeds": seeders,
-                    "peers": leechers,
-                    "source": item.get("indexer", "prowlarr"),
-                    "imdbId": "",  # Prowlarr doesn't always provide IMDb ID
-                })
+                results.append(build_search_result(
+                    name=name,
+                    infohash=infohash,
+                    magnet_link=magnet_url,
+                    size=size,
+                    seeders=seeders,
+                    leechers=leechers,
+                    source=item.get("indexer", "prowlarr"),
+                ))
             
             if results:
                 logger.info("Prowlarr found %d torrents for: %s", len(results), query)
@@ -869,25 +886,18 @@ class JackettClient:
                     if link and link.startswith("magnet:"):
                         magnet_url = link
                 
-                if magnet_url:
-                    magnet_link = magnet_url
-                else:
-                    magnet_link = encode_magnet_link(name, infohash)
-                
                 # Get indexer name
                 indexer = item.get("Tracker") or item.get("TrackerId") or item.get("indexer", "jackett")
                 
-                results.append({
-                    "title": name,
-                    "name": name,
-                    "hash": normalize_hash(infohash),
-                    "magnet": magnet_link,
-                    "size": size,
-                    "seeds": seeders,
-                    "peers": leechers,
-                    "source": indexer.lower() if isinstance(indexer, str) else "jackett",
-                    "imdbId": "",  # Jackett doesn't always provide IMDb ID
-                })
+                results.append(build_search_result(
+                    name=name,
+                    infohash=infohash,
+                    magnet_link=magnet_url,
+                    size=size,
+                    seeders=seeders,
+                    leechers=leechers,
+                    source=indexer.lower() if isinstance(indexer, str) else "jackett",
+                ))
             
             if results:
                 logger.info("Jackett found %d torrents for: %s", len(results), query)
@@ -1960,6 +1970,42 @@ def extract_infohash_from_item(item: Dict[str, Any],
     return None
 
 
+def build_search_result(name: str, infohash: str, magnet_link: str = "",
+                        size: int = 0, seeders: int = 0, leechers: int = 0,
+                        source: str = "", imdb_id: str = "") -> Dict[str, Any]:
+    """Build a standardized search result dict.
+    
+    Shared helper used by ProwlarrClient and JackettClient to avoid
+    code duplication when building result dicts from indexer APIs.
+    
+    Args:
+        name: Torrent display name/title
+        infohash: Torrent info hash
+        magnet_link: Magnet URL (constructed if empty)
+        size: Torrent size in bytes
+        seeders: Number of seeders
+        leechers: Number of leechers
+        source: Source name (indexer name)
+        imdb_id: IMDb ID if available
+        
+    Returns:
+        Standardized result dict
+    """
+    if not magnet_link:
+        magnet_link = encode_magnet_link(name, infohash)
+    return {
+        "title": name,
+        "name": name,
+        "hash": normalize_hash(infohash),
+        "magnet": magnet_link,
+        "size": size,
+        "seeds": seeders,
+        "peers": leechers,
+        "source": source,
+        "imdbId": imdb_id,
+    }
+
+
 class APIError(Exception):
     """API request error."""
     def __init__(self, message: str, status_code: int = None, retry_after: int = None):
@@ -2075,11 +2121,7 @@ def make_request_with_backoff(client: httpx.Client, method: str, url: str,
             # Handle client errors (4xx) - don't retry
             if response.status_code >= 400:
                 # VULN-005: Sanitize error text to prevent information disclosure
-                try:
-                    raw_error = response.text[:1000] if response.text else ""
-                    error_text = sanitize_error_text(raw_error)
-                except (UnicodeDecodeError, AttributeError):
-                    error_text = "<unable to decode response>"
+                error_text = sanitize_response_error(response)
                 raise APIError(
                     f"HTTP {response.status_code}: {error_text}",
                     status_code=response.status_code
@@ -2153,11 +2195,7 @@ class TraktClient:
         
         if response.status_code >= 400:
             # VULN-005: Sanitize error text to prevent information disclosure
-            try:
-                raw_error = response.text[:1000] if response.text else ""
-                error_text = sanitize_error_text(raw_error)
-            except (UnicodeDecodeError, AttributeError):
-                error_text = "<unable to decode response>"
+            error_text = sanitize_response_error(response)
             raise APIError(f"Trakt API error: {response.status_code} - {error_text}", 
                           status_code=response.status_code)
         
@@ -2719,11 +2757,7 @@ class TorboxClient:
             
             if response.status_code >= 400:
                 # VULN-005: Sanitize error text to prevent information disclosure
-                try:
-                    raw_error = response.text[:1000] if response.text else ""
-                    error_text = sanitize_error_text(raw_error)
-                except (UnicodeDecodeError, AttributeError):
-                    error_text = "<unable to decode response>"
+                error_text = sanitize_response_error(response)
                 raise APIError(f"Torbox API error: {response.status_code} - {error_text}",
                               status_code=response.status_code)
             
@@ -2990,7 +3024,7 @@ class TorboxClient:
                     )
                     
                     # Allow complete packs if they're large (>10GB suggests decent quality)
-                    if resolution_score == 0 and is_complete_pack and torrent_size > 10 * 1024**3:
+                    if resolution_score == 0 and is_complete_pack and torrent_size > COMPLETE_PACK_MIN_SIZE:
                         logger.debug("Allowing unknown-resolution complete pack due to large size: "
                                    "%s (%s, score: %d, size: %.1f GB)",
                                    name[:50], quality.resolution, resolution_score, 
@@ -3648,7 +3682,7 @@ class SyncEngine:
             escaped = re.escape(keyword)
             pattern = rf"(^|[^a-zA-Z0-9]){escaped}($|[^a-zA-Z0-9])"
             self._exclude_patterns.append((keyword, re.compile(pattern, re.IGNORECASE)))
-        # Track sync stats for notifications
+        # Track per-run sync stats for accurate summary notifications
         self._sync_stats = {
             "added": 0,
             "upgraded": 0,
@@ -3657,6 +3691,35 @@ class SyncEngine:
             "movies": 0,
             "shows": 0
         }
+    
+    def _increment_stats(self, action: str, content_type: str) -> None:
+        """Increment per-run sync stats counter."""
+        if hasattr(self, '_sync_stats') and action in self._sync_stats:
+            self._sync_stats[action] += 1
+        if hasattr(self, '_sync_stats') and content_type in ("movie", "show"):
+            self._sync_stats[f"{content_type}s"] += 1
+    
+    def get_sync_stats(self) -> Dict[str, int]:
+        """Get per-run sync statistics."""
+        return dict(self._sync_stats)
+    
+    def _send_telegram(self, action: str, **kwargs) -> None:
+        """Send Telegram notification with error handling.
+        
+        Args:
+            action: Notification action name ('added', 'upgraded', etc.) for logging
+            **kwargs: Forwarded to the appropriate telegram.notify_* method
+        """
+        if not self.telegram or not self.telegram.is_configured():
+            return
+        try:
+            if action == "added":
+                self.telegram.notify_added(**kwargs)
+            elif action == "upgraded":
+                self.telegram.notify_upgraded(**kwargs)
+        except (httpx.RequestError, OSError) as e:
+            logger.debug("Telegram %s notification traceback:", action, exc_info=True)
+            logger.debug("Failed to send Telegram %s notification: %s", action, e)
     
     def _is_hash_in_account(self, torrent_hash: Optional[str]) -> bool:
         """Check if a torrent hash already exists in the account.
@@ -3743,6 +3806,7 @@ class SyncEngine:
             log_result("skipped", title, {"reason": f"filtered: {reason}"})
             record_processed(imdb_id, title, year, content_type, "skipped", 
                            f"filtered: {reason}")
+            self._increment_stats("skipped", content_type)
             return False
         
         # Process based on content type
@@ -3776,6 +3840,7 @@ class SyncEngine:
             record_processed(imdb_id, title, year, "movie", "skipped", 
                            "already_in_torbox", torbox_id=torbox_id,
                            quality_score=(existing or {}).get("quality_score") or 0)
+            self._increment_stats("skipped", "movie")
             return True
         
         # Search for cached content
@@ -3790,6 +3855,7 @@ class SyncEngine:
             log_result("skipped", title, {"reason": "not_cached"})
             record_processed(imdb_id, title, year, "movie", "skipped", 
                            "not_cached")
+            self._increment_stats("skipped", "movie")
             return False
         
         # Get best available quality
@@ -3807,6 +3873,7 @@ class SyncEngine:
             record_processed(imdb_id, title, year, "movie", "skipped",
                            "already_in_torbox_by_hash",
                            quality_score=best.quality.score)
+            self._increment_stats("skipped", "movie")
             return True
         
         return self._handle_new_addition(imdb_id, title, year, "movie", cached, 0)
@@ -3839,6 +3906,7 @@ class SyncEngine:
             log_result("skipped", title, {"reason": "not_cached"})
             record_processed(imdb_id, title, year, "show", "skipped", 
                            "not_cached")
+            self._increment_stats("skipped", "show")
             return False
         
         # Group torrents by season
@@ -3850,16 +3918,19 @@ class SyncEngine:
                 log_result("skipped", title, {"reason": "already_in_account"})
                 record_processed(imdb_id, title, year, "show", "skipped", 
                                "already_in_account")
+                self._increment_stats("skipped", "show")
             elif skip_reason == "no_season_info":
                 logger.warning("Found torrents but couldn't parse season info for: %s", title)
                 log_result("skipped", title, {"reason": "no_season_info"})
                 record_processed(imdb_id, title, year, "show", "skipped", 
                                "no_season_info")
+                self._increment_stats("skipped", "show")
             else:
                 logger.warning("Found torrents but none selected for: %s", title)
                 log_result("skipped", title, {"reason": "none_selected"})
                 record_processed(imdb_id, title, year, "show", "skipped", 
                                "none_selected")
+                self._increment_stats("skipped", "show")
             return False
         
         logger.info("Found %d unique seasons for %s", len(seasons_map), title)
@@ -4039,6 +4110,18 @@ class SyncEngine:
         """
         logger.debug("Processing season %s of %s", season_key, title)
         
+        # Check if this show was already discovered in Torbox (from discovery phase)
+        # This prevents re-adding when only the IMDB ID was matched (not individual seasons)
+        torbox_id = existing_torrents.get(imdb_id)
+        if torbox_id:
+            display_title = self._display_title(title, "show", season_key)
+            logger.info("Already in Torbox: %s (torbox_id: %s)", display_title, torbox_id)
+            record_processed(imdb_id, title, year, "show", "skipped",
+                           "already_in_torbox", torbox_id=torbox_id,
+                           quality_score=torrent.quality.score, season=season_key)
+            self._increment_stats("skipped", "show")
+            return True
+        
         # Check if this season already processed
         existing = get_processed_item(imdb_id, season_key)
         
@@ -4063,6 +4146,7 @@ class SyncEngine:
             record_processed(imdb_id, title, year, "show", "skipped",
                            "already_in_torbox_by_hash",
                            quality_score=torrent.quality.score, season=season_key)
+            self._increment_stats("skipped", "show")
             return True
         
         # Pass as list to support fallback torrents
@@ -4084,6 +4168,7 @@ class SyncEngine:
             record_processed(imdb_id, title, year, content_type, "failed",
                            "all_torrents_failed", season=season_key)
             log_result("failed", display_title, {"reason": "all_torrents_failed"})
+            self._increment_stats("failed", content_type)
             return False
 
         torrent = cached[torrent_index]
@@ -4110,6 +4195,7 @@ class SyncEngine:
         except RateLimitError:
             logger.warning("Rate limit hit when adding %s - will retry next run", display_title)
             log_result("skipped", display_title, {"reason": "rate_limited", "retry": True})
+            self._increment_stats("skipped", content_type)
             return False
 
         if new_id:
@@ -4124,21 +4210,17 @@ class SyncEngine:
             )
             log_result("added", display_title,
                       {"quality": torrent.quality.label, "score": torrent.quality.score})
-            # Send Telegram notification for new content
-            if self.telegram and self.telegram.is_configured():
-                try:
-                    self.telegram.notify_added(
-                        title=title,
-                        year=year,
-                        quality_label=torrent.quality.label,
-                        quality_score=torrent.quality.score,
-                        content_type=content_type,
-                        season=season_key if season_key != "unknown" else None,
-                        imdb_id=imdb_id
-                    )
-                except (httpx.RequestError, OSError) as e:
-                    logger.debug("Telegram notification traceback:", exc_info=True)
-                    logger.debug("Failed to send Telegram notification: %s", e)
+            self._increment_stats("added", content_type)
+            self._send_telegram(
+                "added",
+                title=title,
+                year=year,
+                quality_label=torrent.quality.label,
+                quality_score=torrent.quality.score,
+                content_type=content_type,
+                season=season_key if season_key != "unknown" else None,
+                imdb_id=imdb_id
+            )
             return True
         else:
             # Failed to add this torrent - try the next one if available
@@ -4168,6 +4250,7 @@ class SyncEngine:
                 season=season_key
             )
             log_result("failed", display_title, {"reason": "upgrade_all_failed"})
+            self._increment_stats("failed", content_type)
             return False
 
         torrent = cached[torrent_index]
@@ -4195,6 +4278,7 @@ class SyncEngine:
         except RateLimitError:
             logger.warning("Rate limit hit during upgrade for %s - will retry next run", display_title)
             log_result("skipped", display_title, {"reason": "rate_limited", "retry": True})
+            self._increment_stats("skipped", content_type)
             return False
 
         if not new_id:
@@ -4227,23 +4311,19 @@ class SyncEngine:
             "score": torrent.quality.score,
             "old_score": current_score
         })
-        # Send Telegram notification for upgrade
-        if self.telegram and self.telegram.is_configured():
-            try:
-                old_quality = existing.get("quality_label", "Unknown")
-                self.telegram.notify_upgraded(
-                    title=title,
-                    year=year,
-                    old_quality=old_quality,
-                    old_score=current_score,
-                    new_quality=torrent.quality.label,
-                    new_score=torrent.quality.score,
-                    content_type=content_type,
-                    season=season_key if season_key != "unknown" else None
-                )
-            except (httpx.RequestError, OSError) as e:
-                logger.debug("Telegram upgrade notification traceback:", exc_info=True)
-                logger.debug("Failed to send Telegram upgrade notification: %s", e)
+        self._increment_stats("upgraded", content_type)
+        old_quality = existing.get("quality_label", "Unknown")
+        self._send_telegram(
+            "upgraded",
+            title=title,
+            year=year,
+            old_quality=old_quality,
+            old_score=current_score,
+            new_quality=torrent.quality.label,
+            new_score=torrent.quality.score,
+            content_type=content_type,
+            season=season_key if season_key != "unknown" else None
+        )
         return True
     
     def sync(self):
@@ -4302,55 +4382,24 @@ class SyncEngine:
             logger.info("Prioritizing %d missing items before %d existing items", 
                        len(missing), len(existing))
         
-        # Process each item
-        added = 0
-        upgraded = 0
-        skipped = 0
-        failed = 0
+        # Reset per-run stats
+        self._sync_stats = {"added": 0, "upgraded": 0, "skipped": 0, "failed": 0, "movies": 0, "shows": 0}
         
+        # Process each item
         for i, item in enumerate(content, 1):
             content_type = item.get('type', 'movie')
             type_label = "show" if content_type == "show" else "movie"
             logger.info("[%d/%d] %s (%s) [%s]", i, len(content), 
                        item.get('title', 'Unknown'), item.get('year', '?'), type_label)
             
-            result = self.process_content(item, existing_torrents)
-            
-            # For accurate counting, check all records created for this item
-            imdb_id = item.get("imdb_id", "")
-            if content_type == "show":
-                # Get all season records for this show
-                seasons = get_processed_show_seasons(imdb_id)
-                for season_record in seasons:
-                    action = season_record.get("action")
-                    if action == "added":
-                        added += 1
-                    elif action == "upgraded":
-                        upgraded += 1
-                    elif action == "skipped":
-                        skipped += 1
-                    elif action == "failed":
-                        failed += 1
-            else:
-                # Single record for movies
-                processed = get_processed_item(imdb_id)
-                if processed:
-                    action = processed.get("action")
-                    if action == "added":
-                        added += 1
-                    elif action == "upgraded":
-                        upgraded += 1
-                    elif action == "skipped":
-                        skipped += 1
-                    elif action == "failed":
-                        failed += 1
+            self.process_content(item, existing_torrents)
         
         logger.info("="*60)
         logger.info("Sync complete!")
-        logger.info("  Added:    %d", added)
-        logger.info("  Upgraded: %d", upgraded)
-        logger.info("  Skipped:  %d", skipped)
-        logger.info("  Failed:   %d", failed)
+        logger.info("  Added:    %d", self._sync_stats["added"])
+        logger.info("  Upgraded: %d", self._sync_stats["upgraded"])
+        logger.info("  Skipped:  %d", self._sync_stats["skipped"])
+        logger.info("  Failed:   %d", self._sync_stats["failed"])
         logger.info("="*60)
 
 
@@ -5198,16 +5247,15 @@ Examples:
         if telegram and telegram.is_configured():
             try:
                 duration = time.time() - sync_start_time
-                # Get stats from the database since they're recorded there
-                stats = get_stats()
+                run_stats = engine.get_sync_stats()
                 telegram.notify_summary(
-                    added=stats.get('by_action', {}).get('added', 0),
-                    upgraded=stats.get('by_action', {}).get('upgraded', 0),
-                    skipped=stats.get('by_action', {}).get('skipped', 0),
-                    failed=stats.get('by_action', {}).get('failed', 0),
+                    added=run_stats.get("added", 0),
+                    upgraded=run_stats.get("upgraded", 0),
+                    skipped=run_stats.get("skipped", 0),
+                    failed=run_stats.get("failed", 0),
                     duration_seconds=duration,
-                    movies=stats.get('by_type', {}).get('movie', 0),
-                    shows=stats.get('by_type', {}).get('show', 0)
+                    movies=run_stats.get("movies", 0),
+                    shows=run_stats.get("shows", 0)
                 )
             except (httpx.RequestError, OSError) as e:
                 logger.debug("Telegram summary traceback:", exc_info=True)

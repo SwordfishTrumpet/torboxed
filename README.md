@@ -304,6 +304,15 @@ MIT License - use it, modify it, share it freely!
 
 ## 📝 Recent Updates
 
+### 2026-04-25: Per-Run Stats, DRY Refactoring & Bug Fixes
+- **Fixed:** Per-season processing now checks existing_torrents to prevent re-adding discovered content (BUG-017)
+- **Fixed:** Sync summary notifications now use per-run counts instead of database lifetime totals (BUG-018)
+- **Improved:** Extracted `sanitize_response_error()` shared helper to eliminate 3 duplicate blocks
+- **Improved:** Extracted `_send_telegram()` private method for consistent notification error handling
+- **Improved:** Extracted `build_search_result()` shared helper for Prowlarr/Jackett result dict construction
+- **Improved:** Added `COMPLETE_PACK_MIN_SIZE` named constant (10 GB) for readability
+- **Added:** 31 new tests (213 total) covering existing_torrents matching, torrent fallback, search normalization, helper methods, and threshold safety
+
 ### 2026-04-24: Bug Fixes & Code Quality
 - **Fixed:** Prowlarr/Jackett API key loading now uses `.env` file (was bypassing lazy loader)
 - **Fixed:** systemd timer setup now writes service files to `/tmp` for install commands
