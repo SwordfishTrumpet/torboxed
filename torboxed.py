@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""torboxed - Sync Trakt.tv curated movies and shows to Torbox."""
+"""torboxed - Sync Trakt.tv curated movies and shows to your debrid service (Torbox/Real Debrid)."""
 
 import sqlite3
 import json
