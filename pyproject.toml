@@ -1,7 +1,7 @@
 [project]
 name = "torboxed"
 version = "1.0.0"
-description = "Sync Trakt.tv curated movies/shows to Torbox with intelligent quality-based auto-upgrades"
+description = "Sync Trakt.tv curated movies/shows to your debrid service (Torbox/Real Debrid) with intelligent quality-based auto-upgrades"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
