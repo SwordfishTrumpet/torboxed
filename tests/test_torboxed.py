@@ -1337,6 +1337,74 @@ class TestDiscoverExistingTorrents(unittest.TestCase):
         self.assertEqual(imdb_to_torbox, {})
         self.assertEqual(account_hashes, set())
     
+    def test_multi_season_pack_does_not_affect_episodes(self):
+        """BUG FIX: Episode-level records should NOT be updated by multi-season pack discovery.
+        
+        This test verifies that when a multi-season pack is discovered, episode-level
+        records (S01E01) are not incorrectly associated with the pack's torrent ID.
+        This prevents accidental deletion of shared packs when upgrading individual episodes.
+        
+        The bug occurred because episode-level keys like "S05E02" were matching the
+        season extraction pattern (S05E02[1:3] = "05"), causing them to be incorrectly
+        associated with multi-season pack torrent IDs.
+        """
+        import torboxed
+        
+        fake_title = "FakeTestShowXYZ123"
+        fake_imdb = "tt99999999"
+        
+        # Add episode-level record WITH a debrid_id (existing individual episode)
+        torboxed.record_processed(
+            fake_imdb, fake_title, 2025, "show", "added", "success",
+            debrid_id="episode-torrent-id", magnet="magnet:episode",
+            quality_score=2000, quality_label="1080p WEB-DL",
+            season="S05E02"  # Episode-level key - should NOT match multi-season pack
+        )
+        
+        # Add season-level record WITH a different debrid_id (existing season pack)
+        torboxed.record_processed(
+            fake_imdb, fake_title, 2025, "show", "added", "success",
+            debrid_id="season-torrent-id", magnet="magnet:season",
+            quality_score=2000, quality_label="1080p WEB-DL",
+            season="S05"  # Season-level key - should match multi-season pack
+        )
+        
+        # Mock Torbox returning a multi-season pack (S05-S06) with different ID
+        # This triggers name matching since the ID doesn't match existing records
+        self.mock_debrid.get_my_torrents.return_value = [
+            {
+                "id": "multi-season-pack-id",
+                "name": "FakeTestShowXYZ123.S05.S06.1080p.WEB-DL.x264",
+                "hash": "multihash123"
+            }
+        ]
+        
+        # Run discovery
+        result = torboxed.discover_existing_torrents(self.mock_debrid)
+        
+        # Verify discovery succeeded
+        self.assertIsInstance(result, tuple)
+        imdb_to_torbox, account_hashes = result
+        
+        # Check database after discovery
+        with torboxed.get_db() as conn:
+            episode_record = conn.execute(
+                "SELECT debrid_id, reason FROM processed WHERE imdb_id=? AND season=?",
+                (fake_imdb, "S05E02")
+            ).fetchone()
+            season_record = conn.execute(
+                "SELECT debrid_id, reason FROM processed WHERE imdb_id=? AND season=?",
+                (fake_imdb, "S05")
+            ).fetchone()
+        
+        # Episode should retain its original ID (NOT be changed to multi-season pack)
+        self.assertEqual(episode_record['debrid_id'], "episode-torrent-id")
+        self.assertEqual(episode_record['reason'], "success")
+        
+        # Season should still have its original ID because it already had one
+        # (multi-season pack update only applies to records WITHOUT debrid_id)
+        self.assertEqual(season_record['debrid_id'], "season-torrent-id")
+    
     def test_search_includes_year(self):
         """Test that search includes year in query for accuracy."""
         import torboxed
@@ -1468,14 +1536,14 @@ class TestMaxQuality(unittest.TestCase):
         """Test the is_max_quality function with various scores."""
         import torboxed
         
-        # Scores >= 7000 should be max quality
-        self.assertTrue(torboxed.is_max_quality(7000))
-        self.assertTrue(torboxed.is_max_quality(7250))
+        # Scores >= 6000 should be max quality
+        self.assertTrue(torboxed.is_max_quality(6000))
+        self.assertTrue(torboxed.is_max_quality(6250))
         self.assertTrue(torboxed.is_max_quality(8000))
         
-        # Scores < 7000 should NOT be max quality
-        self.assertFalse(torboxed.is_max_quality(6999))
-        self.assertFalse(torboxed.is_max_quality(6000))
+        # Scores < 6000 should NOT be max quality
+        self.assertFalse(torboxed.is_max_quality(5999))
+        self.assertFalse(torboxed.is_max_quality(5000))
         self.assertFalse(torboxed.is_max_quality(4000))
         self.assertFalse(torboxed.is_max_quality(0))
 
@@ -1938,9 +2006,12 @@ class TestMultiSeasonSync(unittest.TestCase):
         self.assertNotIn("S01E01", seasons_map)
         self.assertNotIn("S01E02", seasons_map)
     
-    def test_complete_pack_loses_to_higher_quality_individual_packs(self):
-        """Test that a low-quality Complete pack is removed when individual
-        season packs have higher quality (the The Boys bug scenario)."""
+    def test_complete_pack_wins_over_higher_quality_individual_packs(self):
+        """Test that a Complete pack is always preferred over individual season packs,
+        even when individual packs have higher quality.
+        
+        This reflects the library completeness goal: prefer the pack that covers
+        more content to minimize API calls and maximize library coverage."""
         import torboxed
         from torboxed import TorrentResult, QualityInfo, SeasonInfo
         
@@ -1990,18 +2061,14 @@ class TestMultiSeasonSync(unittest.TestCase):
         
         seasons_map, skip_reason = engine._group_by_season(torrents)
         
-        # Individual packs (score 5500) beat Complete (score 2900) →
-        # Complete should be removed, individual packs + episodes kept.
-        self.assertNotIn("Complete", seasons_map,
-                        "Complete pack should be removed when individual packs have higher quality")
-        self.assertIn("S01", seasons_map)
-        self.assertEqual(seasons_map["S01"].magnet, "magnet:s01-2160p")
-        self.assertIn("S02", seasons_map)
-        self.assertEqual(seasons_map["S02"].magnet, "magnet:s02-2160p")
-        # Episode for S05 should remain (no season pack for S05, gap-filler)
-        self.assertIn("S05E01", seasons_map)
-        self.assertEqual(seasons_map["S05E01"].magnet, "magnet:e05")
-        self.assertEqual(len(seasons_map), 3)
+        # Complete pack always wins, even at lower quality (library completeness goal)
+        self.assertIn("Complete", seasons_map)
+        self.assertEqual(seasons_map["Complete"].magnet, "magnet:complete-720p")
+        # Individual packs and episodes should be removed (covered by Complete)
+        self.assertNotIn("S01", seasons_map)
+        self.assertNotIn("S02", seasons_map)
+        self.assertNotIn("S05E01", seasons_map)
+        self.assertEqual(len(seasons_map), 1)
     
     def test_episodes_only_when_no_pack(self):
         """Test that episodes are used only when no season pack available."""
@@ -4331,29 +4398,31 @@ class TestProcessSeasonWithExistingTorrents(unittest.TestCase):
         torboxed.DB_PATH = self.original_db_path
         self.temp_dir.cleanup()
     
-    def test_skips_when_imdb_id_in_existing_torrents(self):
-        """Test that _process_season skips when IMDB ID found in existing_torrents."""
+    def test_skips_when_hash_already_in_account(self):
+        """Test that _process_season skips when torrent hash already in account (hash-based dedup)."""
         import torboxed
         
         mock_torrent = TorrentResult(
             name="Test.Show.S01.1080p.BluRay",
             magnet="magnet:s01",
+            hash="deadbeef0123456789abcdef0123456789abcdef",
             availability=True,
             size=50000,
             quality=torboxed.QualityInfo(resolution="1080p", source="Blu-ray", codec="H.264", score=3500),
             season_info=SeasonInfo(seasons=[1], is_complete=False, season_label="S01", is_pack=True)
         )
         
+        self.engine.account_hashes.add("deadbeef0123456789abcdef0123456789abcdef")
+        
         result = self.engine._process_season(
             "tt1234567", "Test Show", 2024, "S01",
-            mock_torrent, {"tt1234567": "tb-discovery-match"}
+            mock_torrent, {}
         )
         
         self.assertTrue(result)
         processed = torboxed.get_processed_item("tt1234567", "S01")
         self.assertEqual(processed["action"], "skipped")
-        self.assertEqual(processed["reason"], "already_in_debrid")
-        self.assertEqual(processed["debrid_id"], "tb-discovery-match")
+        self.assertEqual(processed["reason"], "already_in_debrid_by_hash")
     
     def test_proceeds_when_not_in_existing_torrents(self):
         """Test that _process_season proceeds normally when IMDB ID not in existing_torrents."""

@@ -1814,8 +1814,9 @@ RESOLUTION_SCORES = {
 }
 
 # Maximum quality threshold - if score >= this, consider it "maxed out"
-MAX_QUALITY_SCORE = 7000  # 2160p (4000) + Blu-ray (1000) + HEVC (600) + DTS-HD MA (650) = 6250
-# Round up to 7000 to account for variations (AV1 = 800, BDRemux = 1050, etc.)
+# Max achievable: 2160p(4000) + BDRemux(1050) + AV1(800) + DTS-HD MA(650) = 6500
+# Setting threshold at 6000 so 4K BluRay HEVC DTS-HD MA (6250) is maxed out
+MAX_QUALITY_SCORE = 6000
 
 def is_max_quality(quality_score: int) -> bool:
     """Check if quality score indicates maximum quality (no need to upgrade)."""
@@ -2020,6 +2021,78 @@ def parse_season_info(torrent_name: str) -> Optional[SeasonInfo]:
 def is_better_quality(new_score: int, current_score: int, threshold: int = 500) -> bool:
     """Check if new quality is significantly better (meets threshold)."""
     return new_score >= current_score + threshold
+
+
+# Completeness hierarchy: higher number = more complete (covers more content)
+# Series packs > Multi-season packs > Season packs > Episodes
+COMPLETENESS_ORDER = {
+    "complete": 4,
+    "multi_season": 3,
+    "season": 2,
+    "episode": 1,
+    "movie": 1,
+    "unknown": 0
+}
+
+
+def _count_seasons_in_key(season_key: str) -> int:
+    """Extract number of seasons covered from a season key string.
+    
+    Returns number of seasons, or 999 for "Complete".
+    """
+    if season_key == "Complete":
+        return 999
+    if 'E' in season_key:
+        return 1
+    if season_key.startswith('S'):
+        parts = season_key.split('-')
+        if len(parts) == 2 and parts[1].startswith('S'):
+            start = int(parts[0][1:])
+            end = int(parts[1][1:])
+            return end - start + 1
+        return 1
+    return 1
+
+
+def classify_media_level(season_key: str, content_type: str, season_info: Optional[SeasonInfo] = None) -> str:
+    """Classify the media type level of a torrent for upgrade comparison.
+    
+    Media levels ranked by completeness:
+    - "complete": Complete series pack (covers all seasons) — highest priority
+    - "multi_season": Multi-season pack (e.g., S01-S05) — medium-high priority
+    - "season": Single season pack (e.g., S05) — medium priority
+    - "episode": Individual episode (e.g., S05E02) — lowest priority
+    - "movie": Standalone movies (special case, no hierarchy)
+    
+    Args:
+        season_key: The season key (e.g., "unknown", "Complete", "S05", "S05E02")
+        content_type: "movie" or "show"
+        season_info: Optional SeasonInfo from the torrent for more accurate classification
+        
+    Returns:
+        String classifying the media level.
+    """
+    if content_type == "movie":
+        return "movie"
+    if season_key == "Complete":
+        return "complete"
+    if 'E' in season_key:
+        return "episode"
+    if season_key.startswith('S'):
+        if season_info and not season_info.is_complete and len(season_info.seasons) > 1:
+            return "multi_season"
+        return "season"
+    # Fallback to season_info
+    if season_info:
+        if season_info.is_complete:
+            return "complete"
+        if season_info.is_pack:
+            if len(season_info.seasons) > 1:
+                return "multi_season"
+            return "season"
+        if season_info.episode is not None:
+            return "episode"
+    return "unknown"
 
 
 # ============================================================================
@@ -2635,9 +2708,7 @@ class TraktClient:
         imdb = ids.get("imdb", "")
         if imdb:
             return imdb
-        # Fallback: create from trakt ID
-        trakt_id = ids.get("trakt", "")
-        return f"tt{trakt_id}" if trakt_id else ""
+        return ""
     
     # =========================================================================
     # LIKED LISTS (Authenticated)
@@ -3014,7 +3085,8 @@ class DebridClient(ABC):
 
         # Fallback to Prowlarr
         if not all_search_results and prowlarr_available:
-            logger.debug("Searching Prowlarr as fallback: %s", query)
+            if not zilean_available:
+                logger.warning("Zilean not available - Prowlarr text search cannot verify IMDb ID, results may be less accurate")
             prowlarr_results = self.searcher_prowlarr.search(
                 query, categories=prowlarr_categories, limit=SEARCH_LIMIT_TITLE)
             if prowlarr_results:
@@ -3967,7 +4039,8 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
                     matched_seasons = []
                     for show_imdb_id, show_season, show_content_type in show_records:
                         # Check if this season is covered by the pack
-                        if show_season.startswith('S') and show_season[1:3].isdigit():
+                        # BUG FIX: Episode-level records (S01E01) should NOT match season packs
+                        if show_season.startswith('S') and show_season[1:3].isdigit() and 'E' not in show_season:
                             season_num = int(show_season[1:3])
                             if season_num in season_info.seasons:
                                 multi_season_updates.append({
@@ -4627,26 +4700,18 @@ class SyncEngine:
         if skipped_hashes > 0:
             logger.debug("Skipped %d torrent(s) with hash already in account", skipped_hashes)
         
-        # 4. Resolve conflict: if Complete pack was selected alongside individual
-        #    season packs, pick whichever offers better quality to avoid duplicates.
+        # 4. Resolve conflict: Complete pack takes priority over season packs and episodes
+        #    because it covers more content (library completeness goal) and reduces API calls.
+        #    Season packs take priority over individual episodes for the same reason.
+        #    Quality differences are handled within the same level during upgrade checks.
         if "Complete" in best_per_season:
             other_keys = [k for k in best_per_season if k != "Complete"]
             if other_keys:
-                complete_score = best_per_season["Complete"].quality.score
-                # Complete pack covers all seasons, so when it wins,
-                # remove all individual entries (season packs and episodes).
-                season_pack_keys = [k for k in other_keys if re.match(r'^S\d{2}$', k)]
-                if season_pack_keys:
-                    if any(best_per_season[k].quality.score > complete_score
-                           for k in season_pack_keys):
-                        del best_per_season["Complete"]
-                        logger.debug("Preferring individual season packs over lower-quality "
-                                    "complete pack (score: %d)", complete_score)
-                    else:
-                        for k in other_keys:
-                            del best_per_season[k]
-                        logger.debug("Complete pack (score: %d) preferred over individual "
-                                    "season packs", complete_score)
+                # Complete pack always wins - remove all less-complete entries
+                for k in other_keys:
+                    del best_per_season[k]
+                logger.debug("Complete series pack preferred over individual season packs "
+                            "(library completeness goal)")
         
         logger.info("Selected %d torrents: %s", 
                    len(best_per_season), 
@@ -4722,27 +4787,6 @@ class SyncEngine:
         if existing and existing.get("debrid_id") and not is_phantom_record:
             # For upgrades, pass a single-item list since we only check the best one
             return self._handle_upgrade(imdb_id, title, year, content_type, existing, [torrent], season_key)
-        
-        # SECOND: Check if this show was already discovered in debrid account (from discovery phase)
-        # This handles multi-season packs where discovery found the show but this
-        # specific season doesn't have a database record yet (e.g., newly matched season)
-        # 
-        # CRITICAL: Skip this check for episode-level items (S01E01 format).
-        # Discovery matches at the show/season-pack level, not episode level.
-        # If we skip episodes here, they never get added even when they're missing.
-        debrid_id = existing_torrents.get(imdb_id)
-        is_episode = 'E' in season_key or len(season_key) > 3  # S01E01 vs S01
-        
-        if debrid_id and not existing and not is_episode:
-            # Only skip for season-level items (S01, S02) or complete series
-            # Episode-level items should proceed to hash check or addition
-            logger.info("Already in debrid account: %s (debrid_id: %s, discovered in multi-season pack)", 
-                       display_title, debrid_id)
-            record_processed(imdb_id, title, year, content_type, "skipped",
-                           "already_in_debrid", debrid_id=debrid_id,
-                           quality_score=torrent.quality.score, season=season_key)
-            self._increment_stats("skipped", content_type)
-            return True
         
         # Check if torrent hash already exists in account (manual add or discovery miss)
         if self._is_hash_in_account(torrent.hash):
@@ -4860,15 +4904,40 @@ class SyncEngine:
 
         torrent = cached[torrent_index]
 
-        # Check if this is significant upgrade
-        if not is_better_quality(torrent.quality.score, current_score):
-            logger.debug("Current quality sufficient for %s (score: %d vs %d)",
-                        display_title, current_score, torrent.quality.score)
-            log_result("skipped", display_title, {"reason": "current_better", "score": current_score})
+        # Check completeness hierarchy:
+        # - More complete = covers more content (series pack > season pack > episode)
+        # - Upgrading to more complete is always allowed (even at lower quality)
+        # - Within same level, compare quality
+        # - Never downgrade completeness (e.g., replace series pack with season pack)
+        existing_level = classify_media_level(season_key, content_type)
+        new_level = classify_media_level(season_key, content_type, torrent.season_info)
+        existing_score = COMPLETENESS_ORDER.get(existing_level, 0)
+        new_score = COMPLETENESS_ORDER.get(new_level, 0)
+        
+        if new_score > existing_score:
+            # Upgrade to more complete content - always accept
+            logger.info("Completeness upgrade for %s: %s -> %s",
+                       display_title, existing_level, new_level)
+        elif new_score < existing_score:
+            # Would downgrade completeness - reject
+            logger.debug("Completeness downgrade rejected for %s: %s -> %s (keeping %s)",
+                        display_title, existing_level, new_level, existing_level)
+            log_result("skipped", display_title, {"reason": "completeness_downgrade",
+                       "existing": existing_level, "new": new_level})
             record_processed(imdb_id, title, year, content_type, "skipped",
-                           "current_better", debrid_id=old_id,
+                           "completeness_downgrade", debrid_id=old_id,
                            quality_score=current_score, season=season_key)
             return False
+        else:
+            # Same completeness level - compare quality
+            if not is_better_quality(torrent.quality.score, current_score):
+                logger.debug("Current quality sufficient for %s (score: %d vs %d)",
+                            display_title, current_score, torrent.quality.score)
+                log_result("skipped", display_title, {"reason": "current_better", "score": current_score})
+                record_processed(imdb_id, title, year, content_type, "skipped",
+                               "current_better", debrid_id=old_id,
+                               quality_score=current_score, season=season_key)
+                return False
 
         if torrent_index == 0:
             logger.info("Upgrade detected for %s: %d -> %d",
@@ -4876,7 +4945,7 @@ class SyncEngine:
         else:
             logger.info("Trying next best torrent for upgrade (%d/%d): %s",
                        torrent_index + 1, len(cached), torrent.quality.label)
-
+        
         # Remove old torrent FIRST (cheap: ~0.2s wait, no creation rate limit)
         # If this fails, we skip the upgrade entirely - no wasted API calls or duplicates
         logger.debug("Removing old torrent first: %s", old_id)
@@ -5795,8 +5864,9 @@ def check_and_acquire_lock() -> bool:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="torboxed - Sync Trakt.tv content to Torbox",
+        description="torboxed - Sync Trakt.tv content to debrid",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=False,
         epilog="""
 Examples:
   %(prog)s --init              # Initialize database
@@ -5812,6 +5882,8 @@ Examples:
         """
     )
     
+    parser.add_argument("--help", "-h", action="help",
+                       help="Show this help message and exit")
     parser.add_argument("--init", action="store_true",
                        help="Initialize database with default config")
     parser.add_argument("--verbose", "-v", action="store_true",
