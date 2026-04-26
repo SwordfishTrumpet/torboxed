@@ -2222,6 +2222,7 @@ def validate_list_response(data: Any, item_validator=None, context: str = "") ->
 def make_request_with_backoff(client: httpx.Client, method: str, url: str, 
                                 max_retries: int = 3, 
                                 rate_limiter: Optional[RateLimiter] = None,
+                                suppress_500_warnings: bool = False,
                                 **kwargs) -> httpx.Response:
     """Make HTTP request with exponential backoff for server errors and timeouts.
     
@@ -2233,6 +2234,7 @@ def make_request_with_backoff(client: httpx.Client, method: str, url: str,
         url: Request URL
         max_retries: Maximum number of retries
         rate_limiter: Optional RateLimiter to update on 429 responses (BUG-006 FIX)
+        suppress_500_warnings: If True, don't log warnings for 5xx errors (caller handles gracefully)
         **kwargs: Additional arguments for client.request()
     """
     retries = 0
@@ -2260,13 +2262,14 @@ def make_request_with_backoff(client: httpx.Client, method: str, url: str,
                                   method, url.split('/')[-1])
                     # BUG-006 FIX: Update rate limiter without retry time
                     if rate_limiter:
-                        rate_limiter.mark_rate_limited()
+                        rate_limiter.mark_rate_limiter()
                 return response  # Return immediately, don't retry internally
             
             # Handle server errors (5xx) - retry with backoff
             if response.status_code >= 500:
                 if retries < max_retries - 1:
-                    logger.warning("Server error %d. Retrying in %ds...", response.status_code, backoff)
+                    if not suppress_500_warnings:
+                        logger.warning("Server error %d. Retrying in %ds...", response.status_code, backoff)
                     time.sleep(backoff)
                     retries += 1
                     backoff *= 2
@@ -3174,7 +3177,7 @@ class TorboxClient(DebridClient):
     CREATION_MAX_RETRIES = 10
 
     def _request(self, method: str, path: str, use_creation_limiter: bool = False, 
-                 max_retries: int = 3, **kwargs) -> Any:
+                 max_retries: int = 3, suppress_500_warnings: bool = False, **kwargs) -> Any:
         """Make rate-limited request to Torbox API.
         
         Args:
@@ -3182,6 +3185,7 @@ class TorboxClient(DebridClient):
             path: API endpoint path
             use_creation_limiter: Use slower rate limit for creation endpoints (createtorrent, etc.)
             max_retries: Max retries for 429 errors (applies to both creation and non-creation)
+            suppress_500_warnings: If True, don't log warnings for 5xx errors (caller handles gracefully)
             **kwargs: Additional request arguments
             
         Raises:
@@ -3203,7 +3207,8 @@ class TorboxClient(DebridClient):
             url = f"{TORBOX_BASE_URL}{path}"
             # BUG-006 FIX: Pass rate_limiter so it gets updated on 429
             response = make_request_with_backoff(self.client, method, url, 
-                                                  rate_limiter=current_limiter, **kwargs)
+                                                  rate_limiter=current_limiter,
+                                                  suppress_500_warnings=suppress_500_warnings, **kwargs)
             
             # Handle 429 specially
             if response.status_code == 429:
@@ -3447,7 +3452,8 @@ class TorboxClient(DebridClient):
                 response = self._request(
                     "POST",
                     "/v1/api/torrents/controltorrent",
-                    json={"torrent_id": torrent_id, "operation": "delete"}
+                    json={"torrent_id": torrent_id, "operation": "delete"},
+                    suppress_500_warnings=True  # We handle DATABASE_ERROR gracefully
                 )
                 # Validate response has success field
                 if response is None:
