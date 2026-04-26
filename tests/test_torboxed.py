@@ -5029,6 +5029,63 @@ class TestTorboxClientMethods(unittest.TestCase):
             self.assertEqual(result[0]["name"], "1337x")
 
 
+    @patch('time.sleep')
+    def test_remove_torrent_retries_on_database_error(self, mock_sleep):
+        """Test that remove_torrent retries on DATABASE_ERROR (HTTP 500).
+        
+        This handles transient database locks that can occur when a torrent
+        is being processed internally by Torbox.
+        """
+        from torboxed import TorboxClient, APIError
+        
+        # Simulate 2 failures with DATABASE_ERROR, then success
+        side_effects = [
+            APIError("HTTP 500: DATABASE_ERROR", status_code=500),
+            APIError("HTTP 500: DATABASE_ERROR", status_code=500),
+            {"success": True}
+        ]
+        
+        with patch.object(TorboxClient, '_request', side_effect=side_effects):
+            result = self.client.remove_torrent("23264000")
+            
+            # Should succeed after retries
+            self.assertTrue(result)
+            # Should have retried 3 times
+            self.assertEqual(self.client._request.call_count, 3)
+            # Should have slept twice (between retries)
+            self.assertEqual(mock_sleep.call_count, 2)
+    
+    @patch('time.sleep')
+    def test_remove_torrent_fails_after_max_retries(self, mock_sleep):
+        """Test that remove_torrent gives up after max retries on DATABASE_ERROR."""
+        from torboxed import TorboxClient, APIError
+        
+        # Always fail with DATABASE_ERROR
+        with patch.object(TorboxClient, '_request', side_effect=APIError(
+            "HTTP 500: DATABASE_ERROR", status_code=500
+        )):
+            result = self.client.remove_torrent("23264000")
+            
+            # Should fail after exhausting retries
+            self.assertFalse(result)
+            # Should have tried max_retries times (3)
+            self.assertEqual(self.client._request.call_count, 3)
+    
+    def test_remove_torrent_no_retry_on_other_errors(self):
+        """Test that remove_torrent doesn't retry on non-500 errors."""
+        from torboxed import TorboxClient, APIError
+        
+        # Fail with 404 (not retryable)
+        with patch.object(TorboxClient, '_request', side_effect=APIError(
+            "HTTP 404: Not Found", status_code=404
+        )):
+            result = self.client.remove_torrent("23264000")
+            
+            # Should fail immediately without retry
+            self.assertFalse(result)
+            self.assertEqual(self.client._request.call_count, 1)
+
+
 class TestRealDebridClientMethods(unittest.TestCase):
     """Test RealDebridClient methods that weren't directly tested."""
     
