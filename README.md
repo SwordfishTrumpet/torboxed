@@ -194,7 +194,7 @@ A: Yes! Your database is stored locally, API keys are secured, and sensitive inf
 A: Absolutely! You can choose from 24 sources including your personal liked lists on Trakt.
 
 **Q: How do quality upgrades work?**  
-A: TorBoxed scores each release (resolution + source + codec + audio). When a +500+ point better version appears, it upgrades automatically.
+A: TorBoxed scores each release (resolution + source + codec + audio). Upgrades follow a **completeness hierarchy**: series packs > season packs > episodes. Content is always upgraded to something equally or more complete. Within the same completeness level, upgrades trigger when a +500+ point better version appears.
 
 ---
 
@@ -217,7 +217,7 @@ TorBoxed automatically calculates quality scores to pick the best releases:
 | | Dolby TrueHD | 550 |
 | | DTS | 400 |
 
-**Example:** A 4K Blu-ray HEVC release with DTS-HD MA scores **~6250 points**—that's "max quality" and won't be upgraded further!
+**Example:** A 4K Blu-ray HEVC release with DTS-HD MA scores **~6250 points** (threshold: 6000)—that's "max quality" and won't be upgraded further!
 
 ---
 
@@ -252,10 +252,12 @@ uv run torboxed.py --recent 20
 
 TorBoxed handles TV shows intelligently:
 
+- **Completeness hierarchy**: Series packs > Season packs > Episodes (minimizes API calls)
+- **Never downgrades**: A series pack won't be replaced by individual episodes, even at higher quality
+- **Within same level**: Upgrades happen when quality improves by +500 points
 - **Detects seasons** automatically from torrent names (S01, S02, Complete, etc.)
-- **Adds all seasons** that are available, not just one
 - **Tracks independently**—each season can be upgraded separately
-- **Complete series packs** supported alongside individual seasons
+- **Multi-season packs** automatically matched to all covered seasons
 
 Example output:
 ```
@@ -369,7 +371,18 @@ MIT License - use it, modify it, share it freely!
 - **Fixed (BUG-009):** Incomplete phantom record check - now requires both `action='skipped'` AND `debrid_id` is set
 - **Security:** Enhanced path traversal protection with symlink resolution
 - **Stability:** Better resource cleanup prevents connection exhaustion during long runs
-- **Total Tests:** 288 passing
+- **Total Tests:** 290 passing
+
+### 2026-04-26: Quality Threshold, Completeness Upgrade & IMDb ID Fixes
+- **Fixed:** `is_max_quality()` threshold lowered from 7000→6000 (max achievable was 6500, never triggered — wasted API calls)
+- **Fixed:** `is_episode` detection no longer misclassifies "Complete" and multi-season keys as episodes
+- **Fixed:** `_extract_imdb_id()` no longer creates fake `tt{TRAKT_ID}` IDs when IMDb ID is missing
+- **Fixed:** Completeness upgrade from partial season coverage → Complete pack was blocked by show-level debrid_id check (removed in favor of hash-based dedup)
+- **Fixed:** Multi-season packs (S01-S05) now correctly treated as completeness upgrade over single-season packs (S01) via new `"multi_season"` level
+- **Fixed:** Complete series packs always preferred over individual seasons, regardless of quality (library completeness goal)
+- **Improved:** Prowlarr/Jackett fallback warns when Zilean not available (text search can't verify IMDb IDs)
+- **Improved:** `--help, -h` explicitly listed in CLI, description updated for multi-debrid support
+- **Total Tests:** 290 passing
 
 ### 2026-04-25: Per-Run Stats, DRY Refactoring & Bug Fixes
 - **Fixed:** Per-season processing now checks existing_torrents to prevent re-adding discovered content (BUG-017)
