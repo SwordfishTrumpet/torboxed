@@ -422,11 +422,16 @@ class ZileanClient:
         return bool(self.database_url)
     
     def _get_connection(self):
-        """Get or create database connection."""
+        """Get or create database connection with timeout."""
         if psycopg is None:
             raise ImportError("psycopg is not installed. Run: pip install psycopg")
         if self._connection is None or self._connection.closed:
-            self._connection = psycopg.connect(self.database_url)
+            # Connect with 5 second timeout - fail fast if Zilean is unavailable
+            self._connection = psycopg.connect(
+                self.database_url, 
+                connect_timeout=5,
+                options='-c statement_timeout=10000'  # 10 second query timeout
+            )
         return self._connection
     
     def close(self):
