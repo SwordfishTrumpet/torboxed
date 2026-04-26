@@ -5031,43 +5031,47 @@ class TestTorboxClientMethods(unittest.TestCase):
 
     @patch('time.sleep')
     def test_remove_torrent_retries_on_database_error(self, mock_sleep):
-        """Test that remove_torrent retries on DATABASE_ERROR (HTTP 500).
+        """Test that remove_torrent retries on DATABASE_ERROR when torrent still exists.
         
         This handles transient database locks that can occur when a torrent
         is being processed internally by Torbox.
         """
         from torboxed import TorboxClient, APIError
         
-        # Simulate 2 failures with DATABASE_ERROR, then success
-        side_effects = [
-            APIError("HTTP 500: DATABASE_ERROR", status_code=500),
-            APIError("HTTP 500: DATABASE_ERROR", status_code=500),
-            {"success": True}
-        ]
-        
-        with patch.object(TorboxClient, '_request', side_effect=side_effects):
-            result = self.client.remove_torrent("23264000")
+        # Mock get_my_torrents to return torrent still exists (so we actually retry)
+        with patch.object(TorboxClient, 'get_my_torrents', return_value=[{'id': '23264000', 'name': 'test'}]):
+            # Simulate 2 failures with DATABASE_ERROR, then success
+            call_count = [0]
+            def mock_request(*args, **kwargs):
+                call_count[0] += 1
+                if len(args) >= 2 and 'controltorrent' in str(args[1]):
+                    # First 2 calls fail, 3rd succeeds
+                    if call_count[0] <= 2:
+                        raise APIError("HTTP 500: DATABASE_ERROR", status_code=500)
+                    return {"success": True}
+                return None
             
-            # Should succeed after retries
-            self.assertTrue(result)
-            # Should have retried 3 times
-            self.assertEqual(self.client._request.call_count, 3)
-            # Should have slept twice (between retries)
-            self.assertEqual(mock_sleep.call_count, 2)
+            with patch.object(TorboxClient, '_request', side_effect=mock_request):
+                result = self.client.remove_torrent("23264000")
+                
+                # Should succeed after retries
+                self.assertTrue(result)
+                # Should have tried 3 times (2 failures with library checks + 1 success)
+                self.assertEqual(call_count[0], 3)
+                # Should have slept twice (between the actual removal retries)
+                self.assertEqual(mock_sleep.call_count, 2)
     
     @patch('time.sleep')
     def test_remove_torrent_fails_after_max_retries(self, mock_sleep):
         """Test that remove_torrent gives up after max retries on DATABASE_ERROR."""
         from torboxed import TorboxClient, APIError
         
-        # Mock get_my_torrents separately to return the torrent still exists
-        # This avoids get_my_torrents calling _request which would raise APIError
+        # Mock get_my_torrents to return torrent still exists (so all retries are attempted)
         with patch.object(TorboxClient, 'get_my_torrents', return_value=[{'id': '23264000', 'name': 'test'}]):
-            # Fail with DATABASE_ERROR for removal attempts only
+            # Fail with DATABASE_ERROR for removal attempts
             call_count = [0]
             def mock_request(*args, **kwargs):
                 call_count[0] += 1
-                # Only fail for controltorrent (removal) calls, not for get_my_torrents
                 if len(args) >= 2 and 'controltorrent' in str(args[1]):
                     raise APIError("HTTP 500: DATABASE_ERROR", status_code=500)
                 return None
@@ -5077,21 +5081,24 @@ class TestTorboxClientMethods(unittest.TestCase):
                 
                 # Should fail after exhausting retries
                 self.assertFalse(result)
-                # Should have tried 3 removal attempts (get_my_torrents is mocked separately)
+                # Should have tried 3 removal attempts (each with library check)
                 self.assertEqual(call_count[0], 3)
     
     @patch('time.sleep')
     def test_remove_torrent_database_error_already_removed(self, mock_sleep):
-        """Test that remove_torrent succeeds if DATABASE_ERROR but torrent already gone."""
+        """Test that remove_torrent succeeds immediately if DATABASE_ERROR and torrent already gone.
+        
+        This verifies the optimization: on first DATABASE_ERROR, check if torrent exists.
+        If already removed, succeed immediately without further retries.
+        """
         from torboxed import TorboxClient, APIError
         
         # Mock get_my_torrents to return empty list (torrent already removed)
         with patch.object(TorboxClient, 'get_my_torrents', return_value=[]):
-            # Fail with DATABASE_ERROR for removal attempts only
+            # Fail with DATABASE_ERROR for the single removal attempt
             call_count = [0]
             def mock_request(*args, **kwargs):
                 call_count[0] += 1
-                # Only fail for controltorrent (removal) calls, not for get_my_torrents
                 if len(args) >= 2 and 'controltorrent' in str(args[1]):
                     raise APIError("HTTP 500: DATABASE_ERROR", status_code=500)
                 return None
@@ -5099,18 +5106,20 @@ class TestTorboxClientMethods(unittest.TestCase):
             with patch.object(TorboxClient, '_request', side_effect=mock_request):
                 result = self.client.remove_torrent("23264000")
                 
-                # Should succeed because torrent is confirmed gone
+                # Should succeed immediately because torrent is confirmed gone
                 self.assertTrue(result)
-                # Should have tried 3 removal attempts (get_my_torrents is mocked separately)
-                self.assertEqual(call_count[0], 3)
+                # Should have tried only 1 removal attempt (verified gone, no retries needed)
+                self.assertEqual(call_count[0], 1)
+                # Should not have slept (no retries needed)
+                self.assertEqual(mock_sleep.call_count, 0)
     
     def test_remove_torrent_no_retry_on_other_errors(self):
         """Test that remove_torrent doesn't retry on non-500 errors."""
         from torboxed import TorboxClient, APIError
         
-        # Fail with 404 (not retryable)
+        # Fail with 403 Forbidden (not retryable and doesn't match "not found")
         with patch.object(TorboxClient, '_request', side_effect=APIError(
-            "HTTP 404: Not Found", status_code=404
+            "HTTP 403: Forbidden", status_code=403
         )):
             result = self.client.remove_torrent("23264000")
             
