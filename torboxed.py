@@ -3472,10 +3472,27 @@ class TorboxClient(DebridClient):
                     return False
                     
             except APIError as e:
-                # Retry on transient DATABASE_ERROR (500)
-                if hasattr(e, 'status_code') and e.status_code == 500 and attempt < max_retries - 1:
-                    error_str = str(e)
-                    if "DATABASE_ERROR" in error_str or "error processing" in error_str.lower():
+                error_str = str(e)
+                
+                # Check if this is DATABASE_ERROR (Torbox returns 500 for non-existent torrents)
+                is_db_error = (hasattr(e, 'status_code') and e.status_code == 500 and 
+                               ("DATABASE_ERROR" in error_str or "error processing" in error_str.lower()))
+                
+                if is_db_error:
+                    # Check if torrent is actually already gone (Torbox quirk: returns 500 for missing torrents)
+                    logger.debug("DATABASE_ERROR on attempt %d - checking if torrent %s already removed", attempt + 1, torrent_id)
+                    try:
+                        my_torrents = self.get_my_torrents()
+                        if my_torrents is not None:
+                            still_exists = any(str(t.get('id')) == str(torrent_id) for t in my_torrents)
+                            if not still_exists:
+                                logger.info("Torrent %s already removed (confirmed via library check)", torrent_id)
+                                return True
+                    except Exception:
+                        pass  # Fall through to retry logic
+                    
+                    # Torrent still exists or couldn't verify - retry if we have attempts left
+                    if attempt < max_retries - 1:
                         logger.warning(
                             "Transient DATABASE_ERROR removing torrent %s (attempt %d/%d), retrying in %ds...",
                             torrent_id, attempt + 1, max_retries, backoff
@@ -3483,33 +3500,17 @@ class TorboxClient(DebridClient):
                         time.sleep(backoff)
                         backoff *= 2  # Exponential backoff
                         continue
-                    elif "not found" in error_str.lower() or "does not exist" in error_str.lower():
-                        # Torrent already removed - treat as success
-                        logger.debug("Torrent %s not found (already removed)", torrent_id)
-                        return True
-                
-                # Last attempt - check if torrent is already gone (DATABASE_ERROR often means "not found")
-                if attempt == max_retries - 1:
-                    error_str = str(e)
-                    if "DATABASE_ERROR" in error_str:
-                        # Torbox returns DATABASE_ERROR when trying to remove non-existent torrents
-                        # Verify by checking if it's still in the library
-                        logger.debug("DATABASE_ERROR on final attempt - checking if torrent %s already removed", torrent_id)
-                        try:
-                            my_torrents = self.get_my_torrents()
-                            if my_torrents is not None:
-                                still_exists = any(str(t.get('id')) == str(torrent_id) for t in my_torrents)
-                                if not still_exists:
-                                    logger.info("Torrent %s already removed (confirmed via library check)", torrent_id)
-                                    return True
-                        except Exception:
-                            pass  # Fall through to error logging
-                        
-                        logger.error("Error removing torrent %s after %d attempts: %s", torrent_id, max_retries, e)
                     else:
                         logger.error("Error removing torrent %s after %d attempts: %s", torrent_id, max_retries, e)
-                else:
-                    logger.error("Error removing torrent %s: %s", torrent_id, e)
+                        return False
+                
+                # Not a DATABASE_ERROR - check for other "already removed" indicators
+                if "not found" in error_str.lower() or "does not exist" in error_str.lower():
+                    logger.debug("Torrent %s not found (already removed)", torrent_id)
+                    return True
+                
+                # Non-retryable error
+                logger.error("Error removing torrent %s: %s", torrent_id, e)
                 return False
             except APIResponseError as e:
                 logger.error("Error removing torrent %s: %s", torrent_id, e)
