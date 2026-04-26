@@ -5060,16 +5060,49 @@ class TestTorboxClientMethods(unittest.TestCase):
         """Test that remove_torrent gives up after max retries on DATABASE_ERROR."""
         from torboxed import TorboxClient, APIError
         
-        # Always fail with DATABASE_ERROR
-        with patch.object(TorboxClient, '_request', side_effect=APIError(
-            "HTTP 500: DATABASE_ERROR", status_code=500
-        )):
-            result = self.client.remove_torrent("23264000")
+        # Mock get_my_torrents separately to return the torrent still exists
+        # This avoids get_my_torrents calling _request which would raise APIError
+        with patch.object(TorboxClient, 'get_my_torrents', return_value=[{'id': '23264000', 'name': 'test'}]):
+            # Fail with DATABASE_ERROR for removal attempts only
+            call_count = [0]
+            def mock_request(*args, **kwargs):
+                call_count[0] += 1
+                # Only fail for controltorrent (removal) calls, not for get_my_torrents
+                if len(args) >= 2 and 'controltorrent' in str(args[1]):
+                    raise APIError("HTTP 500: DATABASE_ERROR", status_code=500)
+                return None
             
-            # Should fail after exhausting retries
-            self.assertFalse(result)
-            # Should have tried max_retries times (3)
-            self.assertEqual(self.client._request.call_count, 3)
+            with patch.object(TorboxClient, '_request', side_effect=mock_request):
+                result = self.client.remove_torrent("23264000")
+                
+                # Should fail after exhausting retries
+                self.assertFalse(result)
+                # Should have tried 3 removal attempts (get_my_torrents is mocked separately)
+                self.assertEqual(call_count[0], 3)
+    
+    @patch('time.sleep')
+    def test_remove_torrent_database_error_already_removed(self, mock_sleep):
+        """Test that remove_torrent succeeds if DATABASE_ERROR but torrent already gone."""
+        from torboxed import TorboxClient, APIError
+        
+        # Mock get_my_torrents to return empty list (torrent already removed)
+        with patch.object(TorboxClient, 'get_my_torrents', return_value=[]):
+            # Fail with DATABASE_ERROR for removal attempts only
+            call_count = [0]
+            def mock_request(*args, **kwargs):
+                call_count[0] += 1
+                # Only fail for controltorrent (removal) calls, not for get_my_torrents
+                if len(args) >= 2 and 'controltorrent' in str(args[1]):
+                    raise APIError("HTTP 500: DATABASE_ERROR", status_code=500)
+                return None
+            
+            with patch.object(TorboxClient, '_request', side_effect=mock_request):
+                result = self.client.remove_torrent("23264000")
+                
+                # Should succeed because torrent is confirmed gone
+                self.assertTrue(result)
+                # Should have tried 3 removal attempts (get_my_torrents is mocked separately)
+                self.assertEqual(call_count[0], 3)
     
     def test_remove_torrent_no_retry_on_other_errors(self):
         """Test that remove_torrent doesn't retry on non-500 errors."""

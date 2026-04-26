@@ -3483,10 +3483,31 @@ class TorboxClient(DebridClient):
                         time.sleep(backoff)
                         backoff *= 2  # Exponential backoff
                         continue
+                    elif "not found" in error_str.lower() or "does not exist" in error_str.lower():
+                        # Torrent already removed - treat as success
+                        logger.debug("Torrent %s not found (already removed)", torrent_id)
+                        return True
                 
-                # Last attempt or non-retryable error
+                # Last attempt - check if torrent is already gone (DATABASE_ERROR often means "not found")
                 if attempt == max_retries - 1:
-                    logger.error("Error removing torrent %s after %d attempts: %s", torrent_id, max_retries, e)
+                    error_str = str(e)
+                    if "DATABASE_ERROR" in error_str:
+                        # Torbox returns DATABASE_ERROR when trying to remove non-existent torrents
+                        # Verify by checking if it's still in the library
+                        logger.debug("DATABASE_ERROR on final attempt - checking if torrent %s already removed", torrent_id)
+                        try:
+                            my_torrents = self.get_my_torrents()
+                            if my_torrents is not None:
+                                still_exists = any(str(t.get('id')) == str(torrent_id) for t in my_torrents)
+                                if not still_exists:
+                                    logger.info("Torrent %s already removed (confirmed via library check)", torrent_id)
+                                    return True
+                        except Exception:
+                            pass  # Fall through to error logging
+                        
+                        logger.error("Error removing torrent %s after %d attempts: %s", torrent_id, max_retries, e)
+                    else:
+                        logger.error("Error removing torrent %s after %d attempts: %s", torrent_id, max_retries, e)
                 else:
                     logger.error("Error removing torrent %s: %s", torrent_id, e)
                 return False
