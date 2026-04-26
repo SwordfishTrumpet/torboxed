@@ -434,6 +434,20 @@ class ZileanClient:
             )
         return self._connection
     
+    def _get_fresh_connection(self):
+        """Get a fresh database connection for single query use.
+        
+        Use this for searches to avoid stale connection issues.
+        Connection must be closed after use.
+        """
+        if psycopg is None:
+            raise ImportError("psycopg is not installed. Run: pip install psycopg")
+        return psycopg.connect(
+            self.database_url,
+            connect_timeout=5,
+            options='-c statement_timeout=10000'  # 10 second query timeout
+        )
+    
     def close(self):
         """Close database connection."""
         if self._connection and not self._connection.closed:
@@ -512,8 +526,10 @@ class ZileanClient:
             logger.debug("Invalid IMDb ID format: %s", imdb_id)
             return []
         
+        conn = None
         try:
-            conn = self._get_connection()
+            # Use fresh connection for each search to avoid stale connection issues
+            conn = self._get_fresh_connection()
             
             # Essential columns for torrent results
             sql = """
@@ -554,6 +570,13 @@ class ZileanClient:
             else:
                 logger.warning("Zilean search error for IMDb ID '%s': %s", imdb_id, e)
             return []
+        finally:
+            # Always close the connection to avoid leaks and stale connections
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass  # Ignore close errors
     
     def search(self, query: str, category: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
         """Search for torrents by title query.
@@ -569,8 +592,10 @@ class ZileanClient:
         if not query:
             return []
         
+        conn = None
         try:
-            conn = self._get_connection()
+            # Use fresh connection for each search to avoid stale connection issues
+            conn = self._get_fresh_connection()
             
             # Use prefix search for better performance (like zilean-api)
             search_term = f"%{query}%"
@@ -613,6 +638,13 @@ class ZileanClient:
             else:
                 logger.warning("Zilean search error for query '%s': %s", query, e)
             return []
+        finally:
+            # Always close the connection to avoid leaks and stale connections
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass  # Ignore close errors
 
 
 class ProwlarrClient:
@@ -621,19 +653,19 @@ class ProwlarrClient:
     Connects to local Prowlarr instance for torrent search.
     Acts as a fallback when Zilean database is not configured.
     
-    API: http://prowlarr-ingest:9696/api/v1
+    API: http://localhost:9696/api/v1 (configurable via PROWLARR_URL)
     Rate limit: 0.5 req/sec (respectful to indexers)
     """
     
-    def __init__(self, api_key: Optional[str] = None, base_url: str = "http://prowlarr-ingest:9696"):
+    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
         """Initialize Prowlarr client.
         
         Args:
             api_key: Prowlarr API key (from PROWLARR_API_KEY env var)
-            base_url: Prowlarr base URL (default: http://prowlarr-ingest:9696)
+            base_url: Prowlarr base URL (from PROWLARR_URL env var, default: http://localhost:9696)
         """
         self.api_key = api_key or get_env().get("PROWLARR_API_KEY", "")
-        self.base_url = base_url.rstrip("/")
+        self.base_url = (base_url or get_env().get("PROWLARR_URL", "http://localhost:9696")).rstrip("/")
         
         self.client = httpx.Client(
             base_url=self.base_url,
