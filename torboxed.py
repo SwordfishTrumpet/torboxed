@@ -4205,7 +4205,19 @@ class SyncEngine:
         logger.debug("Processing %s (%s, %s)", title, year, imdb_id)
         
         if not imdb_id:
-            logger.warning("No IMDB ID for %s, skipping", title)
+            # Log additional identifiers to help identify the problematic item
+            ids = []
+            if content.get('trakt_id'):
+                ids.append(f"Trakt:{content['trakt_id']}")
+            if content.get('tmdb_id'):
+                ids.append(f"TMDB:{content['tmdb_id']}")
+            if content.get('tvdb_id'):
+                ids.append(f"TVDB:{content['tvdb_id']}")
+            if content.get('slug'):
+                ids.append(f"slug:{content['slug']}")
+            
+            id_info = f" ({', '.join(ids)})" if ids else " (no alternative IDs)"
+            logger.warning("No IMDB ID for '%s' (%d)%s - skipping", title, year, id_info)
             return False
         
         # Check filters
@@ -4860,8 +4872,27 @@ class SyncEngine:
         for i, item in enumerate(content, 1):
             content_type = item.get('type', 'movie')
             type_label = "show" if content_type == "show" else "movie"
-            logger.info("[%d/%d] %s (%s) [%s]", i, len(content), 
-                       item.get('title', 'Unknown'), item.get('year', '?'), type_label)
+            title = item.get('title', 'Unknown')
+            year = item.get('year', 0)
+            
+            # Build identifiers for logging
+            ids = []
+            if item.get('imdb_id'):
+                ids.append(f"IMDB:{item['imdb_id']}")
+            if item.get('trakt_id'):
+                ids.append(f"Trakt:{item['trakt_id']}")
+            if item.get('tmdb_id'):
+                ids.append(f"TMDB:{item['tmdb_id']}")
+            if item.get('tvdb_id'):
+                ids.append(f"TVDB:{item['tvdb_id']}")
+            
+            if ids:
+                id_str = f" ({', '.join(ids)})"
+            else:
+                id_str = " (no IDs)"
+            
+            logger.info("[%d/%d] %s (%s) [%s]%s", i, len(content), 
+                       title, year if year else '?', type_label, id_str)
             
             self.process_content(item, existing_torrents)
         
