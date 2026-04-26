@@ -4729,37 +4729,34 @@ class SyncEngine:
             logger.info("Trying next best torrent for upgrade (%d/%d): %s",
                        torrent_index + 1, len(cached), torrent.quality.label)
 
-        # Add new torrent FIRST (safer - if this fails, we still have old)
+        # Remove old torrent FIRST (cheap: ~0.2s wait, no creation rate limit)
+        # If this fails, we skip the upgrade entirely - no wasted API calls or duplicates
+        logger.debug("Removing old torrent first: %s", old_id)
+        if old_id and not self.debrid.remove_torrent(old_id):
+            logger.warning("Failed to remove old torrent %s for %s, skipping upgrade (no duplicate created)", 
+                          old_id, display_title)
+            log_result("skipped", display_title, {"reason": "remove_old_failed"})
+            record_processed(imdb_id, title, year, content_type, "skipped",
+                           "remove_old_failed", debrid_id=old_id,
+                           quality_score=current_score, season=season_key)
+            self._increment_stats("skipped", content_type)
+            return False
+        logger.debug("Old torrent removed: %s", old_id)
+
+        # Add new torrent (slow: ~57s creation rate limit wait)
         try:
             new_id = self.debrid.add_torrent(torrent.magnet, torrent.name)
         except RateLimitError:
-            logger.warning("Rate limit hit during upgrade for %s - will retry next run", display_title)
-            log_result("skipped", display_title, {"reason": "rate_limited", "retry": True})
-            self._increment_stats("skipped", content_type)
+            logger.warning("Rate limit hit during upgrade for %s - old was removed, will retry next run", display_title)
+            log_result("failed", display_title, {"reason": "rate_limited_after_old_removed"})
+            record_processed(imdb_id, title, year, content_type, "failed",
+                           "rate_limited_after_old_removed", season=season_key)
+            self._increment_stats("failed", content_type)
             return False
 
         if not new_id:
-            # Failed to add this torrent - try the next one if it's still better
-            logger.warning("Failed to add upgrade torrent: %s (trying next best)", torrent.name[:60])
-            return self._handle_upgrade(imdb_id, title, year, content_type, existing,
-                                       cached, season_key, torrent_index + 1)
-
-        # New torrent added successfully - now safe to remove old
-        logger.debug("New torrent added: %s, removing old: %s", new_id, old_id)
-        if self.debrid.remove_torrent(old_id):
-            logger.debug("Removed old torrent: %s", old_id)
-        else:
-            # Failed to remove old torrent - this would create a duplicate
-            # Roll back by removing the new torrent we just added
-            logger.warning("Failed to remove old torrent: %s", old_id)
-            logger.info("Rolling back upgrade - removing new torrent %s to prevent duplicate", new_id)
-            rollback_success = self.debrid.remove_torrent(new_id)
-            if rollback_success:
-                logger.info("Rollback successful - removed new torrent %s, keeping old", new_id)
-            else:
-                logger.error("CRITICAL: Both old (%s) and new (%s) torrents now in account - manual cleanup required!", old_id, new_id)
-            
-            # Try next best torrent (if any)
+            # Failed to add new torrent after removing old - try the next one
+            logger.warning("Failed to add upgrade torrent after removing old: %s (trying next best)", torrent.name[:60])
             return self._handle_upgrade(imdb_id, title, year, content_type, existing,
                                        cached, season_key, torrent_index + 1)
 
