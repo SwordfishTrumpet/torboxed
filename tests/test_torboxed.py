@@ -601,7 +601,7 @@ class TestSyncEngine(unittest.TestCase):
         self.temp_dir.cleanup()
     
     def test_safe_upgrade_adds_before_removing(self):
-        """Test that upgrade adds new torrent before removing old (safe sequence)."""
+        """Test that upgrade removes old before adding new (prevents duplicates on failure)."""
         import torboxed
         
         # Create a processed item with lower quality
@@ -639,26 +639,26 @@ class TestSyncEngine(unittest.TestCase):
         # Verify success
         self.assertTrue(result)
         
-        # Verify add_torrent was called before remove_torrent
-        # (order of calls matters for safety)
+        # Verify remove_torrent was called before add_torrent
+        # (remove first prevents duplicates when Torbox returns 500 on removal)
         calls = self.mock_debrid.method_calls
-        add_call_idx = None
         remove_call_idx = None
+        add_call_idx = None
         
         for i, call in enumerate(calls):
-            if call[0] == "add_torrent":
-                add_call_idx = i
-            elif call[0] == "remove_torrent":
+            if call[0] == "remove_torrent":
                 remove_call_idx = i
+            elif call[0] == "add_torrent":
+                add_call_idx = i
         
-        # Both should be called, and add should come before remove
-        self.assertIsNotNone(add_call_idx, "add_torrent was not called")
+        # Both should be called, and remove should come before add
         self.assertIsNotNone(remove_call_idx, "remove_torrent was not called")
-        self.assertLess(add_call_idx, remove_call_idx, 
-                        "add_torrent must be called before remove_torrent for safety")
+        self.assertIsNotNone(add_call_idx, "add_torrent was not called")
+        self.assertLess(remove_call_idx, add_call_idx, 
+                        "remove_torrent must be called before add_torrent to prevent duplicates")
     
     def test_upgrade_fails_safe_when_add_fails(self):
-        """Test that upgrade fails safely when add_torrent fails (old content preserved)."""
+        """Test that upgrade fails safely when add_torrent fails (tries next best)."""
         import torboxed
         
         # Create a processed item with lower quality
@@ -679,8 +679,9 @@ class TestSyncEngine(unittest.TestCase):
         
         self.mock_debrid.get_cached_torrents.return_value = [mock_torrent]
         
-        # Set up add_torrent to FAIL
+        # Set up add_torrent to FAIL, remove to succeed (old was removed first)
         self.mock_debrid.add_torrent.return_value = None
+        self.mock_debrid.remove_torrent.return_value = True
         
         # Process the content
         content = {
@@ -692,11 +693,11 @@ class TestSyncEngine(unittest.TestCase):
         existing_torrents = {}
         result = self.engine.process_content(content, existing_torrents)
         
-        # Verify failure
+        # Verify failure (no more torrents to try)
         self.assertFalse(result)
         
-        # Verify remove_torrent was NEVER called (old content preserved)
-        self.mock_debrid.remove_torrent.assert_not_called()
+        # Verify remove_torrent WAS called (old removed before trying add)
+        self.mock_debrid.remove_torrent.assert_called_once_with("old-torrent-id")
         
         # Verify failed record was created
         processed = torboxed.get_processed_item("tt7654321")
