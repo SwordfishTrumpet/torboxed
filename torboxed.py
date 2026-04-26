@@ -4749,7 +4749,19 @@ class SyncEngine:
         if self.debrid.remove_torrent(old_id):
             logger.debug("Removed old torrent: %s", old_id)
         else:
-            logger.warning("Failed to remove old torrent: %s (but new one is added)", old_id)
+            # Failed to remove old torrent - this would create a duplicate
+            # Roll back by removing the new torrent we just added
+            logger.warning("Failed to remove old torrent: %s", old_id)
+            logger.info("Rolling back upgrade - removing new torrent %s to prevent duplicate", new_id)
+            rollback_success = self.debrid.remove_torrent(new_id)
+            if rollback_success:
+                logger.info("Rollback successful - removed new torrent %s, keeping old", new_id)
+            else:
+                logger.error("CRITICAL: Both old (%s) and new (%s) torrents now in account - manual cleanup required!", old_id, new_id)
+            
+            # Try next best torrent (if any)
+            return self._handle_upgrade(imdb_id, title, year, content_type, existing,
+                                       cached, season_key, torrent_index + 1)
 
         # Track new hash in account set to prevent re-adding same hash this run
         if torrent.hash:
