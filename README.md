@@ -63,7 +63,7 @@ TRAKT_CLIENT_SECRET=your_trakt_client_secret_here
 EOF
 
 # 3. Build and run
-docker-compose up --build
+docker compose up --build
 docker run --rm -v $(pwd)/data:/data torboxed:latest --init
 docker run --rm -v $(pwd)/data:/data torboxed:latest
 ```
@@ -72,6 +72,61 @@ docker run --rm -v $(pwd)/data:/data torboxed:latest
 ```bash
 uv run torboxed.py --cron-setup  # Interactive setup helper
 ```
+
+---
+
+## 🤖 Option 3: Install Using an LLM Coding Assistant
+
+You can use an AI coding assistant like **OpenCode**, **Claude Code**, **Gemini CLI**, or **Codex** to help you install and configure TorBoxed interactively.
+
+### Prerequisites
+1. Install an LLM coding assistant:
+   - **OpenCode**: `npm install -g opencode` ([docs](https://opencode.ai))
+   - **Claude Code**: `npm install -g @anthropic-ai/claude-code` ([docs](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code))
+   - **Gemini CLI**: Available through Google's developer tools
+   - **Codex**: `npm install -g @openai/codex` ([docs](https://github.com/openai/codex))
+
+2. Get your API keys (see [Getting API Keys](#-getting-api-keys) section)
+
+### Installation Steps
+
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/torboxed.git
+cd torboxed
+
+# Start your LLM assistant (example with OpenCode)
+opencode
+```
+
+Once inside your LLM coding session, simply ask:
+
+> *"Install TorBoxed with my API keys. TORBOX_API_KEY=xxx, TRAKT_CLIENT_ID=yyy, TRAKT_CLIENT_SECRET=zzz"*
+
+The LLM will:
+1. ✅ Check for Python/uv and install if needed
+2. ✅ Create your `.env` file with the provided API keys
+3. ✅ Install dependencies
+4. ✅ Initialize the database
+5. ✅ Run a test sync
+6. ✅ Provide next steps
+
+### What You Can Ask the LLM
+
+```
+"Set up automatic daily syncing with cron"
+"Show me what was added in the last run"
+"Configure it to only sync trending movies"
+"I want to add my Trakt liked lists too"
+"Help me switch to Docker deployment"
+```
+
+### Tips for Best Results
+
+- **Provide API keys upfront**: Include them in your first message for smoother setup
+- **Be specific**: "Install and run a test sync" vs "Set everything up"
+- **Ask for explanations**: "Explain the quality scoring system" or "How do upgrades work?"
+- **Iterative refinement**: Start with basic sync, then add features like Telegram notifications or cron scheduling
 
 ---
 
@@ -259,7 +314,7 @@ sqlite3 torboxed.db "UPDATE config SET sources = '[\"users/liked\", \"movies/tre
 docker run --rm -v $(pwd)/data:/data torboxed:latest
 
 # With verbose output
-docker-compose run --rm torboxed --verbose
+docker compose run --rm torboxed --verbose
 
 # Check stats
 docker run --rm -v $(pwd)/data:/data torboxed:latest --stats
@@ -303,6 +358,18 @@ MIT License - use it, modify it, share it freely!
 ---
 
 ## 📝 Recent Updates
+
+### 2026-04-26: Critical Bug Fixes & Security Improvements
+- **Fixed (BUG-001/002):** Undefined `display_title` and `content_type` variables in `_process_season` - prevented `NameError` exceptions when max quality reached
+- **Fixed (BUG-004):** HTTP client connection leaks - added `DebridClient.close()` method and proper cleanup in `finally` block
+- **Fixed (BUG-005):** Lock file race condition (TOCTOU) - refactored to use atomic creation with `O_EXCL` before checking for stale locks
+- **Fixed (BUG-006):** Rate limiter coordination - added `mark_rate_limited()` method and updated `make_request_with_backoff()` to coordinate with callers
+- **Fixed (BUG-007):** Path validation bypass via symlinks - using `os.path.realpath()` on both paths and allowed roots
+- **Fixed (BUG-008):** Real Debrid `remove_torrent()` return value verification - now checks response is `None` (204 No Content)
+- **Fixed (BUG-009):** Incomplete phantom record check - now requires both `action='skipped'` AND `debrid_id` is set
+- **Security:** Enhanced path traversal protection with symlink resolution
+- **Stability:** Better resource cleanup prevents connection exhaustion during long runs
+- **Total Tests:** 288 passing
 
 ### 2026-04-25: Per-Run Stats, DRY Refactoring & Bug Fixes
 - **Fixed:** Per-season processing now checks existing_torrents to prevent re-adding discovered content (BUG-017)

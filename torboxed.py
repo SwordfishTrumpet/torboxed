@@ -121,7 +121,8 @@ DEFAULT_TIMEOUT_CREATION = 120.0  # For torrent creation (large multi-season pac
 # Search result limits
 SEARCH_LIMIT_IMDB = 200        # Higher limit for IMDb ID searches (ensure season packs)
 SEARCH_LIMIT_TITLE = 50        # Standard limit for title searches
-TORBOX_LIST_LIMIT = 5000       # Max torrents per request from Torbox mylist
+TORBOX_LIST_LIMIT = 5000       # Max torrents per request from Torbox mylist (API default is 1000, but supports up to 5000)
+REAL_DEBRID_LIST_LIMIT = 5000  # Max torrents per request from Real Debrid (API default is 100, but supports up to 5000 for large libraries)
 
 # Discovery threshold for dropped torrent detection
 # If we discover fewer than 95% of tracked torrents, skip clearing to avoid false positives
@@ -135,8 +136,8 @@ COMPLETE_PACK_MIN_SIZE = 10 * 1024**3  # 10 GB
 TRAKT_PER_PAGE = 100           # Maximum items per page (Trakt API max)
 
 # Zilean database config
-# Default connection string for Docker network (postgres container IP)
-ZILEAN_DEFAULT_DB_URL = "postgresql://zilean:zilean_password@172.20.0.2:5432/zilean"
+# Default connection string for Docker network (postgres container hostname)
+ZILEAN_DEFAULT_DB_URL = "postgresql://zilean:zilean_password@postgres:5432/zilean"
 
 # Valid time periods for Trakt API endpoints
 VALID_PERIODS = ["weekly", "monthly", "yearly", "all"]
@@ -201,6 +202,7 @@ def validate_db_path(path: Path) -> Path:
     """Validate database path is within allowed directories.
     
     VULN-004 Fix: Prevent path traversal via DB_PATH environment variable.
+    BUG-007 FIX: Use os.path.realpath() to prevent symlink bypass attacks.
     
     Args:
         path: Database path to validate
@@ -211,14 +213,16 @@ def validate_db_path(path: Path) -> Path:
     Raises:
         ValueError: If path is outside allowed directories
     """
-    resolved = path.resolve()
+    # BUG-007 FIX: Use realpath to resolve all symlinks before validation
+    resolved = Path(os.path.realpath(path))
     
     # Allowed root directories (in order of preference)
+    # BUG-007 FIX: Also resolve symlinks in allowed roots
     allowed_roots = [
-        Path.home() / '.local' / 'share' / 'torboxed',
-        Path('/data'),  # Docker mount
-        Path.cwd(),
-        Path(tempfile.gettempdir()),  # Temp directory for tests
+        Path(os.path.realpath(Path.home() / '.local' / 'share' / 'torboxed')),
+        Path(os.path.realpath(Path('/data'))),  # Docker mount
+        Path(os.path.realpath(Path.cwd())),
+        Path(os.path.realpath(Path(tempfile.gettempdir()))),  # Temp directory for tests
     ]
     
     # Check if path is within any allowed root
@@ -229,13 +233,6 @@ def validate_db_path(path: Path) -> Path:
         except ValueError:
             continue
     
-    # Special case: allow paths that are children of the current working directory
-    try:
-        resolved.relative_to(Path.cwd())
-        return resolved
-    except ValueError:
-        pass
-    
     raise ValueError(f"DB_PATH {path} is outside allowed directories. "
                      f"Allowed: home/.local/share/torboxed, /data, current directory")
 
@@ -244,6 +241,7 @@ def validate_log_path(path: Path) -> Path:
     """Validate log path is within allowed directories.
     
     VULN-004 Fix: Prevent path traversal via LOG_PATH environment variable.
+    BUG-007 FIX: Use os.path.realpath() to prevent symlink bypass attacks.
     
     Args:
         path: Log path to validate
@@ -254,15 +252,17 @@ def validate_log_path(path: Path) -> Path:
     Raises:
         ValueError: If path is outside allowed directories
     """
-    resolved = path.resolve()
+    # BUG-007 FIX: Use realpath to resolve all symlinks before validation
+    resolved = Path(os.path.realpath(path))
     
     # Allowed root directories
+    # BUG-007 FIX: Also resolve symlinks in allowed roots
     allowed_roots = [
-        Path.home() / '.local' / 'share' / 'torboxed',
-        Path('/data'),
-        Path('/var/log'),
-        Path.cwd(),
-        Path(tempfile.gettempdir()),  # Temp directory for tests
+        Path(os.path.realpath(Path.home() / '.local' / 'share' / 'torboxed')),
+        Path(os.path.realpath(Path('/data'))),
+        Path(os.path.realpath(Path('/var/log'))),
+        Path(os.path.realpath(Path.cwd())),
+        Path(os.path.realpath(Path(tempfile.gettempdir()))),  # Temp directory for tests
     ]
     
     # Check if path is within any allowed root
@@ -272,13 +272,6 @@ def validate_log_path(path: Path) -> Path:
             return resolved
         except ValueError:
             continue
-    
-    # Special case: allow paths that are children of the current working directory
-    try:
-        resolved.relative_to(Path.cwd())
-        return resolved
-    except ValueError:
-        pass
     
     raise ValueError(f"LOG_PATH {path} is outside allowed directories. "
                      f"Allowed: home/.local/share/torboxed, /data, /var/log, current directory")
@@ -391,6 +384,27 @@ class RateLimiter:
     def mark_success(self):
         """Mark a request as successfully completed."""
         self.last_successful_request = time.time()
+    
+    def mark_rate_limited(self, retry_after: Optional[int] = None):
+        """BUG-006 FIX: Mark that we were rate limited (429 received).
+        
+        Sets last_successful_request to a future time so that the next
+        wait() call will delay appropriately.
+        
+        Args:
+            retry_after: Seconds to wait (from Retry-After header), or None for default
+        """
+        if retry_after and retry_after > 0:
+            # Use server-provided retry time
+            delay = retry_after
+        else:
+            # Default: wait 2x the normal interval
+            delay = self.min_interval * 2
+        
+        # Set last_successful_request to future time so wait() will delay
+        self.last_successful_request = time.time() + delay
+        logger.debug("Rate limiter %s: marked rate limited, delaying for %ds", 
+                    self.name, delay)
 
 
 class ZileanClient:
@@ -2206,10 +2220,20 @@ def validate_list_response(data: Any, item_validator=None, context: str = "") ->
 
 
 def make_request_with_backoff(client: httpx.Client, method: str, url: str, 
-                                max_retries: int = 3, **kwargs) -> httpx.Response:
+                                max_retries: int = 3, 
+                                rate_limiter: Optional[RateLimiter] = None,
+                                **kwargs) -> httpx.Response:
     """Make HTTP request with exponential backoff for server errors and timeouts.
     
     Note: Does NOT retry on 429 (rate limit) - let the caller's rate limiter handle that.
+    
+    Args:
+        client: HTTP client to use
+        method: HTTP method
+        url: Request URL
+        max_retries: Maximum number of retries
+        rate_limiter: Optional RateLimiter to update on 429 responses (BUG-006 FIX)
+        **kwargs: Additional arguments for client.request()
     """
     retries = 0
     backoff = 1
@@ -2219,15 +2243,24 @@ def make_request_with_backoff(client: httpx.Client, method: str, url: str,
             response = client.request(method, url, **kwargs)
             
             # Handle rate limiting (429 Too Many Requests) - return immediately
-            # Let the caller's rate limiter handle the timing
+            # BUG-006 FIX: Update rate limiter state to coordinate with caller
             if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
                 if retry_after:
                     logger.warning("Rate limited (429) on %s %s. Retry-After: %ss", 
                                   method, url.split('/')[-1], retry_after)
+                    # BUG-006 FIX: Update rate limiter with retry time
+                    if rate_limiter:
+                        try:
+                            rate_limiter.mark_rate_limited(int(retry_after))
+                        except (ValueError, TypeError):
+                            rate_limiter.mark_rate_limited()
                 else:
                     logger.warning("Rate limited (429) on %s %s. Letting rate limiter handle retry.", 
                                   method, url.split('/')[-1])
+                    # BUG-006 FIX: Update rate limiter without retry time
+                    if rate_limiter:
+                        rate_limiter.mark_rate_limited()
                 return response  # Return immediately, don't retry internally
             
             # Handle server errors (5xx) - retry with backoff
@@ -2307,11 +2340,14 @@ class TraktClient:
         
         trakt_limiter.wait()
         url = f"{TRAKT_BASE_URL}{path}"
-        response = make_request_with_backoff(self.client, method, url, headers=headers, **kwargs)
+        # BUG-006 FIX: Pass rate_limiter so it gets updated on 429
+        response = make_request_with_backoff(self.client, method, url, headers=headers, 
+                                              rate_limiter=trakt_limiter, **kwargs)
         
-        # Handle 429 specially - return without marking success so rate limiter works
+        # Handle 429 specially - mark rate limited and return without marking success
         if response.status_code == 429:
             logger.debug("Got 429 for %s, will retry after rate limiter wait", path)
+            # BUG-006 FIX: Rate limiter already updated by make_request_with_backoff
             return None
         
         if response.status_code >= 400:
@@ -2810,6 +2846,31 @@ class DebridClient(ABC):
         self.searcher_zilean = ZileanClient()
         self.searcher_prowlarr = ProwlarrClient()
         self.searcher_jackett = JackettClient()
+    
+    def close(self):
+        """BUG-004 FIX: Close all HTTP clients to prevent connection leaks.
+        
+        Must be called when done using the client to release resources.
+        """
+        # Close Prowlarr client
+        if hasattr(self, 'searcher_prowlarr') and self.searcher_prowlarr:
+            try:
+                self.searcher_prowlarr.close()
+            except Exception:
+                pass  # Ignore close errors
+        
+        # Close Jackett client
+        if hasattr(self, 'searcher_jackett') and self.searcher_jackett:
+            try:
+                self.searcher_jackett.close()
+            except Exception:
+                pass  # Ignore close errors
+        
+        # Zilean uses PostgreSQL connections which are managed separately
+    
+    def __del__(self):
+        """Destructor to ensure clients are closed on garbage collection."""
+        self.close()
 
     @abstractmethod
     def check_cached(self, hashes: List[str]) -> Dict[str, bool]:
@@ -3133,15 +3194,21 @@ class TorboxClient(DebridClient):
         while retries <= effective_max_retries:
             # Use appropriate rate limiter
             if use_creation_limiter:
-                torbox_creation_limiter.wait()
+                current_limiter = torbox_creation_limiter
             else:
-                torbox_limiter.wait()
+                current_limiter = torbox_limiter
+            
+            current_limiter.wait()
             
             url = f"{TORBOX_BASE_URL}{path}"
-            response = make_request_with_backoff(self.client, method, url, **kwargs)
+            # BUG-006 FIX: Pass rate_limiter so it gets updated on 429
+            response = make_request_with_backoff(self.client, method, url, 
+                                                  rate_limiter=current_limiter, **kwargs)
             
             # Handle 429 specially
             if response.status_code == 429:
+                # BUG-006 FIX: Rate limiter already updated by make_request_with_backoff
+                # but we still need to handle retry logic here
                 retry_after = response.headers.get("Retry-After")
                 if retry_after:
                     wait_time = int(retry_after)
@@ -3367,33 +3434,67 @@ class TorboxClient(DebridClient):
             return None
     
     def remove_torrent(self, torrent_id: str) -> bool:
-        """Remove a torrent from Torbox."""
-        try:
-            response = self._request(
-                "POST",
-                "/v1/api/torrents/controltorrent",
-                json={"torrent_id": torrent_id, "operation": "delete"}
-            )
-            # Validate response has success field
-            if response is None:
-                logger.warning("Failed to remove torrent %s (no response)", torrent_id)
+        """Remove a torrent from Torbox.
+        
+        Includes additional retry logic for transient DATABASE_ERROR (HTTP 500)
+        which can occur when the torrent is being processed internally.
+        """
+        max_retries = 3
+        backoff = 2  # Start with 2 second delay
+        
+        for attempt in range(max_retries):
+            try:
+                response = self._request(
+                    "POST",
+                    "/v1/api/torrents/controltorrent",
+                    json={"torrent_id": torrent_id, "operation": "delete"}
+                )
+                # Validate response has success field
+                if response is None:
+                    logger.warning("Failed to remove torrent %s (no response)", torrent_id)
+                    return False
+                
+                validated = validate_response(
+                    response,
+                    required_keys=["success"],
+                    context="Torbox remove torrent"
+                )
+                
+                success = validated.get("success", False)
+                if success:
+                    if attempt > 0:
+                        logger.info("Successfully removed torrent %s after %d retries", torrent_id, attempt)
+                    else:
+                        logger.debug("Removed torrent %s", torrent_id)
+                    return True
+                else:
+                    logger.warning("Failed to remove torrent %s (API returned failure)", torrent_id)
+                    return False
+                    
+            except APIError as e:
+                # Retry on transient DATABASE_ERROR (500)
+                if hasattr(e, 'status_code') and e.status_code == 500 and attempt < max_retries - 1:
+                    error_str = str(e)
+                    if "DATABASE_ERROR" in error_str or "error processing" in error_str.lower():
+                        logger.warning(
+                            "Transient DATABASE_ERROR removing torrent %s (attempt %d/%d), retrying in %ds...",
+                            torrent_id, attempt + 1, max_retries, backoff
+                        )
+                        time.sleep(backoff)
+                        backoff *= 2  # Exponential backoff
+                        continue
+                
+                # Last attempt or non-retryable error
+                if attempt == max_retries - 1:
+                    logger.error("Error removing torrent %s after %d attempts: %s", torrent_id, max_retries, e)
+                else:
+                    logger.error("Error removing torrent %s: %s", torrent_id, e)
                 return False
-            
-            validated = validate_response(
-                response,
-                required_keys=["success"],
-                context="Torbox remove torrent"
-            )
-            
-            success = validated.get("success", False)
-            if success:
-                logger.debug("Removed torrent %s", torrent_id)
-            else:
-                logger.warning("Failed to remove torrent %s (API returned failure)", torrent_id)
-            return success
-        except (APIError, APIResponseError) as e:
-            logger.error("Error removing torrent %s: %s", torrent_id, e)
-            return False
+            except APIResponseError as e:
+                logger.error("Error removing torrent %s: %s", torrent_id, e)
+                return False
+        
+        return False
 
 
 # ============================================================================
@@ -3441,15 +3542,21 @@ class RealDebridClient(DebridClient):
         while retries <= effective_max_retries:
             # Use appropriate rate limiter
             if use_creation_limiter:
-                self._creation_limiter.wait()
+                current_limiter = self._creation_limiter
             else:
-                self._limiter.wait()
+                current_limiter = self._limiter
+            
+            current_limiter.wait()
 
             url = f"{REAL_DEBRID_BASE_URL}{path}"
-            response = make_request_with_backoff(self.client, method, url, **kwargs)
+            # BUG-006 FIX: Pass rate_limiter so it gets updated on 429
+            response = make_request_with_backoff(self.client, method, url, 
+                                                  rate_limiter=current_limiter, **kwargs)
 
             # Handle 429 specially
             if response.status_code == 429:
+                # BUG-006 FIX: Rate limiter already updated by make_request_with_backoff
+                # but we still need to handle retry logic here
                 retry_after = response.headers.get("Retry-After")
                 if retry_after:
                     wait_time = int(retry_after)
@@ -3534,7 +3641,7 @@ class RealDebridClient(DebridClient):
         """
         all_torrents: List[Dict[str, Any]] = []
         page = 1
-        limit = 5000  # RD max per page (reduces API calls for large libraries)
+        limit = REAL_DEBRID_LIST_LIMIT  # Max per request (API supports up to 5000, reduces calls for large libraries)
 
         try:
             while True:
@@ -3637,10 +3744,19 @@ class RealDebridClient(DebridClient):
                 f"/torrents/delete/{torrent_id}"
             )
 
+            # BUG-008 FIX: Verify the response indicates success
             # RD returns 204 No Content on success, which results in None response
             # from _request since response.text would be empty
-            logger.debug("Removed torrent %s", torrent_id)
-            return True
+            # Any non-None response or unexpected data indicates an issue
+            if response is None:
+                # Expected success case (204 No Content)
+                logger.debug("Removed torrent %s", torrent_id)
+                return True
+            else:
+                # Unexpected response - log and return False
+                logger.warning("Unexpected response when removing torrent %s: %s", 
+                             torrent_id, response)
+                return False
 
         except (APIError, APIResponseError) as e:
             # Handle 404 as already removed
@@ -4538,6 +4654,10 @@ class SyncEngine:
         """
         logger.debug("Processing season %s of %s", season_key, title)
         
+        # BUG-001 & BUG-002 FIX: Define variables early that are used throughout method
+        content_type = "show"
+        display_title = self._display_title(title, content_type, season_key)
+        
         # FIRST: Check database for this specific season (per-season granularity)
         # This is the authoritative check - database records are always season-aware
         existing = get_processed_item(imdb_id, season_key)
@@ -4548,7 +4668,9 @@ class SyncEngine:
         # episodes with a torrent ID but never actually added the individual episode.
         # We must re-process these to actually add the content.
         is_phantom_record = False
-        if existing and existing.get("action") == "skipped":
+        # BUG-009 FIX: Also verify that debrid_id is set - a skipped record without
+        # debrid_id shouldn't be considered phantom (it may be an unprocessed item)
+        if existing and existing.get("action") == "skipped" and existing.get("debrid_id"):
             reason = existing.get("reason", "")
             if reason in ("already_in_torbox", "multi_season_pack_discovery", "already_in_account"):
                 is_phantom_record = True
@@ -4571,7 +4693,7 @@ class SyncEngine:
         # Skip phantom records - they need actual addition, not upgrade check
         if existing and existing.get("debrid_id") and not is_phantom_record:
             # For upgrades, pass a single-item list since we only check the best one
-            return self._handle_upgrade(imdb_id, title, year, "show", existing, [torrent], season_key)
+            return self._handle_upgrade(imdb_id, title, year, content_type, existing, [torrent], season_key)
         
         # SECOND: Check if this show was already discovered in debrid account (from discovery phase)
         # This handles multi-season packs where discovery found the show but this
@@ -4586,28 +4708,26 @@ class SyncEngine:
         if debrid_id and not existing and not is_episode:
             # Only skip for season-level items (S01, S02) or complete series
             # Episode-level items should proceed to hash check or addition
-            display_title = self._display_title(title, "show", season_key)
             logger.info("Already in debrid account: %s (debrid_id: %s, discovered in multi-season pack)", 
                        display_title, debrid_id)
-            record_processed(imdb_id, title, year, "show", "skipped",
+            record_processed(imdb_id, title, year, content_type, "skipped",
                            "already_in_debrid", debrid_id=debrid_id,
                            quality_score=torrent.quality.score, season=season_key)
-            self._increment_stats("skipped", "show")
+            self._increment_stats("skipped", content_type)
             return True
         
         # Check if torrent hash already exists in account (manual add or discovery miss)
         if self._is_hash_in_account(torrent.hash):
-            display_title = self._display_title(title, "show", season_key)
             logger.info("Already in debrid account: %s (hash match)", display_title)
             log_result("skipped", display_title, {"reason": "already_in_debrid_by_hash", "hash": torrent.hash[:16] if torrent.hash else "unknown"})
-            record_processed(imdb_id, title, year, "show", "skipped",
+            record_processed(imdb_id, title, year, content_type, "skipped",
                            "already_in_debrid_by_hash",
                            quality_score=torrent.quality.score, season=season_key)
-            self._increment_stats("skipped", "show")
+            self._increment_stats("skipped", content_type)
             return True
         
         # Pass as list to support fallback torrents
-        return self._handle_new_addition(imdb_id, title, year, "show", [torrent], 0, season_key)
+        return self._handle_new_addition(imdb_id, title, year, content_type, [torrent], 0, season_key)
     
     def _handle_new_addition(self, imdb_id: str, title: str, year: int,
                               content_type: str, cached: List[TorrentResult],
@@ -5577,47 +5697,72 @@ def check_and_acquire_lock() -> bool:
     lock_dir = LOCK_PATH.parent
     lock_dir.mkdir(parents=True, exist_ok=True)
     
-    # Check if lock file exists
-    if LOCK_PATH.exists():
+    def _try_acquire_lock() -> bool:
+        """BUG-005 FIX: Try to acquire lock atomically."""
+        try:
+            # Create lock file atomically with O_CREAT | O_EXCL
+            # This prevents TOCTOU race conditions
+            fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            with os.fdopen(fd, 'w') as f:
+                f.write(str(os.getpid()))
+            return True
+        except FileExistsError:
+            return False
+    
+    def _is_lock_stale() -> bool:
+        """Check if existing lock is stale (process not running)."""
         # Security: Check if it's a symlink (could be pointing to sensitive file)
         if LOCK_PATH.is_symlink():
             logger.warning("Lock file is a symlink - potential attack detected. Removing.")
             LOCK_PATH.unlink()
-        elif not LOCK_PATH.is_file():
+            return True
+        
+        if not LOCK_PATH.is_file():
             logger.warning("Lock file is not a regular file. Cannot acquire lock.")
             return False
-        else:
-            # Check if the PID is still running
-            try:
-                old_pid = int(LOCK_PATH.read_text().strip())
-                # Check if process exists (kill -0 check)
-                os.kill(old_pid, 0)
-                # Process is still running
-                return False
-            except (ValueError, OSError, ProcessLookupError):
-                # Stale lock file, process not running
-                LOCK_PATH.unlink()
-    
-    # Create lock file atomically with O_CREAT | O_EXCL
-    # This prevents race conditions where another process creates the file
-    try:
-        fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        with os.fdopen(fd, 'w') as f:
-            f.write(str(os.getpid()))
-    except FileExistsError:
-        # Another process created the file between our check and open
-        return False
-    
-    # Register cleanup on exit
-    def release_lock():
+        
+        # Check if the PID is still running
         try:
-            LOCK_PATH.unlink(missing_ok=True)
-        except (OSError, PermissionError):
-            # Ignore lock cleanup errors
-            pass
+            old_pid = int(LOCK_PATH.read_text().strip())
+            # Check if process exists (kill -0 check)
+            os.kill(old_pid, 0)
+            # Process is still running
+            return False
+        except (ValueError, OSError, ProcessLookupError):
+            # Stale lock file, process not running
+            LOCK_PATH.unlink()
+            return True
     
-    atexit.register(release_lock)
-    return True
+    # First attempt: try atomic creation
+    if _try_acquire_lock():
+        # Register cleanup on exit
+        def release_lock():
+            try:
+                LOCK_PATH.unlink(missing_ok=True)
+            except (OSError, PermissionError):
+                # Ignore lock cleanup errors
+                pass
+        
+        atexit.register(release_lock)
+        return True
+    
+    # Lock exists - check if it's stale
+    if _is_lock_stale():
+        # Retry once after removing stale lock
+        if _try_acquire_lock():
+            # Register cleanup on exit
+            def release_lock():
+                try:
+                    LOCK_PATH.unlink(missing_ok=True)
+                except (OSError, PermissionError):
+                    # Ignore lock cleanup errors
+                    pass
+            
+            atexit.register(release_lock)
+            return True
+    
+    # Lock is held by another running process
+    return False
 
 
 def main():
@@ -5781,6 +5926,13 @@ Examples:
         logger.exception("Fatal error during sync: %s", e)
         sys.exit(1)
     finally:
+        # BUG-004 FIX: Clean up HTTP clients to prevent connection leaks
+        if debrid:
+            try:
+                debrid.close()
+            except Exception:
+                pass  # Ignore cleanup errors
+        
         # Clean up Telegram notifier
         if telegram:
             telegram.close()
