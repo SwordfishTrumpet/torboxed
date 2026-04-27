@@ -88,6 +88,38 @@ def get_lock_path() -> Path:
     return Path(tempfile.gettempdir()) / f'torboxed-{os.getuid()}.lock'
 
 
+def _create_ipv4_transport() -> httpx.HTTPTransport:
+    """Create HTTP transport that forces IPv4-only connections.
+    
+    WORKAROUND: Systems with broken IPv6 (addresses assigned but no default route)
+    experience DNS failures. This forces IPv4-only to avoid the issue.
+    Uses local_address="0.0.0.0" to force IPv4 socket binding.
+    
+    Returns:
+        HTTPTransport configured for IPv4 only
+    """
+    return httpx.HTTPTransport(local_address="0.0.0.0")
+
+
+def create_httpx_client(**kwargs) -> httpx.Client:
+    """Create httpx Client with IPv4-only transport.
+    
+    WORKAROUND: Forces IPv4 to avoid DNS issues on systems with broken IPv6.
+    All httpx.Client instantiations should use this helper.
+    
+    Args:
+        **kwargs: Additional arguments to pass to httpx.Client
+        
+    Returns:
+        Configured httpx.Client instance
+    """
+    # Create transport that only resolves IPv4 addresses
+    # local_address="0.0.0.0" forces the socket to bind to IPv4
+    if 'transport' not in kwargs:
+        kwargs['transport'] = _create_ipv4_transport()
+    return httpx.Client(**kwargs)
+
+
 # Paths (using secure defaults)
 DB_PATH = Path("torboxed.db")
 ENV_PATH = Path(".env")
@@ -681,7 +713,7 @@ class ProwlarrClient:
         self.api_key = api_key or get_env().get("PROWLARR_API_KEY", "")
         self.base_url = (base_url or get_env().get("PROWLARR_URL", "http://localhost:9696")).rstrip("/")
         
-        self.client = httpx.Client(
+        self.client = create_httpx_client(
             base_url=self.base_url,
             headers={
                 "X-Api-Key": self.api_key,
@@ -831,7 +863,7 @@ class JackettClient:
         self.api_key = api_key or get_env().get("JACKETT_API_KEY", "")
         self.base_url = base_url.rstrip("/")
         
-        self.client = httpx.Client(
+        self.client = create_httpx_client(
             base_url=self.base_url,
             headers={
                 "User-Agent": "torboxed/1.0",
@@ -839,7 +871,7 @@ class JackettClient:
             },
             timeout=DEFAULT_TIMEOUT_LONG
         )
-    
+
     def is_configured(self) -> bool:
         """Check if Jackett is configured (has API key)."""
         return bool(self.api_key)
@@ -1043,7 +1075,7 @@ class TelegramNotifier:
     def _get_client(self) -> httpx.Client:
         """Get or create HTTP client."""
         if self._client is None:
-            self._client = httpx.Client(
+            self._client = create_httpx_client(
                 base_url="https://api.telegram.org",
                 timeout=DEFAULT_TIMEOUT_SHORT,
                 headers={"User-Agent": "torboxed/1.0"}
@@ -2384,7 +2416,7 @@ class TraktClient:
         self.client_id = client_id
         self.access_token = access_token
         # VULN-006: Explicitly enable SSL verification
-        self.client = httpx.Client(
+        self.client = create_httpx_client(
             base_url=TRAKT_BASE_URL,
             headers={
                 "Content-Type": "application/json",
@@ -3151,7 +3183,7 @@ class DebridClient(ABC):
                 "leechers": torrent.get("peers", 0),
             })
 
-        logger.info("Found %d torrents from Zilean/Prowlarr/Jackett, %d cached",
+        logger.info("Search returned %d torrents (%d marked available by indexer)",
                      len(results), cached_count)
         return results
 
@@ -3216,10 +3248,10 @@ class DebridClient(ABC):
                 ))
 
         if cached:
-            logger.info("Found %d cached torrents for: %s (skipped %d low-res)",
+            logger.info("Selected %d quality torrents for: %s (filtered out %d low-res)",
                          len(cached), query, skipped_low_res)
         else:
-            logger.info("No cached torrents found for: %s", query)
+            logger.info("No quality torrents available for: %s", query)
 
         return cached
 
@@ -3237,7 +3269,7 @@ class TorboxClient(DebridClient):
         super().__init__()  # Creates searcher_zilean, searcher_prowlarr, searcher_jackett
         self.api_key = api_key
         # VULN-006: Explicitly enable SSL verification
-        self.client = httpx.Client(
+        self.client = create_httpx_client(
             base_url=TORBOX_BASE_URL,
             headers={
                 "Authorization": f"Bearer {api_key}",
@@ -3607,7 +3639,7 @@ class RealDebridClient(DebridClient):
     def __init__(self, api_key: str):
         super().__init__()  # Creates searcher_zilean, searcher_prowlarr, searcher_jackett
         self.api_key = api_key
-        self.client = httpx.Client(
+        self.client = create_httpx_client(
             base_url=REAL_DEBRID_BASE_URL,
             headers={
                 "Authorization": f"Bearer {api_key}",
@@ -3871,22 +3903,24 @@ class RealDebridClient(DebridClient):
 # DEBRID DISCOVERY
 # ============================================================================
 
-def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Dict[str, str], Set[str]]]:
+def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Dict[str, str], Set[str], Dict[str, str]]]:
     """Discover all torrents currently in the debrid account.
     
     Returns mapping of IMDB ID to debrid torrent ID by:
     1. First trying direct ID matching (reliable)
     2. Then falling back to name matching for any unmatched items
     
-    Also returns a set of all torrent hashes in the account for duplicate prevention.
+    Also returns:
+    - A set of all torrent hashes in the account for duplicate prevention
+    - A mapping of hash -> IMDb ID for properly matched torrents (to prevent false positive skips)
     
     Args:
         debrid_client: DebridClient instance
         
     Returns:
-        Tuple of (imdb_id -> debrid_id mapping, set of all hashes in account),
+        Tuple of (imdb_id -> debrid_id mapping, set of all hashes, hash -> imdb_id mapping),
         or None if API call failed,
-        or ({}, set()) if account is empty
+        or ({}, set(), {}) if account is empty
     """
     logger.info("Discovering existing torrents in debrid account...")
     my_torrents = debrid_client.get_my_torrents()
@@ -3898,7 +3932,7 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
     
     if not my_torrents:
         logger.info("No torrents found in debrid account (empty)")
-        return {}, set()
+        return {}, set(), {}
     
     logger.info("Found %d torrents in debrid account", len(my_torrents))
 
@@ -3964,6 +3998,7 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
     
     imdb_to_debrid = {}
     account_hashes = set()  # All hashes in account for duplicate prevention
+    hash_to_imdb = {}  # Hash -> IMDb ID mapping (only for matched torrents)
     id_matches = 0
     name_matches = 0
     unmatched = []
@@ -3984,6 +4019,9 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
         if debrid_id in db_by_debrid_id:
             imdb_id, season = db_by_debrid_id[debrid_id]
             imdb_to_debrid[imdb_id] = debrid_id
+            # Only add to hash_to_imdb if we have a valid hash
+            if torrent_hash:
+                hash_to_imdb[torrent_hash] = imdb_id
             id_matches += 1
             logger.debug("Matched torrent by ID: debrid ID %s -> IMDB %s (season: %s)", debrid_id, imdb_id, season)
             continue
@@ -4057,6 +4095,9 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
                                     torrent_name, imdb_id, matched_seasons, debrid_id)
                 
                 imdb_to_debrid[imdb_id] = debrid_id
+                # Only add to hash_to_imdb if we have a valid hash
+                if torrent_hash:
+                    hash_to_imdb[torrent_hash] = imdb_id
                 name_matches += 1
                 logger.debug("Matched torrent by name '%s' to IMDB %s (debrid ID: %s)",
                             torrent_name, imdb_id, debrid_id)
@@ -4095,12 +4136,12 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
     if unmatched:
         logger.debug("%d torrents could not be matched to database (manual adds)", len(unmatched))
     
-    logger.info("Discovered %d existing torrents in account (ID matches: %d, name matches: %d, multi-season updates: %d, total hashes: %d)",
-               total_matches, id_matches, name_matches, len(multi_season_updates), len(account_hashes))
-    return imdb_to_debrid, account_hashes
+    logger.info("Discovered %d existing torrents in account (ID matches: %d, name matches: %d, multi-season updates: %d, total hashes: %d, matched hashes: %d)",
+               total_matches, id_matches, name_matches, len(multi_season_updates), len(account_hashes), len(hash_to_imdb))
+    return imdb_to_debrid, account_hashes, hash_to_imdb
 
 
-def verify_and_clear_dropped_torrents(existing_torrents: Optional[Tuple[Dict[str, str], Set[str]]]) -> int:
+def verify_and_clear_dropped_torrents(existing_torrents: Optional[Tuple[Dict[str, str], Set[str], Dict[str, str]]]) -> int:
     """Verify database records against discovered torrents and clear dropped ones.
     
     Compares all processed items with debrid_id against the discovered torrents
@@ -4111,7 +4152,7 @@ def verify_and_clear_dropped_torrents(existing_torrents: Optional[Tuple[Dict[str
     (API failure), returns 0 without clearing anything.
     
     Args:
-        existing_torrents: Tuple of (imdb_to_torbox mapping, account_hashes set) from discovery,
+        existing_torrents: Tuple of (imdb_to_torbox mapping, account_hashes set, hash_to_imdb mapping) from discovery,
                          or None if discovery failed
         
     Returns:
@@ -4122,8 +4163,8 @@ def verify_and_clear_dropped_torrents(existing_torrents: Optional[Tuple[Dict[str
         logger.warning("Skipping dropped torrent verification - discovery failed (API error)")
         return 0
     
-    # Unpack the tuple
-    imdb_to_debrid, _ = existing_torrents
+    # Unpack the tuple (only need imdb_to_debrid for this function)
+    imdb_to_debrid, _, _ = existing_torrents
     
     logger.debug("Verifying database records against discovered torrents...")
     
@@ -4301,6 +4342,7 @@ class SyncEngine:
         self.filters = config.get("filters", {})
         self.telegram = telegram_notifier
         self.account_hashes: Set[str] = set()  # All hashes in account for duplicate prevention
+        self.hash_to_imdb: Dict[str, str] = {}  # Hash -> IMDb ID mapping (only for matched torrents)
         # Pre-compile regex patterns for excluded keywords (optimization)
         self._exclude_patterns: List[Tuple[str, Any]] = []
         exclude_keywords = self.filters.get("exclude", [])
@@ -4347,16 +4389,36 @@ class SyncEngine:
             logger.debug("Telegram %s notification traceback:", action, exc_info=True)
             logger.debug("Failed to send Telegram %s notification: %s", action, e)
     
-    def _is_hash_in_account(self, torrent_hash: Optional[str]) -> bool:
-        """Check if a torrent hash already exists in the account.
+    def _is_hash_in_account(self, torrent_hash: Optional[str], imdb_id: str) -> bool:
+        """Check if a torrent hash is already associated with the SAME movie/show.
+        
+        BUG FIX: Previously this checked if hash exists in ANY torrent in the account,
+        which caused false positives when a multi-movie pack's hash matched an
+        individual movie search result. Now it only returns True if the hash
+        is properly matched to the same IMDb ID in our database.
         
         Args:
             torrent_hash: The hash to check (may be None or empty)
+            imdb_id: The IMDb ID we're trying to add
             
         Returns:
-            True if hash exists in account, False otherwise
+            True if hash is already associated with the same IMDb ID, False otherwise
         """
-        return bool(torrent_hash and torrent_hash.lower() in self.account_hashes)
+        if not torrent_hash:
+            return False
+        
+        hash_lower = torrent_hash.lower()
+        
+        # Check if this hash is in our hash_to_imdb mapping (only matched torrents)
+        # and if it's associated with the same IMDb ID
+        if hash_lower in self.hash_to_imdb:
+            return self.hash_to_imdb[hash_lower] == imdb_id
+        
+        # Hash not found in matched mapping - it's either:
+        # 1. An unmatched torrent (multi-movie pack, bad torrent, etc.)
+        # 2. A hash that wasn't properly discovered
+        # In either case, we should NOT skip - let it try to add
+        return False
 
     @staticmethod
     def _display_title(title: str, content_type: str, season_key: str = "unknown") -> str:
@@ -4390,17 +4452,6 @@ class SyncEngine:
         min_resolution_score = self.config.get("filters", {}).get("min_resolution_score", 800)
         return excluded_sources, min_resolution_score
 
-    def _get_searcher_list(self) -> str:
-        """Build a human-readable list of configured searchers."""
-        searchers = []
-        if self.debrid.searcher_zilean.is_configured():
-            searchers.append("Zilean")
-        if self.debrid.searcher_prowlarr.is_configured():
-            searchers.append("Prowlarr")
-        if self.debrid.searcher_jackett.is_configured():
-            searchers.append("Jackett")
-        return " → ".join(searchers) if searchers else "none configured"
-    
     def process_content(self, content: Dict[str, Any], existing_torrents: Dict[str, str]) -> bool:
         """Process a single content item (add or upgrade).
         
@@ -4483,8 +4534,6 @@ class SyncEngine:
         
         # Search for cached content
         search_query = normalize_search_query(f"{title} {year}" if year else title)
-        searcher_list = self._get_searcher_list()
-        logger.info("Searching indexers for: %s (using: %s)", search_query, searcher_list)
         excluded_sources, min_resolution_score = self._get_filter_config()
         cached = self.debrid.get_cached_torrents(search_query, "movie", excluded_sources, min_resolution_score, imdb_id)
         
@@ -4504,9 +4553,10 @@ class SyncEngine:
         if existing and existing.get("debrid_id"):
             return self._handle_upgrade(imdb_id, title, year, "movie", existing, cached)
         
-        # Check if best torrent's hash already exists in account (manual add or discovery miss)
-        if self._is_hash_in_account(best.hash):
-            logger.info("Already in Torbox: %s (hash match)", title)
+        # Check if best torrent's hash already exists in account for THIS movie (manual add or discovery miss)
+        # BUG FIX: Only skip if hash is associated with the SAME IMDb ID, not just any hash in account
+        if self._is_hash_in_account(best.hash, imdb_id):
+            logger.info("Already in Torbox: %s (hash match for same IMDb ID)", title)
             log_result("skipped", title, {"reason": "already_in_torbox_by_hash", "hash": best.hash[:16] if best.hash else "unknown"})
             record_processed(imdb_id, title, year, "movie", "skipped",
                            "already_in_torbox_by_hash",
@@ -4534,8 +4584,6 @@ class SyncEngine:
         
         # Search for cached content
         search_query = normalize_search_query(f"{title} {year}" if year else title)
-        searcher_list = self._get_searcher_list()
-        logger.info("Searching indexers for show: %s (using: %s)", search_query, searcher_list)
         excluded_sources, min_resolution_score = self._get_filter_config()
         cached = self.debrid.get_cached_torrents(search_query, "show", excluded_sources, min_resolution_score, imdb_id)
         
@@ -4548,7 +4596,7 @@ class SyncEngine:
             return False
         
         # Group torrents by season
-        seasons_map, skip_reason = self._group_by_season(cached)
+        seasons_map, skip_reason = self._group_by_season(cached, imdb_id)
         
         if not seasons_map:
             if skip_reason == "all_duplicates":
@@ -4584,7 +4632,7 @@ class SyncEngine:
         
         return any_action_taken
     
-    def _group_by_season(self, cached: List[TorrentResult]) -> Tuple[Dict[str, TorrentResult], str]:
+    def _group_by_season(self, cached: List[TorrentResult], imdb_id: str) -> Tuple[Dict[str, TorrentResult], str]:
         """Group cached torrents by season with smart pack prioritization.
         
         Hierarchy: Series pack > Season packs > Episodes
@@ -4595,6 +4643,7 @@ class SyncEngine:
         
         Args:
             cached: List of TorrentResult objects (already sorted by quality)
+            imdb_id: IMDb ID for hash duplicate checking
             
         Returns:
             Tuple of (seasons_map, skip_reason) where:
@@ -4636,9 +4685,10 @@ class SyncEngine:
         best_per_season: Dict[str, TorrentResult] = {}
         skipped_hashes = 0
         
-        # Helper to check if hash is already in account
+        # Helper to check if hash is already in account for THIS show
+        # BUG FIX: Only skip if hash is associated with the same IMDb ID
         def is_hash_duplicate(torrent: TorrentResult) -> bool:
-            return self._is_hash_in_account(torrent.hash)
+            return self._is_hash_in_account(torrent.hash, imdb_id)
         
         # 1. Add complete series pack if available (highest priority)
         if complete_packs:
@@ -4788,9 +4838,10 @@ class SyncEngine:
             # For upgrades, pass a single-item list since we only check the best one
             return self._handle_upgrade(imdb_id, title, year, content_type, existing, [torrent], season_key)
         
-        # Check if torrent hash already exists in account (manual add or discovery miss)
-        if self._is_hash_in_account(torrent.hash):
-            logger.info("Already in debrid account: %s (hash match)", display_title)
+        # Check if torrent hash already exists in account for THIS movie/show (manual add or discovery miss)
+        # BUG FIX: Only skip if hash is associated with the same IMDb ID
+        if self._is_hash_in_account(torrent.hash, imdb_id):
+            logger.info("Already in debrid account: %s (hash match for same IMDb ID)", display_title)
             log_result("skipped", display_title, {"reason": "already_in_debrid_by_hash", "hash": torrent.hash[:16] if torrent.hash else "unknown"})
             record_processed(imdb_id, title, year, content_type, "skipped",
                            "already_in_debrid_by_hash",
@@ -4823,10 +4874,11 @@ class SyncEngine:
         torrent = cached[torrent_index]
         display_title = self._display_title(title, content_type, season_key)
         
-        # DUPLICATE PREVENTION: Check if this hash already exists in account
+        # DUPLICATE PREVENTION: Check if this hash already exists in account for THIS movie/show
         # This catches torrents that weren't matched during discovery (e.g., database records cleared)
-        if self._is_hash_in_account(torrent.hash):
-            logger.info("Skipping duplicate torrent (hash already in account): %s", display_title)
+        # BUG FIX: Only skip if hash is associated with the same IMDb ID, not just any hash in account
+        if self._is_hash_in_account(torrent.hash, imdb_id):
+            logger.info("Skipping duplicate torrent (hash match for same IMDb ID): %s", display_title)
             log_result("skipped", display_title, {"reason": "already_in_account_by_hash", "hash": torrent.hash[:16] if torrent.hash else "unknown"})
             record_processed(imdb_id, title, year, content_type, "skipped",
                            "already_in_account_by_hash", 
@@ -5085,11 +5137,12 @@ class SyncEngine:
             logger.warning("Discovery failed - proceeding with empty existing_torrents (may re-add items)")
             existing_torrents = {}
             self.account_hashes = set()
+            self.hash_to_imdb = {}
         else:
-            existing_torrents, self.account_hashes = discovery_result
+            existing_torrents, self.account_hashes, self.hash_to_imdb = discovery_result
         
-        logger.info("Discovered %d existing torrents in Torbox (%d unique hashes)", 
-                   len(existing_torrents), len(self.account_hashes))
+        logger.info("Discovered %d existing torrents in Torbox (%d unique hashes, %d matched to IMDb)", 
+                   len(existing_torrents), len(self.account_hashes), len(self.hash_to_imdb))
         
         # Reset per-run stats
         self._sync_stats = {"added": 0, "upgraded": 0, "skipped": 0, "failed": 0, "movies": 0, "shows": 0}
