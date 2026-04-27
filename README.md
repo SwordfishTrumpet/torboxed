@@ -397,7 +397,7 @@ MIT License - use it, modify it, share it freely!
 - **Fixed:** Prowlarr/Jackett API key loading now uses `.env` file (was bypassing lazy loader)
 - **Fixed:** systemd timer setup now writes service files to `/tmp` for install commands
 - **Fixed:** Torrent hash tracking during sync to prevent re-adding same hash within a run
-- **Improved:** Extracted `_display_title()`, `_get_filter_config()`, `_get_searcher_list()` helpers to eliminate code duplication
+- **Improved:** Extracted `_display_title()`, `_get_filter_config()` helpers to eliminate code duplication
 - **Improved:** Fixed misleading comment in season conflict resolution logic
 - **Improved:** Removed unnecessary `COMMIT` in database migration
 - **Total Tests:** 182 passing

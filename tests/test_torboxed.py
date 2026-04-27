@@ -1281,15 +1281,18 @@ class TestDiscoverExistingTorrents(unittest.TestCase):
         # Run discovery
         result = torboxed.discover_existing_torrents(self.mock_debrid)
         
-        # Should return tuple of (imdb_to_torbox, account_hashes)
+        # Should return tuple of (imdb_to_torbox, account_hashes, hash_to_imdb)
         self.assertIsInstance(result, tuple)
-        imdb_to_torbox, account_hashes = result
+        imdb_to_torbox, account_hashes, hash_to_imdb = result
         
         # Should find the match
         self.assertIn("tt1234567", imdb_to_torbox)
         self.assertEqual(imdb_to_torbox["tt1234567"], "tb-id-123")
         # Hash should be in account_hashes
         self.assertIn("abc123", account_hashes)
+        # Hash should be in hash_to_imdb mapping
+        self.assertIn("abc123", hash_to_imdb)
+        self.assertEqual(hash_to_imdb["abc123"], "tt1234567")
     
     def test_discover_empty_when_no_matches(self):
         """Test that discovery returns empty when no matches found."""
@@ -1314,12 +1317,14 @@ class TestDiscoverExistingTorrents(unittest.TestCase):
         # Run discovery
         result = torboxed.discover_existing_torrents(self.mock_debrid)
         
-        # Should return tuple with empty dict and set of hashes
+        # Should return tuple with empty dict, set of hashes, and empty hash_to_imdb
         self.assertIsInstance(result, tuple)
-        imdb_to_torbox, account_hashes = result
+        imdb_to_torbox, account_hashes, hash_to_imdb = result
         self.assertEqual(imdb_to_torbox, {})
         # Should still collect hashes even if no matches
         self.assertIn("def456", account_hashes)
+        # But unmatched hashes should NOT be in hash_to_imdb
+        self.assertNotIn("def456", hash_to_imdb)
     
     def test_discover_empty_torbox_account(self):
         """Test that discovery handles empty Torbox account."""
@@ -1331,11 +1336,12 @@ class TestDiscoverExistingTorrents(unittest.TestCase):
         # Run discovery
         result = torboxed.discover_existing_torrents(self.mock_debrid)
         
-        # Should return tuple of empty dict and empty set
+        # Should return tuple of empty dict, empty set, and empty hash_to_imdb
         self.assertIsInstance(result, tuple)
-        imdb_to_torbox, account_hashes = result
+        imdb_to_torbox, account_hashes, hash_to_imdb = result
         self.assertEqual(imdb_to_torbox, {})
         self.assertEqual(account_hashes, set())
+        self.assertEqual(hash_to_imdb, {})
     
     def test_multi_season_pack_does_not_affect_episodes(self):
         """BUG FIX: Episode-level records should NOT be updated by multi-season pack discovery.
@@ -1384,7 +1390,7 @@ class TestDiscoverExistingTorrents(unittest.TestCase):
         
         # Verify discovery succeeded
         self.assertIsInstance(result, tuple)
-        imdb_to_torbox, account_hashes = result
+        imdb_to_torbox, account_hashes, hash_to_imdb = result
         
         # Check database after discovery
         with torboxed.get_db() as conn:
@@ -1702,7 +1708,7 @@ class TestMultiSeasonSync(unittest.TestCase):
         ]
         
         # Group by season
-        seasons_map, skip_reason = self.engine._group_by_season(torrents)
+        seasons_map, skip_reason = self.engine._group_by_season(torrents, "tt1234567")
         
         # Complete pack (score 3400) and individual packs (also 3400) conflict:
         # since no individual pack has higher quality, Complete wins.
@@ -1993,7 +1999,7 @@ class TestMultiSeasonSync(unittest.TestCase):
         from unittest.mock import Mock
         engine = torboxed.SyncEngine(Mock(), Mock(), {"sources": [], "filters": {}})
         
-        seasons_map, skip_reason = engine._group_by_season(torrents)
+        seasons_map, skip_reason = engine._group_by_season(torrents, "tt1234567")
         
         # Complete pack (score 3400) and individual packs (also 3400) conflict:
         # since no individual pack has higher quality, Complete wins.
@@ -2059,7 +2065,7 @@ class TestMultiSeasonSync(unittest.TestCase):
         from unittest.mock import Mock
         engine = torboxed.SyncEngine(Mock(), Mock(), {"sources": [], "filters": {}})
         
-        seasons_map, skip_reason = engine._group_by_season(torrents)
+        seasons_map, skip_reason = engine._group_by_season(torrents, "tt1234567")
         
         # Complete pack always wins, even at lower quality (library completeness goal)
         self.assertIn("Complete", seasons_map)
@@ -2098,7 +2104,7 @@ class TestMultiSeasonSync(unittest.TestCase):
         from unittest.mock import Mock
         engine = torboxed.SyncEngine(Mock(), Mock(), {"sources": [], "filters": {}})
         
-        seasons_map, skip_reason = engine._group_by_season(torrents)
+        seasons_map, skip_reason = engine._group_by_season(torrents, "tt1234567")
         
         # Should have S01E01 (best quality episode since no pack available)
         self.assertIn("S01E01", seasons_map)
@@ -4399,7 +4405,7 @@ class TestProcessSeasonWithExistingTorrents(unittest.TestCase):
         self.temp_dir.cleanup()
     
     def test_skips_when_hash_already_in_account(self):
-        """Test that _process_season skips when torrent hash already in account (hash-based dedup)."""
+        """Test that _process_season skips when torrent hash already in account for SAME IMDb ID (hash-based dedup)."""
         import torboxed
         
         mock_torrent = TorrentResult(
@@ -4412,7 +4418,9 @@ class TestProcessSeasonWithExistingTorrents(unittest.TestCase):
             season_info=SeasonInfo(seasons=[1], is_complete=False, season_label="S01", is_pack=True)
         )
         
+        # BUG FIX: Hash must be in both account_hashes AND hash_to_imdb with same IMDb ID to trigger skip
         self.engine.account_hashes.add("deadbeef0123456789abcdef0123456789abcdef")
+        self.engine.hash_to_imdb["deadbeef0123456789abcdef0123456789abcdef"] = "tt1234567"
         
         result = self.engine._process_season(
             "tt1234567", "Test Show", 2024, "S01",
@@ -4616,46 +4624,6 @@ class TestDisplayTitleHelper(unittest.TestCase):
         self.assertEqual(title, "Breaking Bad (Complete)")
 
 
-class TestGetSearcherList(unittest.TestCase):
-    """TEST-016: _get_searcher_list helper method."""
-    
-    def test_all_configured(self):
-        mock_debrid = Mock()
-        mock_debrid.searcher_zilean.is_configured.return_value = True
-        mock_debrid.searcher_prowlarr.is_configured.return_value = True
-        mock_debrid.searcher_jackett.is_configured.return_value = True
-        
-        engine = SyncEngine.__new__(SyncEngine)
-        engine.debrid = mock_debrid
-        
-        result = engine._get_searcher_list()
-        self.assertEqual(result, "Zilean → Prowlarr → Jackett")
-    
-    def test_none_configured(self):
-        mock_debrid = Mock()
-        mock_debrid.searcher_zilean.is_configured.return_value = False
-        mock_debrid.searcher_prowlarr.is_configured.return_value = False
-        mock_debrid.searcher_jackett.is_configured.return_value = False
-        
-        engine = SyncEngine.__new__(SyncEngine)
-        engine.debrid = mock_debrid
-        
-        result = engine._get_searcher_list()
-        self.assertEqual(result, "none configured")
-    
-    def test_only_zilean(self):
-        mock_debrid = Mock()
-        mock_debrid.searcher_zilean.is_configured.return_value = True
-        mock_debrid.searcher_prowlarr.is_configured.return_value = False
-        mock_debrid.searcher_jackett.is_configured.return_value = False
-        
-        engine = SyncEngine.__new__(SyncEngine)
-        engine.debrid = mock_debrid
-        
-        result = engine._get_searcher_list()
-        self.assertEqual(result, "Zilean")
-
-
 class TestGetFilterConfig(unittest.TestCase):
     """TEST-016: _get_filter_config helper method."""
     
@@ -4716,7 +4684,7 @@ class TestVerifyAndClearDroppedTorrents(unittest.TestCase):
         # Discovery found only 2 of 10 (20% - below 95% threshold)
         imdb_to_torbox = {"tt0000000": "tb-id-0", "tt0000001": "tb-id-1"}
         
-        result = torboxed.verify_and_clear_dropped_torrents((imdb_to_torbox, set()))
+        result = torboxed.verify_and_clear_dropped_torrents((imdb_to_torbox, set(), {}))
         self.assertEqual(result, 0)
     
     def test_clears_when_discovery_above_threshold(self):
@@ -4738,7 +4706,7 @@ class TestVerifyAndClearDroppedTorrents(unittest.TestCase):
         # Discovery found only 1 of 2 - but that's 1/2=50%, below 95%
         imdb_to_torbox = {"tt0000000": "tb-id-0"}
         
-        result = torboxed.verify_and_clear_dropped_torrents((imdb_to_torbox, set()))
+        result = torboxed.verify_and_clear_dropped_torrents((imdb_to_torbox, set(), {}))
         # 1 found of 2 tracked = 50%, below 95% threshold -> should skip
         self.assertEqual(result, 0)
 
