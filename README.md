@@ -170,7 +170,7 @@ The LLM will:
 | **🔄 Smart Upgrades** | Auto-replaces lower quality with +500 point improvement threshold |
 | **🛡️ No Duplicates** | Smart tracking by IMDb ID means zero duplicates, ever |
 | **📺 Full TV Support** | Handles complete series, individual seasons, multi-season packs |
-| **⏱️ Rate Limited** | Respects API limits with automatic backoff—won't get you banned |
+| **⏱️ Rate Limited** | Respects Torbox limits (~1 add/minute) with automatic backoff—won't get you banned |
 | **🔒 Secure** | API keys redacted from logs, secure lock files, SSL verification |
 | **🎯 Idempotent** | Run it once or a thousand times—same result, no duplicates |
 
@@ -195,6 +195,9 @@ A: Absolutely! You can choose from 24 sources including your personal liked list
 
 **Q: How do quality upgrades work?**  
 A: TorBoxed scores each release (resolution + source + codec + audio). Upgrades follow a **completeness hierarchy**: series packs > season packs > episodes. Content is always upgraded to something equally or more complete. Within the same completeness level, upgrades trigger when a +500+ point better version appears.
+
+**Q: Why is syncing slow?**  
+A: Torbox has a **60/hour creation limit** (~1 torrent per minute). TorBoxed respects this with a 65-second safety margin between adds. First syncs with many items will take time—subsequent runs are much faster since they only check for upgrades and new items.
 
 ---
 
