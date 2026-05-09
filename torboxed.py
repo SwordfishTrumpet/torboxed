@@ -2231,7 +2231,7 @@ def build_search_result(name: str, infohash: str, magnet_link: str = "",
     Returns:
         Standardized result dict
     """
-    if not magnet_link:
+    if not magnet_link or not magnet_link.startswith("magnet:"):
         magnet_link = encode_magnet_link(name, infohash)
     return {
         "title": name,

@@ -4,7 +4,7 @@
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)]()
+
 
 > Tired of manually copying movies from Trakt to Torbox? Let TorBoxed handle it! It automatically discovers trending & popular content from Trakt and adds it to your Torbox account—with smart quality upgrades when better versions become available.
 
@@ -176,28 +176,31 @@ The LLM will:
 
 ---
 
-## ❓ Quick FAQ
+## ❓ Frequently Asked Questions
+
+**Quick answers to common questions:**
 
 **Q: Do I need to be technical to use this?**  
-A: Not at all! If you can copy-and-paste commands, you're good to go. The defaults work out of the box.
-
-**Q: Will it download things I don't want?**  
-A: No—it only syncs from Trakt's curated lists (trending, popular, anticipated). You control which sources to use.
+A: Not at all! If you can copy-and-paste commands, you're good to go.
 
 **Q: What if a movie isn't available on Torbox yet?**  
-A: TorBoxed skips it and will check again on the next run. Once it's cached, it'll be added automatically!
+A: TorBoxed skips it and checks again on the next run. Once cached, it's added automatically!
 
 **Q: Is my data safe?**  
-A: Yes! Your database is stored locally, API keys are secured, and sensitive info is never logged.
-
-**Q: Can I customize which lists to sync?**  
-A: Absolutely! You can choose from 24 sources including your personal liked lists on Trakt.
-
-**Q: How do quality upgrades work?**  
-A: TorBoxed scores each release (resolution + source + codec + audio). Upgrades follow a **completeness hierarchy**: series packs > season packs > episodes. Content is always upgraded to something equally or more complete. Within the same completeness level, upgrades trigger when a +500+ point better version appears.
+A: Yes! Everything is stored locally, API keys are redacted from logs, and sensitive info is never logged.
 
 **Q: Why is syncing slow?**  
-A: Torbox has a **60/hour creation limit** (~1 torrent per minute). TorBoxed respects this with a 65-second safety margin between adds. First syncs with many items will take time—subsequent runs are much faster since they only check for upgrades and new items.
+A: Torbox limits creations to 60/hour (~1 per minute). First syncs take time; subsequent runs are much faster.
+
+📚 **[View Complete FAQ →](FAQ.md)**
+
+For detailed answers about:
+- Search sources (Zilean, Prowlarr, Jackett)
+- Quality scoring & upgrades
+- TV show support
+- Rate limiting & performance
+- Configuration options
+- Troubleshooting common issues
 
 ---
 
@@ -374,8 +377,6 @@ MIT License - use it, modify it, share it freely!
 - **Fixed (BUG-009):** Incomplete phantom record check - now requires both `action='skipped'` AND `debrid_id` is set
 - **Security:** Enhanced path traversal protection with symlink resolution
 - **Stability:** Better resource cleanup prevents connection exhaustion during long runs
-- **Total Tests:** 290 passing
-
 ### 2026-04-26: Quality Threshold, Completeness Upgrade & IMDb ID Fixes
 - **Fixed:** `is_max_quality()` threshold lowered from 7000→6000 (max achievable was 6500, never triggered — wasted API calls)
 - **Fixed:** `is_episode` detection no longer misclassifies "Complete" and multi-season keys as episodes
@@ -385,8 +386,6 @@ MIT License - use it, modify it, share it freely!
 - **Fixed:** Complete series packs always preferred over individual seasons, regardless of quality (library completeness goal)
 - **Improved:** Prowlarr/Jackett fallback warns when Zilean not available (text search can't verify IMDb IDs)
 - **Improved:** `--help, -h` explicitly listed in CLI, description updated for multi-debrid support
-- **Total Tests:** 290 passing
-
 ### 2026-04-25: Per-Run Stats, DRY Refactoring & Bug Fixes
 - **Fixed:** Per-season processing now checks existing_torrents to prevent re-adding discovered content (BUG-017)
 - **Fixed:** Sync summary notifications now use per-run counts instead of database lifetime totals (BUG-018)
@@ -394,7 +393,7 @@ MIT License - use it, modify it, share it freely!
 - **Improved:** Extracted `_send_telegram()` private method for consistent notification error handling
 - **Improved:** Extracted `build_search_result()` shared helper for Prowlarr/Jackett result dict construction
 - **Improved:** Added `COMPLETE_PACK_MIN_SIZE` named constant (10 GB) for readability
-- **Added:** 31 new tests (213 total) covering existing_torrents matching, torrent fallback, search normalization, helper methods, and threshold safety
+- **Added:** New tests covering existing_torrents matching, torrent fallback, search normalization, helper methods, and threshold safety
 
 ### 2026-04-24: Bug Fixes & Code Quality
 - **Fixed:** Prowlarr/Jackett API key loading now uses `.env` file (was bypassing lazy loader)
@@ -403,16 +402,14 @@ MIT License - use it, modify it, share it freely!
 - **Improved:** Extracted `_display_title()`, `_get_filter_config()` helpers to eliminate code duplication
 - **Improved:** Fixed misleading comment in season conflict resolution logic
 - **Improved:** Removed unnecessary `COMMIT` in database migration
-- **Total Tests:** 182 passing
 
 ### 2026-04-23: Bug Fixes & Code Quality
 - **Fixed:** Empty infohash handling - torrents without valid hashes are now properly filtered out before attempting to add to Torbox
 - **Improved:** All bare `except Exception` clauses converted to specific exception types for better error handling
 - **Improved:** Added named constants for all magic numbers (timeouts, limits, thresholds)
 - **Improved:** Code structure - subprocess imports moved to top of file
-- **Added:** Comprehensive test coverage for `check_cached` method (7 new tests)
-- **Added:** Complete test suite for retry/backoff logic (8 new tests)
-- **Total Tests:** 182 passing
+- **Added:** Comprehensive test coverage for `check_cached` method
+- **Added:** Complete test suite for retry/backoff logic
 
 ---
 
