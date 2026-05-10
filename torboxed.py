@@ -4222,7 +4222,7 @@ def verify_and_clear_dropped_torrents(existing_torrents: Optional[Tuple[Dict[str
     return cleared_count
 
 
-def cleanup_unmatched_torrents() -> None:
+def cleanup_unmatched_torrents(force: bool = False) -> None:
     """Remove torrents from the debrid account that can't be matched to the database.
     
     Unmatched torrents are problematic because:
@@ -4231,9 +4231,10 @@ def cleanup_unmatched_torrents() -> None:
     3. They have no association with Trakt items
     
     This function identifies all unmatched torrents, lists them, and optionally
-    removes them after user confirmation.
+    removes them after user confirmation (unless force=True).
     
-    SAFETY: Requires user confirmation before removal.
+    Args:
+        force: If True, skip user confirmation and remove immediately.
     """
     logger.info("Scanning for unmatched torrents...")
     
@@ -4294,12 +4295,14 @@ def cleanup_unmatched_torrents() -> None:
     print(f"Total: {len(unmatched)} torrents will be REMOVED from debrid account")
     print(f"{'='*80}")
     
-    # Require confirmation
-    response = input("\nType 'REMOVE' to delete these torrents (or anything else to cancel): ")
-    
-    if response.strip() != 'REMOVE':
-        print("\nCancelled. No torrents were removed.")
-        return
+    # Require confirmation unless --yes was passed
+    if not force:
+        response = input("\nType 'REMOVE' to delete these torrents (or anything else to cancel): ")
+        if response.strip() != 'REMOVE':
+            print("\nCancelled. No torrents were removed.")
+            return
+    else:
+        print("\n--yes flag set, skipping confirmation...")
     
     # Remove unmatched torrents
     print("\nRemoving unmatched torrents...")
@@ -4325,6 +4328,237 @@ def cleanup_unmatched_torrents() -> None:
     if removed_count > 0:
         print(f"\nNote: If any of these were from Trakt lists, they will be re-added")
         print(f"on the next sync with proper tracking (if cached torrents are found).")
+
+
+def cleanup_duplicate_torrents(force: bool = False) -> None:
+    """Remove duplicate torrents for the same movie/season from the debrid account.
+
+    A duplicate is when the same IMDb ID has multiple torrents for the same season.
+    For movies: more than 1 torrent for the same movie.
+    For shows: more than 1 torrent for the same season (S01, S02, Complete, etc.).
+
+    Keeps the best quality torrent and removes the rest.
+
+    Args:
+        force: If True, skip user confirmation and remove immediately.
+    """
+    logger.info("Scanning for duplicate torrents...")
+
+    debrid_client = create_debrid_client()
+    if not debrid_client:
+        logger.error("Failed to create debrid client.")
+        return
+
+    my_torrents = debrid_client.get_my_torrents()
+    if my_torrents is None:
+        logger.error("Failed to fetch torrents from debrid account")
+        return
+    if not my_torrents:
+        logger.info("No torrents in debrid account")
+        return
+
+    logger.info("Found %d torrents in debrid account", len(my_torrents))
+
+    # Load DB records for matching and quality scores
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT imdb_id, title, year, debrid_id, season, content_type, quality_score FROM processed WHERE debrid_id IS NOT NULL"
+        ).fetchall()
+
+    db_by_debrid_id: Dict[str, Dict[str, Any]] = {}
+    db_by_title_year: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        debrid_id = str(row['debrid_id'])
+        db_by_debrid_id[debrid_id] = dict(row)
+        key = f"{row['title'].lower()}:{row['year']}"
+        if key not in db_by_title_year:
+            db_by_title_year[key] = []
+        db_by_title_year[key].append(dict(row))
+
+    # Match each torrent and group by (imdb_id, season)
+    groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    unmatched: List[Dict[str, Any]] = []
+
+    for torrent in my_torrents:
+        debrid_id = str(torrent.get("id", ""))
+        if not debrid_id:
+            continue
+
+        imdb_id: Optional[str] = None
+        season = "unknown"
+        content_type = "movie"
+        db_score: Optional[int] = None
+
+        # Method 1: direct DB match
+        if debrid_id in db_by_debrid_id:
+            db_rec = db_by_debrid_id[debrid_id]
+            imdb_id = db_rec['imdb_id']
+            season = db_rec.get('season') or "unknown"
+            content_type = db_rec.get('content_type', 'movie')
+            db_score = db_rec.get('quality_score')
+        else:
+            # Method 2: name match
+            torrent_name = torrent.get("name", "")
+            if not torrent_name:
+                unmatched.append(torrent)
+                continue
+            try:
+                parsed = guessit(torrent_name)
+                torrent_title = parsed.get("title", "").lower()
+                torrent_year = parsed.get("year", None)
+                if isinstance(torrent_year, list):
+                    torrent_year = torrent_year[0] if torrent_year else None
+            except (ValueError, TypeError):
+                unmatched.append(torrent)
+                continue
+
+            if not torrent_title:
+                unmatched.append(torrent)
+                continue
+
+            season_info = parse_season_info(torrent_name)
+            if season_info and season_info.is_complete:
+                season = "Complete"
+            elif season_info and season_info.seasons:
+                season = f"S{season_info.seasons[0]:02d}"
+
+            matched = False
+            for key, show_records in db_by_title_year.items():
+                db_title, db_year = key.rsplit(":", 1)
+                db_year = int(db_year) if db_year.isdigit() else None
+                title_match = db_title in torrent_title or torrent_title in db_title
+                year_match = True
+                if torrent_year and db_year:
+                    year_match = abs(torrent_year - db_year) <= 1
+                if title_match and year_match:
+                    rec = show_records[0]
+                    imdb_id = rec['imdb_id']
+                    content_type = rec.get('content_type', 'movie')
+                    matched = True
+                    break
+
+            if not matched:
+                unmatched.append(torrent)
+                continue
+
+        if not imdb_id:
+            unmatched.append(torrent)
+            continue
+
+        group_key = (imdb_id, season)
+        if group_key not in groups:
+            groups[group_key] = []
+        groups[group_key].append({
+            "torrent": torrent,
+            "db_score": db_score,
+            "content_type": content_type,
+        })
+
+    # Identify duplicates (groups with >1 torrent)
+    duplicates: Dict[Tuple[str, str], List[Dict[str, Any]]] = {
+        k: v for k, v in groups.items() if len(v) > 1
+    }
+
+    if not duplicates:
+        logger.info("No duplicate torrents found (same IMDb + season).")
+        if unmatched:
+            logger.info("%d torrents could not be matched to database and were skipped.", len(unmatched))
+        return
+
+    # Build list of torrents to remove
+    to_remove: List[Dict[str, Any]] = []
+    keep_list: List[Dict[str, Any]] = []
+
+    for group_key, items in duplicates.items():
+        imdb_id, season = group_key
+        # Score each torrent
+        scored = []
+        for item in items:
+            torrent = item["torrent"]
+            score = item.get("db_score") or 0
+            if score == 0:
+                # Parse name for quality score
+                quality = parse_quality(torrent.get("name", "Unknown"))
+                score = quality.score
+            size = torrent.get("size", 0) or 0
+            scored.append({
+                "torrent": torrent,
+                "score": score,
+                "size": size,
+                "has_db_record": item.get("db_score") is not None,
+            })
+
+        # Sort by: highest score first, then largest size, then db record as tiebreaker
+        scored.sort(key=lambda x: (-x["score"], -x["size"], not x["has_db_record"]))
+
+        keep = scored[0]
+        remove = scored[1:]
+
+        keep_list.append({
+            "imdb_id": imdb_id,
+            "season": season,
+            "name": keep["torrent"].get("name", "Unknown")[:60],
+            "score": keep["score"],
+            "id": keep["torrent"].get("id"),
+        })
+
+        for r in remove:
+            to_remove.append({
+                "imdb_id": imdb_id,
+                "season": season,
+                "name": r["torrent"].get("name", "Unknown")[:60],
+                "score": r["score"],
+                "id": r["torrent"].get("id"),
+                "size": r["size"],
+            })
+
+    # Show summary
+    print(f"\n{'='*80}")
+    print(f"DUPLICATE TORRENTS: {len(to_remove)} to remove")
+    print(f"{'='*80}")
+    print(f"Keeping {len(keep_list)} best torrent(s):\n")
+    for k in keep_list:
+        print(f"  KEEP  {k['name']}")
+        print(f"        IMDb: {k['imdb_id']}  Season: {k['season']}  Score: {k['score']}")
+        print()
+
+    print(f"Will REMOVE:\n")
+    for r in to_remove:
+        print(f"  REMOVE  {r['name']}")
+        print(f"          IMDb: {r['imdb_id']}  Season: {r['season']}  Score: {r['score']}  Size: {r['size']}")
+        print()
+
+    print(f"{'='*80}")
+
+    # Require confirmation unless --yes
+    if not force:
+        response = input("\nType 'REMOVE' to delete these duplicate torrents: ")
+        if response.strip() != 'REMOVE':
+            print("\nCancelled. No torrents were removed.")
+            return
+    else:
+        print("\n--yes flag set, skipping confirmation...")
+
+    # Remove duplicates
+    print("\nRemoving duplicate torrents...")
+    removed_count = 0
+    failed_count = 0
+
+    for r in to_remove:
+        try:
+            if debrid_client.remove_torrent(r['id']):
+                print(f"  ✓ Removed: {r['name'][:50]}...")
+                removed_count += 1
+            else:
+                print(f"  ✗ Failed: {r['name'][:50]}...")
+                failed_count += 1
+        except (APIError, APIResponseError) as e:
+            print(f"  ✗ Error removing {r['id']}: {e}")
+            failed_count += 1
+
+    print(f"\n{'='*80}")
+    print(f"Done! Removed {removed_count} duplicates, failed {failed_count}")
+    print(f"{'='*80}")
 
 
 # ============================================================================
@@ -5955,6 +6189,10 @@ Examples:
                        help="Reset specific item for re-processing")
     parser.add_argument("--cleanup-unmatched", action="store_true",
                        help="Remove torrents from Torbox that can't be matched to database (orphaned)")
+    parser.add_argument("--cleanup-duplicates", action="store_true",
+                       help="Remove duplicate torrents for the same movie/season (keep best quality)")
+    parser.add_argument("--yes", "-y", action="store_true",
+                       help="Skip confirmation prompts (use with --cleanup-unmatched or --cleanup-duplicates)")
     
     args = parser.parse_args()
     
@@ -5962,7 +6200,7 @@ Examples:
     setup_logging(verbose=args.verbose)
     
     # Check for overlapping runs (but skip for non-sync commands)
-    skip_lock_commands = {'--init', '--test', '--cron-setup', '--cron-status', '--stats', '--recent', '--reset', '--cleanup-unmatched'}
+    skip_lock_commands = {'--init', '--test', '--cron-setup', '--cron-status', '--stats', '--recent', '--reset', '--cleanup-unmatched', '--cleanup-duplicates'}
     if not any(getattr(args, cmd.lstrip('-').replace('-', '_'), False) for cmd in skip_lock_commands):
         if not check_and_acquire_lock():
             logger.warning("Another instance of torboxed is already running. Exiting.")
@@ -6018,7 +6256,12 @@ Examples:
     
     # Cleanup unmatched torrents
     if args.cleanup_unmatched:
-        cleanup_unmatched_torrents()
+        cleanup_unmatched_torrents(force=args.yes)
+        return
+    
+    # Cleanup duplicate torrents
+    if args.cleanup_duplicates:
+        cleanup_duplicate_torrents(force=args.yes)
         return
     
     # Check API keys (lazy-loaded)
