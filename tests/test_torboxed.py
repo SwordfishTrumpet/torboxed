@@ -4990,7 +4990,7 @@ class TestProwlarrClientMethods(unittest.TestCase):
         from torboxed import ProwlarrClient
         self.client = ProwlarrClient.__new__(ProwlarrClient)
         self.client.api_key = "test_api_key"
-        self.client.base_url = "http://prowlarr-ingest:9696"
+        self.client.base_url = "http://localhost:9696"
     
     def test_is_configured_true(self):
         """Test is_configured returns True when API key exists."""
