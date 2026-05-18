@@ -332,6 +332,79 @@ docker run --rm -v $(pwd)/data:/data torboxed:latest --stats
 
 ---
 
+## 🌐 WebDAV Server (NEW)
+
+TorBoxed now includes a built-in WebDAV server that exposes your synced content as a virtual filesystem. Compatible with Infuse and other WebDAV clients.
+
+### Quick Start
+
+```bash
+# Install optional WebDAV dependencies
+uv pip install "wsgidav>=4.0.0" "cheroot>=10.0.0"
+
+# Backfill existing torrents (one-time)
+uv run torboxed.py --backfill-files
+
+# Start the server
+uv run torboxed.py --serve
+```
+
+### How It Works
+
+1. **Virtual Filesystem**: Movies and TV shows appear as organized folders with real filenames
+2. **302 Redirects**: Video playback redirects to the debrid CDN — your server doesn't proxy gigabytes of video
+3. **IMDb ID Tags**: Filenames include {imdb-tt1234567} tags for perfect Infuse metadata matching
+4. **Episode Granularity**: Season packs are expanded into per-episode virtual files for Infuse "Up Next" support
+5. **Subtitle Support**: External subtitle files (.srt, .ass, .vtt) from torrents appear alongside videos
+
+### Infuse Setup
+
+1. Settings → Manage Shares → Add Share → WebDAV
+2. URL: `http://your-server:8080`
+3. Username/Password: Configured in `.env`
+4. Save → Test Connection → Add to Library
+
+### Configuration
+
+Add to your `.env` file:
+
+```bash
+# WebDAV Server (optional)
+WEBDAV_ENABLED=true
+WEBDAV_HOST=0.0.0.0
+WEBDAV_PORT=8080
+WEBDAV_AUTH_USER=your_username
+WEBDAV_AUTH_PASS=your_password
+```
+
+### Health Check
+
+```
+GET /health → 200 OK
+{"status": "ok", "torrents_tracked": 1234, "torrents_cached": 1234, "uptime_seconds": 86400}
+```
+
+### Behind nginx (HTTPS)
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name torboxed.yourdomain.com;
+    
+    ssl_certificate /etc/letsencrypt/live/.../fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/.../privkey.pem;
+    
+    location / {
+        proxy_pass http://localhost:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_buffering off;
+    }
+}
+```
+
+---
+
 ## 🆘 Need Help?
 
 - **Something not working?** Run `uv run torboxed.py --test` to verify your setup

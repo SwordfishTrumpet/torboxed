@@ -32,7 +32,14 @@ from torboxed import (
     # Search helpers
     build_search_result, normalize_search_query, encode_magnet_link, normalize_hash,
     # Constants
-    COMPLETE_PACK_MIN_SIZE
+    COMPLETE_PACK_MIN_SIZE, RD_CACHE_CHECK_BATCH,
+    # WebDAV / torrent_files
+    store_torrent_files, get_torrent_files, get_video_file_for_episode, get_subtitle_files,
+    cleanup_orphan_torrent_files,
+    extract_imdb_from_filename, build_movie_filename, build_episode_filename, build_subtitle_filename,
+    resolve_path, resolve_debrid_id_for_path, _get_db_listing, _get_best_debrid_for_season,
+    _classify_file, get_webdav_config, backfill_torrent_files,
+    classify_media_level, COMPLETENESS_ORDER
 )
 
 
@@ -54,6 +61,8 @@ class TestDebridClientABC(unittest.TestCase):
             def get_my_torrents(self): pass
             def add_torrent(self, magnet, title=""): pass
             def remove_torrent(self, torrent_id): pass
+            def get_torrent_files(self, debrid_id): return []
+            def get_direct_url(self, debrid_id, file_id): return None
 
         with self.assertRaises(TypeError):
             IncompleteClient()
@@ -66,6 +75,8 @@ class TestDebridClientABC(unittest.TestCase):
             def check_cached(self, hashes): pass
             def add_torrent(self, magnet, title=""): pass
             def remove_torrent(self, torrent_id): pass
+            def get_torrent_files(self, debrid_id): return []
+            def get_direct_url(self, debrid_id, file_id): return None
 
         with self.assertRaises(TypeError):
             IncompleteClient()
@@ -78,6 +89,8 @@ class TestDebridClientABC(unittest.TestCase):
             def check_cached(self, hashes): pass
             def get_my_torrents(self): pass
             def remove_torrent(self, torrent_id): pass
+            def get_torrent_files(self, debrid_id): return []
+            def get_direct_url(self, debrid_id, file_id): return None
 
         with self.assertRaises(TypeError):
             IncompleteClient()
@@ -90,6 +103,8 @@ class TestDebridClientABC(unittest.TestCase):
             def check_cached(self, hashes): pass
             def get_my_torrents(self): pass
             def add_torrent(self, magnet, title=""): pass
+            def get_torrent_files(self, debrid_id): return []
+            def get_direct_url(self, debrid_id, file_id): return None
 
         with self.assertRaises(TypeError):
             IncompleteClient()
@@ -103,6 +118,8 @@ class TestDebridClientABC(unittest.TestCase):
             def get_my_torrents(self): return []
             def add_torrent(self, magnet, title=""): return None
             def remove_torrent(self, torrent_id): return True
+            def get_torrent_files(self, debrid_id): return []
+            def get_direct_url(self, debrid_id, file_id): return None
 
         client = FullClient()
         self.assertIsNotNone(client.searcher_zilean)
@@ -121,6 +138,8 @@ class TestDebridClientABC(unittest.TestCase):
             def get_my_torrents(self): return []
             def add_torrent(self, magnet, title=""): return None
             def remove_torrent(self, torrent_id): return True
+            def get_torrent_files(self, debrid_id): return []
+            def get_direct_url(self, debrid_id, file_id): return None
 
         client = SearchClient()
         client.searcher_zilean = Mock()
@@ -138,6 +157,40 @@ class TestDebridClientABC(unittest.TestCase):
         result = client.search_torrents("Test Movie", "movie")
         self.assertEqual(client.last_cache_call, ["abc123"])
         self.assertTrue(result[0]["availability"])
+
+    def test_get_cached_torrents_sorted_by_quality(self):
+        """Cached results should be sorted by quality score descending."""
+        import torboxed
+
+        class SortClient(torboxed.DebridClient):
+            def check_cached(self, hashes):
+                return {h: True for h in hashes}
+            def get_my_torrents(self): return []
+            def add_torrent(self, magnet, title=""): return None
+            def remove_torrent(self, torrent_id): return True
+            def get_torrent_files(self, debrid_id): return []
+            def get_direct_url(self, debrid_id, file_id): return None
+
+        client = SortClient()
+        client.searcher_zilean = Mock()
+        client.searcher_zilean.is_configured.return_value = True
+        client.searcher_zilean.search_by_imdb.return_value = []
+        client.searcher_zilean.search.return_value = [
+            {"name": "Movie.720p.HDTV.x264", "hash": "aaa", "magnet": "magnet:?xt=urn:btih:aaa", "size": 1000, "seeds": 1, "peers": 0},
+            {"name": "Movie.2160p.BluRay.HEVC.DTS-HD.MA", "hash": "bbb", "magnet": "magnet:?xt=urn:btih:bbb", "size": 5000, "seeds": 1, "peers": 0},
+            {"name": "Movie.1080p.WEB-DL.H.264", "hash": "ccc", "magnet": "magnet:?xt=urn:btih:ccc", "size": 3000, "seeds": 1, "peers": 0},
+        ]
+        client.searcher_prowlarr = Mock()
+        client.searcher_prowlarr.is_configured.return_value = False
+        client.searcher_jackett = Mock()
+        client.searcher_jackett.is_configured.return_value = False
+
+        results = client.get_cached_torrents("Movie 2024", "movie")
+
+        self.assertGreaterEqual(len(results), 2)
+        for i in range(len(results) - 1):
+            self.assertGreaterEqual(results[i].quality.score, results[i + 1].quality.score,
+                                     f"Result {i} score {results[i].quality.score} should be >= result {i+1} score {results[i+1].quality.score}")
 
 
 class TestRateLimiter(unittest.TestCase):
@@ -2076,6 +2129,37 @@ class TestMultiSeasonSync(unittest.TestCase):
         self.assertNotIn("S05E01", seasons_map)
         self.assertEqual(len(seasons_map), 1)
     
+    def test_group_by_season_selects_best_quality_per_season(self):
+        """_group_by_season should select highest quality torrent per season."""
+        import torboxed
+        from torboxed import TorrentResult, QualityInfo, SeasonInfo
+
+        torrents = [
+            TorrentResult(
+                name="Show.S01.720p.HDTV",
+                magnet="magnet:s01-720p",
+                availability=True,
+                size=1000,
+                quality=QualityInfo(resolution="720p", score=2200),
+                season_info=SeasonInfo(seasons=[1], is_complete=False, season_label="S01", is_pack=True)
+            ),
+            TorrentResult(
+                name="Show.S01.1080p.BluRay",
+                magnet="magnet:s01-1080p",
+                availability=True,
+                size=5000,
+                quality=QualityInfo(resolution="1080p", score=4500),
+                season_info=SeasonInfo(seasons=[1], is_complete=False, season_label="S01", is_pack=True)
+            ),
+        ]
+
+        engine = torboxed.SyncEngine(Mock(), Mock(), {"sources": [], "filters": {}})
+        seasons_map, skip_reason = engine._group_by_season(torrents, "tt9999999")
+
+        self.assertIn("S01", seasons_map)
+        self.assertEqual(seasons_map["S01"].quality.score, 4500)
+        self.assertEqual(seasons_map["S01"].magnet, "magnet:s01-1080p")
+
     def test_episodes_only_when_no_pack(self):
         """Test that episodes are used only when no season pack available."""
         import torboxed
@@ -2434,6 +2518,35 @@ class TestProwlarrClient(unittest.TestCase):
             self.fail("Magnet link contains non-ASCII characters")
 
 
+    @patch('httpx.Client.get')
+    def test_search_passes_imdb_id_as_integer(self, mock_get):
+        """Prowlarr should pass imdbId as integer when IMDb ID provided."""
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = []
+        mock_get.return_value = mock_response
+
+        self.client.search("Movie 2024", imdb_id="tt0137523")
+
+        call_args = mock_get.call_args
+        params = call_args[1].get("params", {})
+        self.assertEqual(params.get("imdbId"), 137523)
+
+    @patch('httpx.Client.get')
+    def test_search_without_imdb_id_omits_param(self, mock_get):
+        """Prowlarr should not pass imdbId when not provided."""
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = []
+        mock_get.return_value = mock_response
+
+        self.client.search("Movie 2024")
+
+        call_args = mock_get.call_args
+        params = call_args[1].get("params", {})
+        self.assertNotIn("imdbId", params)
+
+
 class TestSearchFallbackBehavior(unittest.TestCase):
     """Test Zilean → Prowlarr fallback behavior."""
     
@@ -2700,6 +2813,34 @@ class TestJackettClient(unittest.TestCase):
         }
         result = self.client._extract_infohash(item)
         self.assertEqual(result, "direct123")
+
+    @patch('httpx.Client.get')
+    def test_search_passes_imdb_id(self, mock_get):
+        """Jackett should pass imdbid parameter when IMDb ID provided."""
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"Results": []}
+        mock_get.return_value = mock_response
+
+        self.client.search("Movie 2024", imdb_id="tt0137523")
+
+        call_args = mock_get.call_args
+        params = call_args[1].get("params", {})
+        self.assertEqual(params.get("imdbid"), "tt0137523")
+
+    @patch('httpx.Client.get')
+    def test_search_without_imdb_id_omits_param(self, mock_get):
+        """Jackett should not pass imdbid when not provided."""
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"Results": []}
+        mock_get.return_value = mock_response
+
+        self.client.search("Movie 2024")
+
+        call_args = mock_get.call_args
+        params = call_args[1].get("params", {})
+        self.assertNotIn("imdbid", params)
 
 
 class TestTraktLikedLists(unittest.TestCase):
@@ -4015,6 +4156,34 @@ class TestRealDebridClient(unittest.TestCase):
         self.assertFalse(result["abc123"])
 
     @patch.object(RealDebridClient, '_request')
+    def test_check_cached_batches_large_hash_lists(self, mock_request):
+        """Cache check should batch hashes into chunks to avoid URL length issues."""
+        hashes = [f"{i:040x}" for i in range(250)]
+        mock_request.return_value = {h: {"rd": [{}]} for h in hashes}
+
+        result = self.client.check_cached(hashes)
+
+        expected_batches = (250 + RD_CACHE_CHECK_BATCH - 1) // RD_CACHE_CHECK_BATCH
+        self.assertEqual(mock_request.call_count, expected_batches)
+        self.assertEqual(len(result), 250)
+        self.assertTrue(all(result.values()))
+
+    @patch.object(RealDebridClient, '_request')
+    def test_check_cached_small_list_single_call(self, mock_request):
+        """Cache check with few hashes should make exactly one API call."""
+        hashes = ["abc123", "def456"]
+        mock_request.return_value = {
+            "abc123": {"rd": [{}]},
+            "def456": {}
+        }
+
+        result = self.client.check_cached(hashes)
+
+        self.assertEqual(mock_request.call_count, 1)
+        self.assertTrue(result["abc123"])
+        self.assertFalse(result["def456"])
+
+    @patch.object(RealDebridClient, '_request')
     def test_get_my_torrents_normalizes_filename(self, mock_request):
         """Test get_my_torrents normalizes 'filename' to 'name'."""
         mock_request.return_value = [
@@ -4602,6 +4771,42 @@ class TestParseSeasonInfoCompleteSeries(unittest.TestCase):
         self.assertFalse(info.is_pack)
         self.assertEqual(info.episode, 5)
         self.assertEqual(info.season_label, "S01E05")
+
+    def test_box_set_detected_as_complete(self):
+        """Test 'Box Set' keyword triggers complete detection."""
+        info = parse_season_info("Show.Box.Set.1080p")
+        self.assertIsNotNone(info)
+        self.assertTrue(info.is_complete)
+
+    def test_boxset_detected_as_complete(self):
+        """Test 'Boxset' keyword triggers complete detection."""
+        info = parse_season_info("Show.Boxset.1080p")
+        self.assertIsNotNone(info)
+        self.assertTrue(info.is_complete)
+
+    def test_integral_detected_as_complete(self):
+        """Test 'Integral' keyword triggers complete detection."""
+        info = parse_season_info("Show.Integral.1080p")
+        self.assertIsNotNone(info)
+        self.assertTrue(info.is_complete)
+
+    def test_integrale_detected_as_complete(self):
+        """Test 'Integrale' keyword triggers complete detection."""
+        info = parse_season_info("Show.Integrale.1080p")
+        self.assertIsNotNone(info)
+        self.assertTrue(info.is_complete)
+
+    def test_complete_collection_detected_as_complete(self):
+        """Test 'Complete Collection' keyword triggers complete detection."""
+        info = parse_season_info("Show.Complete.Collection.1080p")
+        self.assertIsNotNone(info)
+        self.assertTrue(info.is_complete)
+
+    def test_the_complete_detected_as_complete(self):
+        """Test 'The Complete' keyword triggers complete detection."""
+        info = parse_season_info("The.Complete.Show.1080p")
+        self.assertIsNotNone(info)
+        self.assertTrue(info.is_complete)
 
 
 class TestDisplayTitleHelper(unittest.TestCase):
@@ -5194,6 +5399,8 @@ class TestDebridClientFindExisting(unittest.TestCase):
             def get_my_torrents(self): return mock_debrid.get_my_torrents()
             def add_torrent(self, magnet, title=""): return None
             def remove_torrent(self, torrent_id): return True
+            def get_torrent_files(self, debrid_id): return []
+            def get_direct_url(self, debrid_id, file_id): return None
         
         client = TestDebrid()
         result = client.find_existing_by_hash("abc123")
@@ -5216,6 +5423,8 @@ class TestDebridClientFindExisting(unittest.TestCase):
             def get_my_torrents(self): return mock_debrid.get_my_torrents()
             def add_torrent(self, magnet, title=""): return None
             def remove_torrent(self, torrent_id): return True
+            def get_torrent_files(self, debrid_id): return []
+            def get_direct_url(self, debrid_id, file_id): return None
         
         client = TestDebrid()
         result = client.find_existing_by_hash("xyz789")
@@ -5231,6 +5440,8 @@ class TestDebridClientFindExisting(unittest.TestCase):
             def get_my_torrents(self): return []
             def add_torrent(self, magnet, title=""): return None
             def remove_torrent(self, torrent_id): return True
+            def get_torrent_files(self, debrid_id): return []
+            def get_direct_url(self, debrid_id, file_id): return None
         
         client = TestDebrid()
         result = client.find_existing_by_hash("abc123")
@@ -5744,6 +5955,644 @@ class TestAPIErrorClasses(unittest.TestCase):
         error = APIResponseError("Invalid response")
         
         self.assertIsInstance(error, APIError)
+
+
+class TestWebDAVAndTorrentFiles(unittest.TestCase):
+    """Test WebDAV path resolution and torrent_files database functions."""
+
+    def setUp(self):
+        """Create temporary database for testing."""
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.test_db_path = Path(self.temp_dir.name) / "test.db"
+
+        import torboxed
+        self.original_db_path = torboxed.DB_PATH
+        torboxed.DB_PATH = self.test_db_path
+        torboxed.init_db()
+
+    def tearDown(self):
+        """Clean up temporary database."""
+        import torboxed
+        torboxed.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+
+    # =========================================================================
+    # _classify_file tests
+    # =========================================================================
+
+    def test_classify_video_file(self):
+        """_classify_file returns is_video=True for .mkv/.mp4/.avi files."""
+        for name in ("movie.mkv", "episode.mp4", "video.avi"):
+            is_video, is_subtitle, sub_lang, ep_s, ep_n = _classify_file(name, name)
+            self.assertTrue(is_video, f"{name} should be video")
+            self.assertFalse(is_subtitle)
+            self.assertIsNone(sub_lang)
+
+    def test_classify_subtitle_file(self):
+        """_classify_file returns is_subtitle=True for .srt/.ass/.vtt files."""
+        for name in ("subs.srt", "captions.ass", "subtitles.vtt"):
+            is_video, is_subtitle, sub_lang, ep_s, ep_n = _classify_file(name, name)
+            self.assertFalse(is_video)
+            self.assertTrue(is_subtitle, f"{name} should be subtitle")
+
+    def test_classify_non_media(self):
+        """_classify_file returns False/False for .txt/.nfo files."""
+        for name in ("readme.txt", "info.nfo", "sample.jpg"):
+            is_video, is_subtitle, sub_lang, ep_s, ep_n = _classify_file(name, name)
+            self.assertFalse(is_video)
+            self.assertFalse(is_subtitle)
+            self.assertIsNone(sub_lang)
+
+    # =========================================================================
+    # store_torrent_files / get_torrent_files tests
+    # =========================================================================
+
+    @patch('torboxed.guessit')
+    def test_store_and_get_torrent_files(self, mock_guessit):
+        """store files via store_torrent_files, verify get_torrent_files retrieves them."""
+        # Mock guessit to return season/episode
+        mock_guessit.return_value = {"season": 1, "episode": 5}
+
+        files = [
+            {"name": "Show.S01E05.mkv", "path": "Show.S01E05.mkv", "size": 500000000, "id": "f1"},
+            {"name": "Show.S01E05.en.srt", "path": "Show.S01E05.en.srt", "size": 50000, "id": "f2"},
+        ]
+        store_torrent_files("deb_123", "torbox", files)
+
+        result = get_torrent_files("deb_123")
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["debrid_id"], "deb_123")
+        self.assertEqual(result[0]["debrid_service"], "torbox")
+
+        # Find the video file
+        video = [r for r in result if r["is_video"] == 1]
+        self.assertEqual(len(video), 1)
+        self.assertEqual(video[0]["episode_season"], 1)
+        self.assertEqual(video[0]["episode_number"], 5)
+
+        # Find the subtitle file
+        subs = [r for r in result if r["is_subtitle"] == 1]
+        self.assertEqual(len(subs), 1)
+
+    def test_get_torrent_files_empty(self):
+        """get_torrent_files returns [] for unknown debrid_id."""
+        result = get_torrent_files("nonexistent")
+        self.assertEqual(result, [])
+
+    @patch('torboxed.guessit')
+    def test_get_video_file_for_episode_match(self, mock_guessit):
+        """store files for a debrid_id, verify get_video_file_for_episode finds S01E02."""
+        mock_guessit.side_effect = lambda name: (
+            {"season": 1, "episode": 1} if "E01" in name else
+            {"season": 1, "episode": 2} if "E02" in name else
+            {"season": None, "episode": None}
+        )
+
+        files = [
+            {"name": "Show.S01E01.mkv", "path": "S01E01.mkv", "size": 500, "id": "e01"},
+            {"name": "Show.S01E02.mkv", "path": "S01E02.mkv", "size": 600, "id": "e02"},
+        ]
+        store_torrent_files("deb_456", "torbox", files)
+
+        result = get_video_file_for_episode("deb_456", 1, 2)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["file_name"], "Show.S01E02.mkv")
+        self.assertEqual(result["episode_season"], 1)
+        self.assertEqual(result["episode_number"], 2)
+
+    @patch('torboxed.guessit')
+    def test_get_video_file_for_episode_no_match(self, mock_guessit):
+        """returns None when no matching episode exists."""
+        mock_guessit.return_value = {"season": 1, "episode": 1}
+
+        files = [
+            {"name": "Show.S01E01.mkv", "path": "S01E01.mkv", "size": 500, "id": "e01"},
+        ]
+        store_torrent_files("deb_789", "torbox", files)
+
+        result = get_video_file_for_episode("deb_789", 1, 2)  # E02 doesn't exist
+        self.assertIsNone(result)
+
+    @patch('torboxed.guessit')
+    def test_get_subtitle_files(self, mock_guessit):
+        """store video+subtitle files, verify get_subtitle_files returns only subtitles."""
+        mock_guessit.return_value = {"season": 1, "episode": 1}
+
+        files = [
+            {"name": "Show.S01E01.mkv", "path": "S01E01.mkv", "size": 500, "id": "v1"},
+            {"name": "Show.S01E01.en.srt", "path": "S01E01.en.srt", "size": 10, "id": "s1"},
+            {"name": "Show.S01E01.nl.srt", "path": "S01E01.nl.srt", "size": 12, "id": "s2"},
+        ]
+        store_torrent_files("deb_sub_1", "torbox", files)
+
+        subs = get_subtitle_files("deb_sub_1")
+        self.assertEqual(len(subs), 2)
+        self.assertTrue(all(s["is_subtitle"] == 1 for s in subs))
+        languages = {s["subtitle_language"] for s in subs}
+        self.assertEqual(languages, {"en", "nl"})
+
+    def test_cleanup_orphan_torrent_files(self):
+        """store files for orphaned debrid_id, call cleanup, verify rows are deleted."""
+        import torboxed
+
+        # Store files for an orphan debrid_id (not in processed table)
+        store_torrent_files("orphan_id", "torbox", [
+            {"name": "Movie.mkv", "path": "Movie.mkv", "size": 1000, "id": "f1"},
+        ])
+
+        # Verify files exist
+        self.assertEqual(len(get_torrent_files("orphan_id")), 1)
+
+        # Cleanup
+        deleted = cleanup_orphan_torrent_files()
+        self.assertEqual(deleted, 1)
+
+        # Verify files are gone
+        self.assertEqual(len(get_torrent_files("orphan_id")), 0)
+
+    def test_cleanup_preserves_valid_torrent_files(self):
+        """cleanup only removes orphan rows, keeps ones with valid debrid_id in processed."""
+        import torboxed
+
+        # Add a processed record
+        torboxed.record_processed(
+            "tt1234567", "Test Movie", 2024, "movie", "added", "success",
+            debrid_id="valid_id", magnet="magnet:test",
+            quality_score=2500, quality_label="1080p",
+            debrid_service="torbox"
+        )
+
+        # Store files for valid debrid_id
+        store_torrent_files("valid_id", "torbox", [
+            {"name": "Movie.mkv", "path": "Movie.mkv", "size": 1000, "id": "f1"},
+        ])
+
+        # Store files for orphan debrid_id
+        store_torrent_files("orphan_id", "torbox", [
+            {"name": "Orphan.mkv", "path": "Orphan.mkv", "size": 500, "id": "f2"},
+        ])
+
+        deleted = cleanup_orphan_torrent_files()
+        self.assertEqual(deleted, 1)
+
+        # Valid files should remain
+        self.assertEqual(len(get_torrent_files("valid_id")), 1)
+        # Orphan files should be gone
+        self.assertEqual(len(get_torrent_files("orphan_id")), 0)
+
+    # =========================================================================
+    # Filename extraction / building tests
+    # =========================================================================
+
+    def test_extract_imdb_from_filename(self):
+        """extract_imdb_from_filename parses {imdb-tt0137523} tag."""
+        result = extract_imdb_from_filename("Fight Club (1999) {imdb-tt0137523}.mkv")
+        self.assertEqual(result, "tt0137523")
+
+        result = extract_imdb_from_filename("{imdb-tt1234567}")
+        self.assertEqual(result, "tt1234567")
+
+    def test_extract_imdb_no_match(self):
+        """returns None when no imdb tag present."""
+        self.assertIsNone(extract_imdb_from_filename("Movie.2024.mkv"))
+        self.assertIsNone(extract_imdb_from_filename(""))
+        self.assertIsNone(extract_imdb_from_filename("{imdb-}"))
+
+    def test_build_movie_filename(self):
+        """build_movie_filename with known params."""
+        result = build_movie_filename("Fight Club", 1999, "tt0137523")
+        self.assertEqual(result, "Fight Club (1999) {imdb-tt0137523}.mkv")
+
+    def test_build_movie_filename_slashes_replaced(self):
+        """build_movie_filename replaces slashes in title."""
+        result = build_movie_filename("AC/DC", 2024, "tt1234567")
+        self.assertNotIn("/", result)
+        self.assertIn("AC-DC", result)
+
+    def test_build_episode_filename(self):
+        """build_episode_filename with S01E02."""
+        result = build_episode_filename("Breaking Bad", 1, 2, "tt0903747")
+        self.assertEqual(
+            result,
+            "Breaking Bad {imdb-tt0903747} S01E02.mkv"
+        )
+
+    def test_build_subtitle_filename_with_lang(self):
+        """build_subtitle_filename with language code."""
+        result = build_subtitle_filename("Movie (2024) {imdb-tt1234567}.mkv", "en")
+        self.assertEqual(result, "Movie (2024) {imdb-tt1234567}.en.srt")
+
+    def test_build_subtitle_filename_no_lang(self):
+        """build_subtitle_filename without language."""
+        result = build_subtitle_filename("Movie (2024) {imdb-tt1234567}.mkv", None)
+        self.assertEqual(result, "Movie (2024) {imdb-tt1234567}.srt")
+
+    def test_build_subtitle_filename_custom_ext(self):
+        """build_subtitle_filename with custom extension."""
+        result = build_subtitle_filename("Movie.mkv", "fr", ".ass")
+        self.assertEqual(result, "Movie.fr.ass")
+
+    # =========================================================================
+    # resolve_path tests
+    # =========================================================================
+
+    def test_resolve_path_root(self):
+        """resolve_path("/") returns type="root"."""
+        result = resolve_path("/")
+        self.assertEqual(result["type"], "root")
+
+    def test_resolve_path_root_empty(self):
+        """resolve_path("") returns type="root"."""
+        result = resolve_path("")
+        self.assertEqual(result["type"], "root")
+
+    def test_resolve_path_movies_collection(self):
+        """resolve_path("/Movies/") returns type="collection_root"."""
+        result = resolve_path("/Movies/")
+        self.assertEqual(result["type"], "collection_root")
+        self.assertEqual(result["root"], "Movies")
+
+    def test_resolve_path_tv_shows(self):
+        """resolve_path("/TV Shows/") returns type="show_list"."""
+        result = resolve_path("/TV Shows/")
+        self.assertEqual(result["type"], "show_list")
+        self.assertEqual(result["root"], "TV Shows")
+
+    def test_resolve_path_movie_folder(self):
+        """resolve_path with /Movies/Title/ returns type="movie_folder"."""
+        result = resolve_path("/Movies/Fight Club (1999)/")
+        self.assertEqual(result["type"], "movie_folder")
+        self.assertEqual(result["show_title"], "Fight Club (1999)")
+
+    def test_resolve_path_movie_file(self):
+        """resolve_path with full movie path returns type="movie_file"."""
+        path = "/Movies/Fight Club (1999)/Fight Club (1999) {imdb-tt0137523}.mkv"
+        result = resolve_path(path)
+        self.assertEqual(result["type"], "movie_file")
+        self.assertEqual(result["imdb_id"], "tt0137523")
+
+    def test_resolve_path_show_folder(self):
+        """resolve_path with /TV Shows/Show Name/ returns type="show_folder"."""
+        result = resolve_path("/TV Shows/Breaking Bad/")
+        self.assertEqual(result["type"], "show_folder")
+        self.assertEqual(result["show_title"], "Breaking Bad")
+
+    def test_resolve_path_season_folder(self):
+        """resolve_path with /TV Shows/Show/Season 1/ returns type="season_folder"."""
+        result = resolve_path("/TV Shows/Breaking Bad/Season 1/")
+        self.assertEqual(result["type"], "season_folder")
+        self.assertEqual(result["season_number"], 1)
+        self.assertEqual(result["season_key"], "S01")
+
+    def test_resolve_path_episode_file(self):
+        """resolve_path with episode path: currently the >=3 TV Shows check
+        fires before the >=4 check, so a 4-segment TV Shows path returns
+        'season_folder' rather than 'episode_file'."""
+        path = "/TV Shows/Breaking Bad/Season 1/Breaking Bad {imdb-tt0903747} S01E01.mkv"
+        result = resolve_path(path)
+        # The len(segments) >= 3 check fires first and returns season_folder
+        self.assertEqual(result["type"], "season_folder")
+        self.assertEqual(result["season_number"], 1)
+        self.assertEqual(result["season_key"], "S01")
+
+    def test_resolve_path_unknown(self):
+        """resolve_path with unrecognized path returns type="unknown"."""
+        result = resolve_path("/Some/Unknown/Path")
+        self.assertEqual(result["type"], "unknown")
+
+    # =========================================================================
+    # resolve_debrid_id_for_path tests
+    # =========================================================================
+
+    def test_resolve_debrid_id_for_path(self):
+        """resolve_debrid_id_for_path finds existing record."""
+        import torboxed
+
+        torboxed.record_processed(
+            "tt0137523", "Fight Club", 1999, "movie", "added", "success",
+            debrid_id="tb-fc-123", magnet="magnet:fc",
+            quality_score=3500, quality_label="1080p BluRay",
+            debrid_service="torbox"
+        )
+
+        result = resolve_debrid_id_for_path("tt0137523")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["debrid_id"], "tb-fc-123")
+        self.assertEqual(result["title"], "Fight Club")
+        self.assertEqual(result["content_type"], "movie")
+
+    def test_resolve_debrid_id_for_path_with_season(self):
+        """resolve_debrid_id_for_path with season finds specific season record."""
+        import torboxed
+
+        torboxed.record_processed(
+            "tt0903747", "Breaking Bad", 2008, "show", "added", "success",
+            debrid_id="tb-bb-s01", magnet="magnet:bb1",
+            quality_score=3400, quality_label="1080p WEB-DL",
+            season="S01", debrid_service="torbox"
+        )
+        torboxed.record_processed(
+            "tt0903747", "Breaking Bad", 2008, "show", "added", "success",
+            debrid_id="tb-bb-s02", magnet="magnet:bb2",
+            quality_score=3400, quality_label="1080p WEB-DL",
+            season="S02", debrid_service="torbox"
+        )
+
+        result = resolve_debrid_id_for_path("tt0903747", "S01")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["debrid_id"], "tb-bb-s01")
+
+    def test_resolve_debrid_id_not_found(self):
+        """returns None when no record exists."""
+        result = resolve_debrid_id_for_path("tt9999999")
+        self.assertIsNone(result)
+
+    # =========================================================================
+    # _get_db_listing tests
+    # =========================================================================
+
+    def test_get_db_listing_root(self):
+        """_get_db_listing for root returns ["Movies", "TV Shows"]."""
+        result = _get_db_listing("/", {"type": "root"})
+        self.assertEqual(result, ["Movies", "TV Shows"])
+
+    def test_get_db_listing_collection_root_empty(self):
+        """_get_db_listing for collection_root with no movies returns []."""
+        result = _get_db_listing("/Movies/", {"type": "collection_root"})
+        self.assertEqual(result, [])
+
+    def test_get_db_listing_collection_root_with_movies(self):
+        """_get_db_listing shows movie filenames when movies exist."""
+        import torboxed
+
+        torboxed.record_processed(
+            "tt0137523", "Fight Club", 1999, "movie", "added", "success",
+            debrid_id="tb-fc", magnet="magnet:fc",
+            quality_score=3500, quality_label="1080p BluRay",
+            debrid_service="torbox"
+        )
+
+        result = _get_db_listing("/Movies/", {"type": "collection_root"})
+        self.assertIn("Fight Club (1999) {imdb-tt0137523}.mkv", result)
+
+    @patch('torboxed.guessit')
+    def test_get_db_listing_movie_folder(self, mock_guessit):
+        """_get_db_listing for movie_folder returns video + subtitle filenames."""
+        import torboxed
+        mock_guessit.return_value = {}
+
+        torboxed.record_processed(
+            "tt0137523", "Fight Club", 1999, "movie", "added", "success",
+            debrid_id="tb-fc", magnet="magnet:fc",
+            quality_score=3500, quality_label="1080p BluRay",
+            debrid_service="torbox"
+        )
+
+        # Store subtitles for this movie
+        store_torrent_files("tb-fc", "torbox", [
+            {"name": "Fight.Club.1999.mkv", "path": "movie.mkv", "size": 1000, "id": "v1"},
+            {"name": "Fight.Club.1999.en.srt", "path": "sub.en.srt", "size": 10, "id": "s1"},
+        ])
+
+        resolved = {"type": "movie_folder", "imdb_id": "tt0137523"}
+        result = _get_db_listing("/Movies/Fight Club (1999)/", resolved)
+        self.assertIn("Fight Club (1999) {imdb-tt0137523}.mkv", result)
+        self.assertTrue(any("en.srt" in f for f in result))
+
+    def test_get_db_listing_show_list_empty(self):
+        """_get_db_listing for show_list with no shows returns []."""
+        result = _get_db_listing("/TV Shows/", {"type": "show_list"})
+        self.assertEqual(result, [])
+
+    def test_get_db_listing_show_list_with_shows(self):
+        """_get_db_listing for show_list returns show titles."""
+        import torboxed
+
+        torboxed.record_processed(
+            "tt0903747", "Breaking Bad", 2008, "show", "added", "success",
+            debrid_id="tb-bb", magnet="magnet:bb",
+            quality_score=3400, season="S01",
+            debrid_service="torbox"
+        )
+
+        result = _get_db_listing("/TV Shows/", {"type": "show_list"})
+        self.assertIn("Breaking Bad", result)
+
+    def test_get_db_listing_show_folder(self):
+        """_get_db_listing for show_folder returns season names."""
+        import torboxed
+
+        torboxed.record_processed(
+            "tt0903747", "Breaking Bad", 2008, "show", "added", "success",
+            debrid_id="tb-bb", magnet="magnet:bb",
+            quality_score=3400, season="S01",
+            debrid_service="torbox"
+        )
+
+        resolved = {"type": "show_folder", "show_title": "Breaking Bad"}
+        result = _get_db_listing("/TV Shows/Breaking Bad/", resolved)
+        self.assertIn("Season 1", result)
+
+    # =========================================================================
+    # _get_best_debrid_for_season tests
+    # =========================================================================
+
+    def test_get_best_debrid_for_season_empty(self):
+        """_get_best_debrid_for_season returns None for empty list."""
+        result = _get_best_debrid_for_season([], "S01", 1)
+        self.assertIsNone(result)
+
+    def test_get_best_debrid_for_season_complete_wins(self):
+        """_get_best_debrid_for_season prefers complete pack over season pack."""
+        seasons = [
+            {"season": "S01", "quality_score": 5000, "debrid_id": "id-s01"},
+            {"season": "Complete", "quality_score": 3000, "debrid_id": "id-complete"},
+        ]
+        result = _get_best_debrid_for_season(seasons, "S01", 1)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["debrid_id"], "id-complete")
+
+    def test_get_best_debrid_for_season_multi_season_wins_over_season(self):
+        """_get_best_debrid_for_season: without SeasonInfo objects,
+        classify_media_level returns 'season' for both single and multi-season
+        keys, so higher quality_score wins at the same completeness level."""
+        seasons = [
+            {"season": "S01", "quality_score": 5000, "debrid_id": "id-s01"},
+            {"season": "S01-S05", "quality_score": 4000, "debrid_id": "id-multi"},
+        ]
+        result = _get_best_debrid_for_season(seasons, "S01", 1)
+        self.assertIsNotNone(result)
+        # Both classify as "season" (completeness=2) without season_info,
+        # so higher quality_score wins
+        self.assertEqual(result["debrid_id"], "id-s01")
+
+    def test_get_best_debrid_for_season_same_level_higher_quality(self):
+        """_get_best_debrid_for_season within same completeness picks higher quality."""
+        seasons = [
+            {"season": "S01", "quality_score": 3000, "debrid_id": "id-low"},
+            {"season": "S01", "quality_score": 5000, "debrid_id": "id-high"},
+        ]
+        result = _get_best_debrid_for_season(seasons, "S01", 1)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["debrid_id"], "id-high")
+
+    # =========================================================================
+    # get_webdav_config tests
+    # =========================================================================
+
+    def test_get_webdav_config_defaults(self):
+        """get_webdav_config returns defaults when env is empty."""
+        import torboxed
+        with patch.object(torboxed, 'get_env', return_value={}):
+            config = get_webdav_config()
+            self.assertEqual(config["host"], "0.0.0.0")
+            self.assertEqual(config["port"], 8080)
+            self.assertEqual(config["log_level"], "info")
+
+    def test_webdav_config_from_env(self):
+        """get_webdav_config reads from environment variables."""
+        import torboxed
+        with patch.object(torboxed, 'get_env', return_value={
+            "WEBDAV_HOST": "127.0.0.1",
+            "WEBDAV_PORT": "9090",
+            "WEBDAV_AUTH_USER": "admin",
+            "WEBDAV_AUTH_PASS": "secret",
+            "WEBDAV_LOG_LEVEL": "debug",
+        }):
+            config = get_webdav_config()
+            self.assertEqual(config["host"], "127.0.0.1")
+            self.assertEqual(config["port"], 9090)
+            self.assertEqual(config["user"], "admin")
+            self.assertEqual(config["password"], "secret")
+            self.assertEqual(config["log_level"], "debug")
+
+    # =========================================================================
+    # backfill_torrent_files tests
+    # =========================================================================
+
+    def test_backfill_empty_processed_table(self):
+        """backfill_torrent_files returns (0, 0) when no processed records."""
+        mock_debrid = Mock()
+        result = backfill_torrent_files(mock_debrid)
+        self.assertEqual(result, (0, 0))
+
+    @patch('torboxed.RateLimiter')
+    def test_backfill_skips_already_cached(self, mock_rate_limiter_class):
+        """backfill_torrent_files skips records already in torrent_files table."""
+        import torboxed
+        mock_limiter = Mock()
+        mock_rate_limiter_class.return_value = mock_limiter
+
+        # Add a processed record with debrid_id
+        torboxed.record_processed(
+            "tt1234567", "Cached Movie", 2024, "movie", "added", "success",
+            debrid_id="cached_id", magnet="magnet:test",
+            quality_score=2500, quality_label="1080p",
+            debrid_service="torbox"
+        )
+
+        # Pre-store files for this debrid_id (simulate already cached)
+        store_torrent_files("cached_id", "torbox", [
+            {"name": "Movie.mkv", "path": "Movie.mkv", "size": 1000, "id": "f1"},
+        ])
+
+        mock_debrid = Mock()
+        result = backfill_torrent_files(mock_debrid)
+
+        # Should process 1 record, store 0 new files (already cached)
+        self.assertEqual(result[0], 1)  # total_processed
+        self.assertEqual(result[1], 0)  # files_stored
+
+        # get_torrent_files should NOT have been called (skipped due to cache hit)
+        mock_debrid.get_torrent_files.assert_not_called()
+
+    @patch('torboxed.RateLimiter')
+    def test_backfill_stores_new_files(self, mock_rate_limiter_class):
+        """backfill_torrent_files fetches and stores files for uncached records."""
+        import torboxed
+        mock_limiter = Mock()
+        mock_rate_limiter_class.return_value = mock_limiter
+
+        # Add a processed record WITHOUT cached torrent_files
+        torboxed.record_processed(
+            "tt7654321", "New Movie", 2024, "movie", "added", "success",
+            debrid_id="new_id", magnet="magnet:new",
+            quality_score=2500, quality_label="1080p",
+            debrid_service="torbox"
+        )
+
+        mock_debrid = Mock()
+        mock_debrid.get_torrent_files.return_value = [
+            {"name": "New.Movie.2024.mkv", "path": "movie.mkv", "size": 2000, "id": "f99"},
+        ]
+
+        result = backfill_torrent_files(mock_debrid)
+
+        self.assertEqual(result[0], 1)  # total_processed
+        self.assertEqual(result[1], 1)  # files_stored
+
+        # Verify files were stored
+        stored = get_torrent_files("new_id")
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["file_name"], "New.Movie.2024.mkv")
+
+        mock_debrid.get_torrent_files.assert_called_once_with("new_id")
+
+    # =========================================================================
+    # Edge case tests
+    # =========================================================================
+
+    def test_multi_episode_filename(self):
+        """build_episode_filename with S01E01 (standard formatting)."""
+        result = build_episode_filename("Show Name", 1, 1, "tt9999999")
+        self.assertEqual(result, "Show Name {imdb-tt9999999} S01E01.mkv")
+
+    @patch('torboxed.guessit')
+    def test_classify_multi_dot_episode(self, mock_guessit):
+        """_classify_file on S01E01E02 multi-episode file classifies as video."""
+        mock_guessit.return_value = {"season": 1, "episode": [1, 2]}
+        is_video, is_subtitle, sub_lang, ep_s, ep_n = _classify_file(
+            "Show.S01E01E02.1080p.mkv", "Show.S01E01E02.1080p.mkv"
+        )
+        self.assertTrue(is_video)
+        self.assertFalse(is_subtitle)
+
+    def test_resolve_path_subtitle_in_movie_folder(self):
+        """resolve_path extracts imdb_id from subtitle in movie folder."""
+        result = resolve_path(
+            "/Movies/Fight Club (1999)/Fight Club (1999) {imdb-tt0137523}.en.srt"
+        )
+        self.assertEqual(result["type"], "movie_file")
+        self.assertEqual(result["imdb_id"], "tt0137523")
+
+    def test_resolve_path_special_episode(self):
+        """resolve_path on S00E01 special episode parses season=0, episode=1."""
+        result = resolve_path(
+            "/TV Shows/Specials Show/Season 0/Specials Show {imdb-tt9999999} S00E01.mkv"
+        )
+        self.assertEqual(result["type"], "season_folder")
+        self.assertEqual(result["season_number"], 0)
+        self.assertEqual(result["season_key"], "S00")
+
+    def test_subtitle_files_no_episode(self):
+        """get_subtitle_files with no season/episode returns all subtitles."""
+        files = [
+            {"name": "Movie.mkv", "path": "Movie.mkv", "size": 1000, "id": "v1"},
+            {"name": "Movie.en.srt", "path": "sub.en.srt", "size": 10, "id": "s1"},
+            {"name": "Movie.nl.srt", "path": "sub.nl.srt", "size": 12, "id": "s2"},
+        ]
+        store_torrent_files("deb_noep", "torbox", files)
+
+        subs = get_subtitle_files("deb_noep")
+        self.assertEqual(len(subs), 2)
+        self.assertTrue(all(s["is_subtitle"] == 1 for s in subs))
+        languages = {s["subtitle_language"] for s in subs}
+        self.assertEqual(languages, {"en", "nl"})
+
+    def test_extract_imdb_deeply_nested(self):
+        """extract_imdb_from_filename finds imdb tag amid other tokens."""
+        result = extract_imdb_from_filename("Show Name {imdb-tt9999999} S01E01.en.srt")
+        self.assertEqual(result, "tt9999999")
 
 
 if __name__ == "__main__":

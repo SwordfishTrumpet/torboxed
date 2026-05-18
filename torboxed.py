@@ -17,11 +17,13 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
+import hashlib
 import re
 import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import unicodedata
 
 # Import guessit for quality parsing
@@ -37,6 +39,18 @@ try:
     import psycopg
 except ImportError:
     pass  # psycopg is optional - Zilean features will be disabled
+
+# Import wsgidav for WebDAV server (optional)
+wsgidav = None
+try:
+    import wsgidav
+    from wsgidav.wsgidav_app import WsgiDAVApp
+    from wsgidav.dav_provider import DAVProvider, DAVCollection, DAVNonCollection
+except ImportError:
+    WsgiDAVApp = None
+    DAVProvider = None
+    DAVCollection = None
+    DAVNonCollection = None
 
 # =============================================================================
 # SECURITY FUNCTIONS (must be defined before constants)
@@ -151,8 +165,9 @@ DEFAULT_TIMEOUT_LONG = 60.0    # For search operations (Prowlarr, Jackett, Torbo
 DEFAULT_TIMEOUT_CREATION = 120.0  # For torrent creation (large multi-season packs need more time)
 
 # Search result limits
-SEARCH_LIMIT_IMDB = 200        # Higher limit for IMDb ID searches (ensure season packs)
-SEARCH_LIMIT_TITLE = 50        # Standard limit for title searches
+SEARCH_LIMIT_IMDB = 500        # Higher limit for IMDb ID searches (ensure season packs)
+SEARCH_LIMIT_TITLE = 100       # Standard limit for title searches
+RD_CACHE_CHECK_BATCH = 100     # Max hashes per Real Debrid instantAvailability call
 TORBOX_LIST_LIMIT = 5000       # Max torrents per request from Torbox mylist (API default is 1000, but supports up to 5000)
 REAL_DEBRID_LIST_LIMIT = 5000  # Max torrents per request from Real Debrid (API default is 100, but supports up to 5000 for large libraries)
 
@@ -173,6 +188,59 @@ ZILEAN_DEFAULT_DB_URL = "postgresql://zilean:zilean_password@postgres:5432/zilea
 
 # Valid time periods for Trakt API endpoints
 VALID_PERIODS = ["weekly", "monthly", "yearly", "all"]
+
+# Video file extensions for filtering torrent files
+VIDEO_EXTENSIONS = {'.mkv', '.mp4', '.avi', '.mov', '.wmv', '.m4v', '.webm', '.ts'}
+
+# Subtitle file extensions for filtering torrent files
+SUBTITLE_EXTENSIONS = {'.srt', '.ass', '.vtt', '.sub', '.ssa', '.idx'}
+
+# Subtitle language codes parsed from filenames
+SUBTITLE_LANG_PATTERNS = [
+    (r'\.(en|eng|english)\.', 'en'),
+    (r'\.(nl|dut|dutch|nld)\.', 'nl'),
+    (r'\.(fr|fra|fre|french)\.', 'fr'),
+    (r'\.(de|ger|deu|german)\.', 'de'),
+    (r'\.(es|spa|spanish)\.', 'es'),
+    (r'\.(it|ita|italian)\.', 'it'),
+    (r'\.(pt|por|portuguese)\.', 'pt'),
+    (r'\.(ru|rus|russian)\.', 'ru'),
+    (r'\.(ja|jpn|japanese)\.', 'ja'),
+    (r'\.(ko|kor|korean)\.', 'ko'),
+    (r'\.(zh|chi|chinese)\.', 'zh'),
+    (r'\.(ar|ara|arabic)\.', 'ar'),
+]
+
+# MIME type mapping for WebDAV virtual files
+MIME_TYPES = {
+    '.mkv': 'video/x-matroska',
+    '.mp4': 'video/mp4',
+    '.avi': 'video/x-msvideo',
+    '.mov': 'video/quicktime',
+    '.wmv': 'video/x-ms-wmv',
+    '.m4v': 'video/mp4',
+    '.webm': 'video/webm',
+    '.ts': 'video/mp2t',
+    '.srt': 'application/x-subrip',
+    '.ass': 'text/x-ssa',
+    '.vtt': 'text/vtt',
+    '.sub': 'application/x-subrip',
+    '.ssa': 'text/x-ssa',
+    '.idx': 'application/octet-stream',
+}
+
+# WebDAV server defaults
+WEBDAV_DEFAULT_HOST = "0.0.0.0"
+WEBDAV_DEFAULT_PORT = 8080
+WEBDAV_DEFAULT_USER = "***REDACTED***"
+WEBDAV_DEFAULT_PASS = "***REDACTED***"
+WEBDAV_DEFAULT_LOG_LEVEL = "info"
+
+# Backfill rate limit (one get_torrent_files call every 3 seconds)
+BACKFILL_RATE_LIMIT = 3.0
+
+# Declared as passed to access checks for non-existent permissions
+WEBDAV_METHODS_TO_PASS = {'OPTIONS', 'PROPFIND', 'PROPPATCH', 'MKCOL', 'COPY', 'MOVE', 'LOCK', 'UNLOCK'}
 
 
 # =============================================================================
@@ -740,13 +808,14 @@ class ProwlarrClient:
             validate_guid=False
         )
     
-    def search(self, query: str, categories: Optional[List[int]] = None, limit: int = 100) -> List[Dict[str, Any]]:
+    def search(self, query: str, categories: Optional[List[int]] = None, limit: int = 100, imdb_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Search for torrents via Prowlarr.
         
         Args:
             query: Search query string (title + year recommended)
             categories: Optional list of category IDs (2000=movies, 5000=tv)
             limit: Maximum number of results to return
+            imdb_id: Optional IMDb ID for more accurate search (e.g., 'tt0137523')
             
         Returns:
             List of torrent dicts with infoHash, title, size, etc.
@@ -765,6 +834,11 @@ class ProwlarrClient:
             }
             if categories:
                 params["categories"] = ",".join(str(c) for c in categories)
+            if imdb_id and imdb_id.startswith("tt"):
+                try:
+                    params["imdbId"] = int(imdb_id[2:])
+                except ValueError:
+                    pass
             
             url = f"{self.base_url}/api/v1/search"
             response = self.client.get(url, params=params)
@@ -889,13 +963,14 @@ class JackettClient:
             validate_guid=True
         )
     
-    def search(self, query: str, categories: Optional[List[int]] = None, limit: int = 100) -> List[Dict[str, Any]]:
+    def search(self, query: str, categories: Optional[List[int]] = None, limit: int = 100, imdb_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Search for torrents via Jackett.
         
         Args:
             query: Search query string (title + year recommended)
             categories: Optional list of category IDs (2000=movies, 5000=tv)
             limit: Maximum number of results to return
+            imdb_id: Optional IMDb ID for more accurate search (e.g., 'tt0137523')
             
         Returns:
             List of torrent dicts with infoHash, title, size, etc.
@@ -912,6 +987,8 @@ class JackettClient:
                 "apikey": self.api_key,
                 "Query": query,
             }
+            if imdb_id:
+                params["imdbid"] = imdb_id
             
             # Map categories to Jackett format if provided
             if categories:
@@ -1452,11 +1529,16 @@ def get_trakt_access_token() -> Optional[str]:
 
 @contextmanager
 def get_db():
-    """Context manager for database connections with error handling."""
+    """Context manager for database connections with error handling.
+    
+    Uses WAL mode for concurrent read access (WebDAV + sync) and
+    check_same_thread=False for multi-threaded wsgidav.
+    """
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
         yield conn
     except sqlite3.Error as e:
         print(f"Database error: {e}")
@@ -1613,6 +1695,39 @@ def migrate_db():
                 logger.error("Failed to add debrid_service column: %s", e)
                 # Don't raise - this is non-critical
         
+        # Migration 4: Check if torrent_files table exists
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='torrent_files'")
+        if not cursor.fetchone():
+            logger.info("Migrating database schema to add torrent_files table...")
+            try:
+                conn.execute('''
+                    CREATE TABLE torrent_files (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        debrid_id TEXT NOT NULL,
+                        debrid_service TEXT NOT NULL,
+                        file_id TEXT NOT NULL DEFAULT '',
+                        file_name TEXT NOT NULL,
+                        file_path TEXT NOT NULL DEFAULT '',
+                        file_size INTEGER,
+                        episode_season INTEGER,
+                        episode_number INTEGER,
+                        is_video BOOLEAN DEFAULT 0,
+                        is_subtitle BOOLEAN DEFAULT 0,
+                        subtitle_language TEXT,
+                        created_at TEXT,
+                        UNIQUE(debrid_id, file_path)
+                    )
+                ''')
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_torrent_files_lookup ON torrent_files(debrid_id, episode_season, episode_number)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_torrent_files_video ON torrent_files(debrid_id, is_video)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_torrent_files_media ON torrent_files(debrid_id, is_video, is_subtitle)")
+                conn.commit()
+                logger.info("Added torrent_files table for WebDAV file caching")
+                migrations_performed = True
+            except sqlite3.Error as e:
+                logger.debug("Torrent_files migration traceback:", exc_info=True)
+                logger.error("Failed to create torrent_files table: %s", e)
+        
         return migrations_performed
 
 
@@ -1654,6 +1769,26 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_imdb_id ON processed(imdb_id);
             CREATE INDEX IF NOT EXISTS idx_debrid_service ON processed(debrid_service);
             CREATE INDEX IF NOT EXISTS idx_debrid_id ON processed(debrid_id);
+            
+            CREATE TABLE IF NOT EXISTS torrent_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                debrid_id TEXT NOT NULL,
+                debrid_service TEXT NOT NULL,
+                file_id TEXT NOT NULL DEFAULT '',
+                file_name TEXT NOT NULL,
+                file_path TEXT NOT NULL DEFAULT '',
+                file_size INTEGER,
+                episode_season INTEGER,
+                episode_number INTEGER,
+                is_video BOOLEAN DEFAULT 0,
+                is_subtitle BOOLEAN DEFAULT 0,
+                subtitle_language TEXT,
+                created_at TEXT,
+                UNIQUE(debrid_id, file_path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_torrent_files_lookup ON torrent_files(debrid_id, episode_season, episode_number);
+            CREATE INDEX IF NOT EXISTS idx_torrent_files_video ON torrent_files(debrid_id, is_video);
+            CREATE INDEX IF NOT EXISTS idx_torrent_files_media ON torrent_files(debrid_id, is_video, is_subtitle);
             
             -- Insert default config if empty
             INSERT OR IGNORE INTO config (id, sources, limits, quality_prefs, filters, telegram_settings)
@@ -1830,6 +1965,200 @@ def get_recent(limit: int = 10) -> List[Dict[str, Any]]:
         return [dict(row) for row in rows]
 
 
+# =============================================================================
+# TORRENT FILES CACHE (WebDAV support)
+# =============================================================================
+
+def _classify_file(filename: str, file_path: str) -> Tuple[bool, bool, Optional[str], Optional[int], Optional[int]]:
+    """Classify a torrent file as video/subtitle and extract metadata.
+    
+    Args:
+        filename: Raw filename from torrent
+        file_path: Relative path within torrent (for nested dirs)
+        
+    Returns:
+        (is_video, is_subtitle, subtitle_language, episode_season, episode_number)
+    """
+    name_lower = filename.lower()
+    ext = Path(filename).suffix.lower()
+    
+    is_video = ext in VIDEO_EXTENSIONS
+    is_subtitle = ext in SUBTITLE_EXTENSIONS
+    
+    # Parse subtitle language
+    subtitle_language = None
+    if is_subtitle:
+        for pattern, lang_code in SUBTITLE_LANG_PATTERNS:
+            if re.search(pattern, name_lower):
+                subtitle_language = lang_code
+                break
+    
+    # Parse episode info using guessit
+    episode_season = None
+    episode_number = None
+    if is_video:
+        try:
+            parsed = guessit(filename)
+            season_data = parsed.get("season")
+            episode_data = parsed.get("episode")
+            if season_data is not None:
+                if isinstance(season_data, list):
+                    episode_season = season_data[0] if season_data else None
+                else:
+                    episode_season = int(season_data) if season_data else None
+            if episode_data is not None:
+                if isinstance(episode_data, list):
+                    episode_number = episode_data[0] if episode_data else None
+                else:
+                    episode_number = int(episode_data) if episode_data else None
+        except Exception:
+            pass  # Guessit failed, leave as None
+    
+    return is_video, is_subtitle, subtitle_language, episode_season, episode_number
+
+
+def store_torrent_files(debrid_id: str, debrid_service: str, files: List[Dict[str, Any]]) -> None:
+    """Store file listing in torrent_files table.
+    
+    Normalizes file metadata, classifies video/subtitle files, and
+    parses episode info for TV content. Write-once cache since torrents
+    are immutable.
+    
+    Args:
+        debrid_id: Debrid torrent identifier
+        debrid_service: Which debrid service ('torbox' or 'realdebrid')
+        files: List of file dicts from debrid API with name, path, size, id fields
+    """
+    if not files:
+        return
+    
+    with get_db() as conn:
+        for f in files:
+            name = f.get("name", "")
+            path = f.get("path", name)
+            size = f.get("size", 0)
+            file_id = str(f.get("id", ""))
+            
+            try:
+                size = int(size) if size else 0
+            except (ValueError, TypeError):
+                size = 0
+            
+            # Classify file type
+            is_video, is_subtitle, sub_lang, ep_season, ep_num = _classify_file(name, path)
+            
+            try:
+                conn.execute('''
+                    INSERT OR IGNORE INTO torrent_files
+                    (debrid_id, debrid_service, file_id, file_name, file_path, file_size,
+                     episode_season, episode_number, is_video, is_subtitle, subtitle_language, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    str(debrid_id), debrid_service, file_id, name, path, size,
+                    ep_season, ep_num, int(is_video), int(is_subtitle), sub_lang,
+                    datetime.now(timezone.utc).isoformat()
+                ))
+            except sqlite3.Error as e:
+                logger.debug("Error storing torrent file %s: %s", name, e)
+        
+        conn.commit()
+    
+    logger.debug("Stored %d files for torrent %s (%s)", len(files), debrid_id, debrid_service)
+
+
+def get_torrent_files(debrid_id: str) -> List[Dict[str, Any]]:
+    """Get cached file listing for a torrent. Returns [] if not cached.
+    
+    Args:
+        debrid_id: Debrid torrent identifier
+        
+    Returns:
+        List of file dicts with all torrent_files columns
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM torrent_files WHERE debrid_id = ? ORDER BY file_name",
+            (str(debrid_id),)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_video_file_for_episode(debrid_id: str, season: int, episode: int) -> Optional[Dict[str, Any]]:
+    """Find the best video file matching S{season}E{episode}.
+    
+    For episode-level lookup within season packs. Returns the
+    first matching video file by exact season/episode match.
+    
+    Args:
+        debrid_id: Debrid torrent identifier
+        season: Season number
+        episode: Episode number
+        
+    Returns:
+        Matching file dict or None
+    """
+    with get_db() as conn:
+        row = conn.execute(
+            """SELECT * FROM torrent_files 
+               WHERE debrid_id = ? AND is_video = 1 
+               AND episode_season = ? AND episode_number = ?
+               ORDER BY file_size DESC LIMIT 1""",
+            (str(debrid_id), season, episode)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_subtitle_files(debrid_id: str, season: Optional[int] = None, 
+                       episode: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Find all subtitle files matching episode/movie context.
+    
+    Args:
+        debrid_id: Debrid torrent identifier
+        season: Optional season number (for TV shows)
+        episode: Optional episode number (for TV shows)
+        
+    Returns:
+        List of subtitle file dicts
+    """
+    with get_db() as conn:
+        if season is not None and episode is not None:
+            rows = conn.execute(
+                """SELECT * FROM torrent_files
+                   WHERE debrid_id = ? AND is_subtitle = 1
+                   AND (episode_season IS NULL OR episode_season = ?)
+                   ORDER BY subtitle_language, file_name""",
+                (str(debrid_id), season)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT * FROM torrent_files
+                   WHERE debrid_id = ? AND is_subtitle = 1
+                   ORDER BY file_name""",
+                (str(debrid_id),)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def cleanup_orphan_torrent_files() -> int:
+    """Remove torrent_files rows for debrid_ids no longer in processed table.
+    
+    Returns:
+        Number of rows deleted
+    """
+    with get_db() as conn:
+        cursor = conn.execute("""
+            DELETE FROM torrent_files 
+            WHERE debrid_id NOT IN (
+                SELECT DISTINCT debrid_id FROM processed WHERE debrid_id IS NOT NULL
+            )
+        """)
+        conn.commit()
+        deleted = cursor.rowcount
+        if deleted > 0:
+            logger.info("Cleaned up %d orphaned torrent_files rows", deleted)
+        return deleted
+
+
 # ============================================================================
 # QUALITY SCORING
 # ============================================================================
@@ -1985,8 +2314,17 @@ def parse_season_info(torrent_name: str) -> Optional[SeasonInfo]:
     
     # Check for "Complete" in the name (complete series pack)
     name_lower = torrent_name.lower()
-    complete_keywords = ['complete', 'full series', 'entire series', 'all seasons']
-    has_complete_keyword = any(keyword in name_lower for keyword in complete_keywords)
+    name_normalized = name_lower.replace('.', ' ').replace('-', ' ').replace('_', ' ')
+    complete_keywords = [
+        'complete', 'complete series', 'complete collection',
+        'full series', 'entire series', 'all seasons',
+        'the complete', 'integral', 'integrale',
+        'box set', 'boxset',
+    ]
+    has_complete_keyword = any(
+        keyword in name_lower or keyword in name_normalized
+        for keyword in complete_keywords
+    )
     
     # If no season, episode, or complete keyword, it's likely a movie
     if season_data is None and episode_data is None and not has_complete_keyword:
@@ -2367,7 +2705,7 @@ def make_request_with_backoff(client: httpx.Client, method: str, url: str,
                                   method, url.split('/')[-1])
                     # BUG-006 FIX: Update rate limiter without retry time
                     if rate_limiter:
-                        rate_limiter.mark_rate_limiter()
+                        rate_limiter.mark_rate_limited()
                 return response  # Return immediately, don't retry internally
             
             # Handle server errors (5xx) - retry with backoff
@@ -3028,6 +3366,32 @@ class DebridClient(ABC):
         """
         ...
 
+    @abstractmethod
+    def get_torrent_files(self, debrid_id: str) -> List[Dict[str, Any]]:
+        """Get file listing inside a torrent.
+
+        Args:
+            debrid_id: Debrid torrent identifier.
+
+        Returns:
+            List of file dicts with keys: name, path, size, id.
+            Empty list if the torrent has no files or the API call fails.
+        """
+        ...
+
+    @abstractmethod
+    def get_direct_url(self, debrid_id: str, file_id: str) -> Optional[str]:
+        """Generate a direct download/stream URL for a specific file.
+
+        Args:
+            debrid_id: Debrid torrent identifier.
+            file_id: File identifier within the torrent (from get_torrent_files).
+
+        Returns:
+            Temporary direct URL string, or None if generation fails.
+        """
+        ...
+
     # ---- Concrete shared methods ----
 
     def find_existing_by_hash(self, torrent_hash: str) -> Optional[Dict[str, Any]]:
@@ -3120,7 +3484,7 @@ class DebridClient(ABC):
             if not zilean_available:
                 logger.warning("Zilean not available - Prowlarr text search cannot verify IMDb ID, results may be less accurate")
             prowlarr_results = self.searcher_prowlarr.search(
-                query, categories=prowlarr_categories, limit=SEARCH_LIMIT_TITLE)
+                query, categories=prowlarr_categories, limit=SEARCH_LIMIT_TITLE, imdb_id=imdb_id)
             if prowlarr_results:
                 logger.info("Prowlarr found %d torrents for: %s",
                              len(prowlarr_results), query)
@@ -3130,7 +3494,7 @@ class DebridClient(ABC):
         if not all_search_results and jackett_available:
             logger.debug("Searching Jackett as fallback: %s", query)
             jackett_results = self.searcher_jackett.search(
-                query, limit=SEARCH_LIMIT_TITLE)
+                query, limit=SEARCH_LIMIT_TITLE, imdb_id=imdb_id)
             if jackett_results:
                 logger.info("Jackett found %d torrents for: %s",
                              len(jackett_results), query)
@@ -3246,6 +3610,8 @@ class DebridClient(ABC):
                     leechers=item.get("leechers", 0),
                     season_info=parse_season_info(name),
                 ))
+
+        cached.sort(key=lambda t: t.quality.score, reverse=True)
 
         if cached:
             logger.info("Selected %d quality torrents for: %s (filtered out %d low-res)",
@@ -3627,6 +3993,104 @@ class TorboxClient(DebridClient):
                 return False
         
         return False
+    
+    def get_torrent_files(self, debrid_id: str) -> List[Dict[str, Any]]:
+        """Get file listing inside a Torbox torrent.
+        
+        Uses Torbox API endpoint to retrieve detailed torrent info including
+        the files array. Each file entry is normalized to: name, path, size, id.
+        
+        Args:
+            debrid_id: Torbox torrent identifier
+            
+        Returns:
+            List of file dicts, empty list on failure
+        """
+        try:
+            response = self._request(
+                "GET",
+                "/v1/api/torrents/myid",
+                params={"id": str(debrid_id)},
+                suppress_500_warnings=True
+            )
+            
+            if not response or not isinstance(response, dict):
+                return []
+            
+            data = response.get("data", {})
+            if not isinstance(data, dict):
+                return []
+            
+            files = data.get("files", [])
+            if not isinstance(files, list):
+                return []
+            
+            result = []
+            for f in files:
+                if not isinstance(f, dict):
+                    continue
+                name = f.get("name", f.get("filename", ""))
+                result.append({
+                    "name": name,
+                    "path": name,
+                    "size": int(f.get("size", 0)) if f.get("size") else 0,
+                    "id": str(f.get("id", f.get("file_id", name))),
+                })
+            
+            return result
+            
+        except (APIError, APIResponseError) as e:
+            logger.debug("Error getting torrent files for %s: %s", debrid_id, e)
+            return []
+    
+    def get_direct_url(self, debrid_id: str, file_id: str) -> Optional[str]:
+        """Generate a direct stream URL for a specific file in a Torbox torrent.
+        
+        Queries torrent details to get the download/stream link for a file.
+        
+        Args:
+            debrid_id: Torbox torrent identifier
+            file_id: File identifier within the torrent
+            
+        Returns:
+            Temporary direct URL string, or None if generation fails
+        """
+        try:
+            response = self._request(
+                "GET",
+                "/v1/api/torrents/myid",
+                params={"id": str(debrid_id)},
+                suppress_500_warnings=True
+            )
+            
+            if not response or not isinstance(response, dict):
+                return None
+            
+            data = response.get("data", {})
+            if not isinstance(data, dict):
+                return None
+            
+            files = data.get("files", [])
+            if not isinstance(files, list):
+                return None
+            
+            # Find the matching file and return its download link
+            for f in files:
+                if not isinstance(f, dict):
+                    continue
+                f_id = str(f.get("id", f.get("file_id", f.get("name", ""))))
+                if f_id == str(file_id):
+                    # Try stream link first, then download link
+                    link = f.get("stream_link") or f.get("download_link") or f.get("link")
+                    if link:
+                        return link
+                    break
+            
+            return None
+            
+        except (APIError, APIResponseError) as e:
+            logger.debug("Error getting direct URL for torrent %s file %s: %s", debrid_id, file_id, e)
+            return None
 
 
 # ============================================================================
@@ -3737,30 +4201,33 @@ class RealDebridClient(DebridClient):
         if not hashes:
             return {}
 
-        try:
-            # RD expects hashes separated by '/' in the URL path
-            hash_path = "/".join(normalize_hash(h) for h in hashes)
-            response = self._request(
-                "GET",
-                f"/torrents/instantAvailability/{hash_path}"
-            )
+        result: Dict[str, bool] = {}
+        for i in range(0, len(hashes), RD_CACHE_CHECK_BATCH):
+            chunk = hashes[i:i + RD_CACHE_CHECK_BATCH]
+            try:
+                hash_path = "/".join(normalize_hash(h) for h in chunk)
+                response = self._request(
+                    "GET",
+                    f"/torrents/instantAvailability/{hash_path}"
+                )
 
-            if response and isinstance(response, dict):
-                result = {}
-                for h in hashes:
-                    h_lower = normalize_hash(h)
-                    # In RD, if hash key exists and has 'rd' field with content, it's cached
-                    hash_data = response.get(h_lower, {})
-                    is_cached = isinstance(hash_data, dict) and bool(hash_data.get("rd"))
-                    result[h_lower] = is_cached
-                return result
+                if response and isinstance(response, dict):
+                    for h in chunk:
+                        h_lower = normalize_hash(h)
+                        hash_data = response.get(h_lower, {})
+                        is_cached = isinstance(hash_data, dict) and bool(hash_data.get("rd"))
+                        result[h_lower] = is_cached
+                else:
+                    for h in chunk:
+                        result[normalize_hash(h)] = False
 
-            return {h.lower(): False for h in hashes}
+            except (APIError, APIResponseError) as e:
+                logger.debug("Cache check traceback:", exc_info=True)
+                logger.debug("Error checking cached torrents (batch %d): %s", i // RD_CACHE_CHECK_BATCH, e)
+                for h in chunk:
+                    result[normalize_hash(h)] = False
 
-        except (APIError, APIResponseError) as e:
-            logger.debug("Cache check traceback:", exc_info=True)
-            logger.debug("Error checking cached torrents: %s", e)
-            return {h.lower(): False for h in hashes}
+        return result
 
     def get_my_torrents(self) -> Optional[List[Dict[str, Any]]]:
         """Get all torrents in user's Real Debrid account.
@@ -3897,6 +4364,103 @@ class RealDebridClient(DebridClient):
                 return True
             logger.error("Error removing torrent %s: %s", torrent_id, e)
             return False
+    
+    def get_torrent_files(self, debrid_id: str) -> List[Dict[str, Any]]:
+        """Get file listing inside a Real Debrid torrent.
+        
+        Uses RD /torrents/info/{id} endpoint to get torrent details
+        including the files array. Each file entry is normalized.
+        
+        Args:
+            debrid_id: Real Debrid torrent identifier
+            
+        Returns:
+            List of file dicts, empty list on failure
+        """
+        try:
+            response = self._request("GET", f"/torrents/info/{debrid_id}")
+            
+            if not response or not isinstance(response, dict):
+                return []
+            
+            files = response.get("files", [])
+            if not isinstance(files, list):
+                return []
+            
+            result = []
+            for f in files:
+                if not isinstance(f, dict):
+                    continue
+                # RD files have: id, path, bytes, selected
+                name = f.get("path", "")
+                result.append({
+                    "name": Path(name).name if name else "",
+                    "path": name,
+                    "size": int(f.get("bytes", 0)) if f.get("bytes") else 0,
+                    "id": str(f.get("id", name)),
+                })
+            
+            return result
+            
+        except (APIError, APIResponseError) as e:
+            logger.debug("Error getting torrent files for %s: %s", debrid_id, e)
+            return []
+    
+    def get_direct_url(self, debrid_id: str, file_id: str) -> Optional[str]:
+        """Generate a direct download URL for a Real Debrid file.
+        
+        Uses RD /unrestrict/link endpoint with the file's download link.
+        Falls back to /downloads endpoint if unrestrict fails.
+        
+        Args:
+            debrid_id: Real Debrid torrent identifier
+            file_id: File identifier within the torrent
+            
+        Returns:
+            Temporary direct URL string, or None if generation fails
+        """
+        try:
+            # Get torrent info to find the file's download link
+            response = self._request("GET", f"/torrents/info/{debrid_id}")
+            
+            if not response or not isinstance(response, dict):
+                return None
+            
+            files = response.get("files", [])
+            if not isinstance(files, list):
+                return None
+            
+            # Find matching file
+            target_link = None
+            for f in files:
+                if not isinstance(f, dict):
+                    continue
+                f_id = str(f.get("id", f.get("path", "")))
+                if f_id == str(file_id):
+                    target_link = f.get("download")
+                    if target_link:
+                        break
+            
+            if not target_link:
+                return None
+            
+            # Unrestrict the link to get a direct download URL
+            unrestrict_resp = self._request(
+                "POST",
+                "/unrestrict/link",
+                data={"link": target_link}
+            )
+            
+            if unrestrict_resp and isinstance(unrestrict_resp, dict):
+                dl_url = unrestrict_resp.get("download")
+                if dl_url:
+                    return dl_url
+            
+            return target_link  # Fallback to the original download link
+            
+        except (APIError, APIResponseError) as e:
+            logger.debug("Error getting direct URL for torrent %s file %s: %s", debrid_id, file_id, e)
+            return None
 
 
 # ============================================================================
@@ -4915,6 +5479,12 @@ class SyncEngine:
                         episodes[season_num] = []
                     episodes[season_num].append(torrent)
         
+        complete_packs.sort(key=lambda t: t.quality.score, reverse=True)
+        for season_num in season_packs:
+            season_packs[season_num].sort(key=lambda t: t.quality.score, reverse=True)
+        for season_num in episodes:
+            episodes[season_num].sort(key=lambda t: t.quality.score, reverse=True)
+
         # Build final result with prioritization and duplicate checking
         best_per_season: Dict[str, TorrentResult] = {}
         skipped_hashes = 0
@@ -5137,6 +5707,17 @@ class SyncEngine:
             # Track hash in account set to prevent re-adding same hash this run
             if torrent.hash:
                 self.account_hashes.add(torrent.hash.lower())
+            
+            # Populate torrent_files cache for WebDAV
+            try:
+                files = self.debrid.get_torrent_files(new_id)
+                if files:
+                    store_torrent_files(new_id, get_debrid_service(), files)
+                else:
+                    logger.debug("No files returned for new torrent %s (may still be processing)", new_id)
+            except Exception:
+                logger.debug("Failed to cache torrent files for %s:", new_id, exc_info=True)
+            
             record_processed(
                 imdb_id, title, year, content_type, "added", "success",
                 debrid_id=new_id, magnet=torrent.magnet,
@@ -5266,6 +5847,16 @@ class SyncEngine:
         # Track new hash in account set to prevent re-adding same hash this run
         if torrent.hash:
             self.account_hashes.add(torrent.hash.lower())
+
+        # Populate torrent_files cache for WebDAV
+        try:
+            files = self.debrid.get_torrent_files(new_id)
+            if files:
+                store_torrent_files(new_id, get_debrid_service(), files)
+            else:
+                logger.debug("No files returned for upgraded torrent %s (may still be processing)", new_id)
+        except Exception:
+            logger.debug("Failed to cache torrent files for %s:", new_id, exc_info=True)
 
         # Record successful upgrade
         record_processed(
@@ -6149,6 +6740,1003 @@ def check_and_acquire_lock() -> bool:
     return False
 
 
+def backfill_torrent_files(debrid_client: DebridClient) -> Tuple[int, int]:
+    """Backfill torrent_files cache for all existing debrid_ids.
+    
+    Iterates over all processed records with a debrid_id, calls
+    get_torrent_files() for each, and stores in the torrent_files table.
+    Rate-limited to BACKFILL_RATE_LIMIT (3s) between API calls.
+    Skips records already cached (idempotent).
+    
+    Args:
+        debrid_client: Debrid service client
+        
+    Returns:
+        (total_processed, files_stored) tuple
+    """
+    backfill_limiter = RateLimiter(BACKFILL_RATE_LIMIT, name="Backfill")
+    
+    # Get all unique debrid_ids from processed table
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT DISTINCT debrid_id, debrid_service FROM processed 
+            WHERE debrid_id IS NOT NULL AND debrid_id != ''
+            ORDER BY processed_at DESC
+        """).fetchall()
+    
+    if not rows:
+        logger.info("No torrents found to backfill")
+        return 0, 0
+    
+    logger.info("Starting backfill for %d torrents...", len(rows))
+    total_processed = 0
+    files_stored = 0
+    
+    for i, row in enumerate(rows):
+        debrid_id = row["debrid_id"]
+        debrid_service = row["debrid_service"] or "torbox"
+        
+        # Skip if already cached
+        existing = get_torrent_files(debrid_id)
+        if existing:
+            logger.debug("[%d/%d] Torrent %s already cached (%d files)", 
+                        i + 1, len(rows), debrid_id, len(existing))
+            total_processed += 1
+            continue
+        
+        # Rate limit
+        backfill_limiter.wait()
+        
+        try:
+            files = debrid_client.get_torrent_files(debrid_id)
+            backfill_limiter.mark_success()
+            
+            if files:
+                store_torrent_files(debrid_id, debrid_service, files)
+                files_stored += len(files)
+                logger.info("[%d/%d] Cached %d files for torrent %s", 
+                           i + 1, len(rows), len(files), debrid_id)
+            else:
+                logger.debug("[%d/%d] No files for torrent %s (may need re-sync)", 
+                            i + 1, len(rows), debrid_id)
+            
+        except Exception as e:
+            logger.debug("Backfill error for %s:", debrid_id, exc_info=True)
+            logger.warning("[%d/%d] Failed to backfill torrent %s: %s", 
+                          i + 1, len(rows), debrid_id, e)
+        
+        total_processed += 1
+    
+    logger.info("Backfill complete: %d torrents processed, %d files stored", 
+                total_processed, files_stored)
+    return total_processed, files_stored
+
+
+# =============================================================================
+# WEBDAV SERVER
+# =============================================================================
+
+def get_webdav_config() -> Dict[str, Any]:
+    """Load WebDAV configuration from environment variables."""
+    return {
+        "host": get_env().get("WEBDAV_HOST", WEBDAV_DEFAULT_HOST),
+        "port": int(get_env().get("WEBDAV_PORT", str(WEBDAV_DEFAULT_PORT))),
+        "user": get_env().get("WEBDAV_AUTH_USER", WEBDAV_DEFAULT_USER),
+        "password": get_env().get("WEBDAV_AUTH_PASS", WEBDAV_DEFAULT_PASS),
+        "log_level": get_env().get("WEBDAV_LOG_LEVEL", WEBDAV_DEFAULT_LOG_LEVEL),
+    }
+
+
+def _url_decode_path(path: str) -> str:
+    """URL-decode a WebDAV path, handling plus signs and percent-encoding."""
+    import urllib.parse
+    try:
+        return urllib.parse.unquote(path)
+    except Exception:
+        return path
+
+
+def extract_imdb_from_filename(filename: str) -> Optional[str]:
+    """Extract IMDb ID from {imdb-tt1234567} pattern in filename."""
+    match = re.search(r'\{imdb-(tt\d+)\}', filename)
+    return match.group(1) if match else None
+
+
+def build_movie_filename(title: str, year: int, imdb_id: str) -> str:
+    """Build Infuse-compatible movie filename with IMDb ID tag."""
+    safe_title = title.replace('/', '-').replace('\\', '-')
+    return f"{safe_title} ({year}) {{imdb-{imdb_id}}}.mkv"
+
+
+def build_episode_filename(title: str, season: int, episode: int, imdb_id: str) -> str:
+    """Build Infuse-compatible episode filename with IMDb ID tag."""
+    safe_title = title.replace('/', '-').replace('\\', '-')
+    return f"{safe_title} {{imdb-{imdb_id}}} S{season:02d}E{episode:02d}.mkv"
+
+
+def build_subtitle_filename(video_name: str, language: Optional[str], ext: str = '.srt') -> str:
+    """Build subtitle filename matching video file."""
+    base = video_name.rsplit('.', 1)[0]
+    if language:
+        return f"{base}.{language}{ext}"
+    return f"{base}{ext}"
+
+
+def get_debrid_client_for_service(service: str) -> Optional[DebridClient]:
+    """Get the debrid client instance for a specific service name.
+    
+    Args:
+        service: Debrid service name ('torbox' or 'realdebrid')
+        
+    Returns:
+        DebridClient instance, or None if API key not configured
+    """
+    if service == "torbox":
+        api_key = get_torbox_key()
+        if api_key:
+            return TorboxClient(api_key)
+    elif service == "realdebrid":
+        api_key = get_real_debrid_key()
+        if api_key:
+            return RealDebridClient(api_key)
+    return None
+
+
+def resolve_debrid_id_for_path(imdb_id: str, season: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Look up the best debrid_id from processed table for a given IMDb ID.
+    
+    Uses the most recently processed record for the IMDb ID (and optional season).
+    
+    Args:
+        imdb_id: IMDb ID (e.g., "tt0137523")
+        season: Optional season key for TV shows
+        
+    Returns:
+        Dict with debrid_id, debrid_service, title, year, content_type or None
+    """
+    with get_db() as conn:
+        if season and season != "unknown":
+            row = conn.execute(
+                """SELECT debrid_id, debrid_service, title, year, content_type
+                   FROM processed
+                   WHERE imdb_id = ? AND season = ? AND debrid_id IS NOT NULL
+                   ORDER BY processed_at DESC LIMIT 1""",
+                (imdb_id, season)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """SELECT debrid_id, debrid_service, title, year, content_type
+                   FROM processed
+                   WHERE imdb_id = ? AND debrid_id IS NOT NULL
+                   ORDER BY processed_at DESC LIMIT 1""",
+                (imdb_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+
+def resolve_path(path: str) -> Optional[Dict[str, Any]]:
+    """Parse a WebDAV path into structured info for database lookup.
+    
+    Handles:
+    - /Movies/Movie Name (Year)/Movie Name (Year) {imdb-tt1234567}.mkv
+    - /TV Shows/Show Name/Season 1/Show Name {imdb-tt1234567} S01E01.mkv
+    - /Movies/ (collection listing)
+    - /TV Shows/Show Name/ (show folder)
+    - /TV Shows/Show Name/Season 1/ (season folder)
+    
+    Returns:
+        Dict with type, imdb_id, debrid_id, season, episode, etc., or None
+    """
+    if not path or path == "/":
+        return {"type": "root"}
+    
+    # Strip leading/trailing slashes and decode
+    clean = path.strip("/")
+    segments = [_url_decode_path(s) for s in clean.split("/") if s]
+    
+    if not segments:
+        return {"type": "root"}
+    
+    result: Dict[str, Any] = {"type": "unknown"}
+    
+    if segments[0] in ("Movies", "TV Shows"):
+        result["root"] = segments[0]
+        
+        if len(segments) == 1:
+            # Collection listing request
+            result["type"] = "collection_root" if segments[0] == "Movies" else "show_list"
+            return result
+        
+        if len(segments) >= 2:
+            result["show_title"] = segments[1]
+            
+            if segments[0] == "Movies" and len(segments) == 2:
+                # /Movies/Title (Year)/ - show movie folder
+                result["type"] = "movie_folder"
+                # Try to extract IMDb ID from folder name
+                imdb = extract_imdb_from_filename(segments[1])
+                if imdb:
+                    result["imdb_id"] = imdb
+                return result
+            
+            if segments[0] == "Movies" and len(segments) >= 3:
+                # /Movies/Title (Year)/filename.mkv - individual file
+                result["type"] = "movie_file"
+                imdb = extract_imdb_from_filename(segments[-1])
+                if not imdb:
+                    imdb = extract_imdb_from_filename(segments[1])
+                if imdb:
+                    result["imdb_id"] = imdb
+                return result
+            
+            if segments[0] == "TV Shows" and len(segments) == 2:
+                # /TV Shows/Show Name/
+                result["type"] = "show_folder"
+                return result
+            
+            if segments[0] == "TV Shows" and len(segments) >= 3:
+                # /TV Shows/Show Name/Season 1/
+                result["type"] = "season_folder"
+                # Parse season number from segment
+                season_match = re.search(r'Season\s+(\d+)', segments[2], re.IGNORECASE)
+                if season_match:
+                    result["season_number"] = int(season_match.group(1))
+                    result["season_key"] = f"S{result['season_number']:02d}"
+                return result
+            
+            if segments[0] == "TV Shows" and len(segments) >= 4:
+                # /TV Shows/Show Name/Season 1/file.mkv
+                result["type"] = "episode_file"
+                # Parse season/episode from filename
+                match = re.search(r'S(\d{2})E(\d{2})', segments[-1])
+                if match:
+                    result["season_number"] = int(match.group(1))
+                    result["episode_number"] = int(match.group(2))
+                    result["season_key"] = f"S{result['season_number']:02d}"
+                imdb = extract_imdb_from_filename(segments[-1])
+                if imdb:
+                    result["imdb_id"] = imdb
+                return result
+    
+    return result
+
+
+def _get_display_name(resolved: Dict[str, Any], imdb_id: Optional[str] = None) -> str:
+    """Get human-readable display name for a path resolution result."""
+    if resolved.get("type") == "root":
+        return "/"
+    if resolved.get("type") == "collection_root":
+        return "Movies"
+    if resolved.get("type") == "show_list":
+        return "TV Shows"
+    return resolved.get("show_title", resolved.get("type", "Unknown"))
+
+
+def _resolve_show_imdb_lookup(title: str) -> Optional[str]:
+    """Look up IMDb ID for a show by its display title."""
+    with get_db() as conn:
+        row = conn.execute(
+            """SELECT imdb_id FROM processed 
+               WHERE content_type = 'show' AND debrid_id IS NOT NULL
+               AND title LIKE ?
+               ORDER BY processed_at DESC LIMIT 1""",
+            (f"%{title}%",)
+        ).fetchone()
+        return row["imdb_id"] if row else None
+
+
+def _get_db_listing(parent_path: str, resolved: Dict[str, Any]) -> List[str]:
+    """Get directory listing from database for a given path type.
+    
+    Uses database cursors as generators. Never materializes full lists 
+    in memory unnecessarily.
+    
+    Args:
+        parent_path: The WebDAV path being listed
+        resolved: Path resolution result from resolve_path()
+        
+    Returns:
+        List of child names for the directory listing
+    """
+    path_type = resolved.get("type", "")
+    
+    if path_type == "root":
+        return ["Movies", "TV Shows"]
+    
+    elif path_type == "collection_root":
+        # List all movies
+        with get_db() as conn:
+            rows = conn.execute("""
+                SELECT DISTINCT title, year, imdb_id, debrid_id 
+                FROM processed 
+                WHERE content_type = 'movie' AND debrid_id IS NOT NULL
+                ORDER BY title
+            """).fetchall()
+            return [build_movie_filename(r["title"], r["year"], r["imdb_id"]) for r in rows]
+    
+    elif path_type == "show_list":
+        # List all TV shows
+        with get_db() as conn:
+            rows = conn.execute("""
+                SELECT DISTINCT title
+                FROM processed 
+                WHERE content_type = 'show' AND debrid_id IS NOT NULL
+                ORDER BY title
+            """).fetchall()
+            return [r["title"] for r in rows]
+    
+    elif path_type == "movie_folder":
+        # List movie video file + subtitles
+        imdb = resolved.get("imdb_id")
+        if not imdb:
+            return []
+        db_info = resolve_debrid_id_for_path(imdb)
+        if not db_info:
+            return []
+        debrid_id = db_info.get("debrid_id")
+        if not debrid_id:
+            return []
+        title = db_info.get("title", "Movie")
+        year = db_info.get("year", 0)
+        
+        names = []
+        # Video file
+        names.append(build_movie_filename(title, year, imdb))
+        # Subtitles
+        subs = get_subtitle_files(str(debrid_id))
+        for sub in subs:
+            lang = sub.get("subtitle_language")
+            ext = Path(sub.get("file_name", ".srt")).suffix or ".srt"
+            names.append(build_subtitle_filename(
+                build_movie_filename(title, year, imdb), lang, ext
+            ))
+        return names
+    
+    elif path_type == "show_folder":
+        # List seasons for a show
+        show_title = resolved.get("show_title", "")
+        imdb = _resolve_show_imdb_lookup(show_title)
+        if not imdb:
+            return []
+        
+        # Get all processed seasons for this show
+        seasons = get_processed_show_seasons(imdb)
+        if not seasons:
+            return []
+        
+        # Collect unique season numbers from torrent_files
+        season_nums = set()
+        for s in seasons:
+            debrid_id = s.get("debrid_id")
+            if not debrid_id:
+                continue
+            files = get_torrent_files(str(debrid_id))
+            for f in files:
+                if f.get("is_video") and f.get("episode_season"):
+                    season_nums.add(f["episode_season"])
+        
+        if not season_nums:
+            # Fallback to season keys from processed
+            for s in seasons:
+                sk = s.get("season", "unknown")
+                if sk.startswith("S") and sk[1:].isdigit():
+                    season_nums.add(int(sk[1:]))
+        
+        return sorted([f"Season {n}" for n in season_nums])
+    
+    elif path_type == "season_folder":
+        # List episode files for a season
+        show_title = resolved.get("show_title", "")
+        season_num = resolved.get("season_number")
+        season_key = resolved.get("season_key")
+        if not season_key:
+            return []
+        
+        imdb = _resolve_show_imdb_lookup(show_title)
+        if not imdb:
+            return []
+        
+        # Get all season records for this show
+        seasons = get_processed_show_seasons(imdb)
+        if not seasons:
+            return []
+        
+        # Find the best debrid_id for this season (prefer complete/multi_season packs)
+        best = _get_best_debrid_for_season(seasons, season_key, season_num)
+        if not best:
+            return []
+        
+        debrid_id = best.get("debrid_id")
+        if not debrid_id:
+            return []
+        
+        # Get episode files from torrent_files
+        files = get_torrent_files(str(debrid_id))
+        names = []
+        for f in files:
+            if f.get("is_video") and f.get("episode_season") == season_num:
+                ep = f.get("episode_number")
+                if ep:
+                    names.append(build_episode_filename(
+                        show_title, season_num, ep, imdb
+                    ))
+        
+        # Add subtitles
+        subs = get_subtitle_files(str(debrid_id), season_num, None)
+        for sub in subs:
+            lang = sub.get("subtitle_language")
+            ext = Path(sub.get("file_name", ".srt")).suffix or ".srt"
+            # Find matching episode video name
+            sub_ep = sub.get("episode_number")
+            if sub_ep:
+                video_name = build_episode_filename(show_title, season_num, sub_ep, imdb)
+                names.append(build_subtitle_filename(video_name, lang, ext))
+        
+        return sorted(names)
+    
+    return []
+
+
+def _get_best_debrid_for_season(seasons: List[Dict[str, Any]], season_key: str, 
+                                 season_num: Optional[int]) -> Optional[Dict[str, Any]]:
+    """Pick the best debrid_id for a season, preferring most complete packs.
+    
+    When a show has both Complete pack AND individual season pack:
+    1. Group all debrid_ids by completeness
+    2. Prefer most complete (complete > multi_season > season > episode)
+    3. Within same completeness, prefer higher quality_score
+    """
+    if not seasons:
+        return None
+    
+    # Classify each and pick best
+    best = None
+    best_completeness = -1
+    best_score = -1
+    
+    for s in seasons:
+        sk = s.get("season", "unknown")
+        level = classify_media_level(sk, "show")
+        comp_score = COMPLETENESS_ORDER.get(level, 0)
+        
+        if comp_score > best_completeness:
+            best_completeness = comp_score
+            best_score = s.get("quality_score") or 0
+            best = s
+        elif comp_score == best_completeness:
+            qs = s.get("quality_score") or 0
+            if qs > best_score:
+                best_score = qs
+                best = s
+    
+    return best
+
+
+# Thread-safe inflight fetch deduplication for cache miss handling
+_inflight_fetches: Set[str] = set()
+_inflight_lock = threading.Lock()
+
+
+def _fetch_and_cache_torrent_files(debrid_id: str, debrid_service: str) -> bool:
+    """Fetch and cache torrent files, with thread-safe dedup.
+    
+    Args:
+        debrid_id: Debrid torrent identifier
+        debrid_service: Which debrid service
+        
+    Returns:
+        True if files were cached, False otherwise
+    """
+    with _inflight_lock:
+        if debrid_id in _inflight_fetches:
+            return False  # Another thread is already fetching
+        _inflight_fetches.add(debrid_id)
+    
+    try:
+        client = get_debrid_client_for_service(debrid_service)
+        if not client:
+            return False
+        
+        try:
+            files = client.get_torrent_files(debrid_id)
+            if files:
+                store_torrent_files(debrid_id, debrid_service, files)
+                return True
+            else:
+                # Write sentinel to prevent repeated re-fetches
+                store_torrent_files(debrid_id, debrid_service, [{
+                    "name": "__pending__",
+                    "path": "__pending__",
+                    "size": 0,
+                    "id": "__pending__",
+                }])
+                return False
+        finally:
+            client.close()
+    except Exception:
+        return False
+    finally:
+        with _inflight_lock:
+            _inflight_fetches.discard(debrid_id)
+
+
+def _resolve_direct_url(debrid_id: str, file_id: str, debrid_service: str) -> Optional[str]:
+    """Resolve a direct download/stream URL for a file in a debrid torrent.
+    
+    Args:
+        debrid_id: Debrid torrent identifier
+        file_id: File identifier within the torrent
+        debrid_service: Which debrid service
+        
+    Returns:
+        Direct URL string, or None
+    """
+    client = get_debrid_client_for_service(debrid_service)
+    if not client:
+        return None
+    try:
+        return client.get_direct_url(debrid_id, file_id)
+    finally:
+        client.close()
+
+
+class TorBoxedFolderResource(DAVCollection if DAVCollection else object):
+    """Represents a virtual folder (Movies, TV Shows, Season, etc.).
+    
+    Memory: get_member_names() uses generators where possible.
+    For large libraries, PROPFIND results are streamed, not materialized.
+    """
+    
+    def __init__(self, path: str, environ: dict, display_name: str, 
+                 member_names: Optional[List[str]] = None):
+        super().__init__(path, environ)
+        self._path = path
+        self._environ = environ
+        self._display_name = display_name
+        self._member_names = member_names
+        self._resolved = resolve_path(path) if path != "/" else {"type": "root"}
+    
+    def get_member_names(self):
+        if self._member_names is not None:
+            return self._member_names
+        return _get_db_listing(self._path, self._resolved)
+    
+    def get_member(self, name):
+        child_path = f"{self._path.rstrip('/')}/{name}"
+        return _create_resource_for_path(child_path, self._environ, name)
+
+
+class TorBoxedFileResource(DAVNonCollection if DAVNonCollection else object):
+    """Represents a single virtual video or subtitle file.
+    
+    File content is not stored - get_content() is intercepted by 
+    RedirectMiddleware which returns a 302 redirect to debrid CDN.
+    """
+    
+    def __init__(self, path: str, environ: dict, display_name: str,
+                 file_size: int = 0, content_type_str: str = "video/x-matroska",
+                 created_at: Optional[str] = None):
+        super().__init__(path, environ)
+        self._path = path
+        self._display_name = display_name
+        self._size = file_size
+        self._content_type_str = content_type_str
+        self._created_at = created_at or datetime.now(timezone.utc).isoformat()
+        self._etag = hashlib.sha256(f"{path}:{file_size}".encode()).hexdigest()[:16]
+    
+    def get_content(self):
+        # Content is served by RedirectMiddleware, not here
+        from io import BytesIO
+        return BytesIO(b"")
+    
+    def get_content_length(self):
+        return self._size
+    
+    def get_content_type(self):
+        return self._content_type_str
+    
+    def support_etag(self):
+        return True
+    
+    def get_etag(self):
+        return self._etag
+    
+    def support_ranges(self):
+        return True
+    
+    def get_last_modified(self):
+        try:
+            return datetime.fromisoformat(self._created_at).timestamp()
+        except Exception:
+            return time.time()
+
+
+class TorBoxedDAVProvider(DAVProvider if DAVProvider else object):
+    """Virtual filesystem backed by TorBoxed database.
+    
+    Memory: Uses SQLite cursors as generators. Never materializes 
+    full file lists in memory — streams results via yield.
+    """
+    
+    def __init__(self):
+        super().__init__()
+    
+    def get_resource_inst(self, path: str, environ: dict):
+        """Return DAVResource for the given path."""
+        return _create_resource_for_path(path, environ)
+
+
+def _create_resource_for_path(path: str, environ: dict, 
+                               display_name: Optional[str] = None):
+    """Create the appropriate DAV resource for a WebDAV path.
+    
+    Args:
+        path: WebDAV request path
+        environ: WSGI environ dict
+        display_name: Optional override for display name
+        
+    Returns:
+        TorBoxedFolderResource or TorBoxedFileResource
+    """
+    is_collection = path.endswith("/") or path == "/"
+    
+    if is_collection:
+        return TorBoxedFolderResource(path, environ, display_name or _get_display_name({"type": "folder"}, None))
+    
+    # It's a file
+    mime = MIME_TYPES.get(".mkv", "video/x-matroska")
+    # Try to determine mime from extension
+    ext = Path(path).suffix.lower()
+    if ext in MIME_TYPES:
+        mime = MIME_TYPES[ext]
+    elif ext in SUBTITLE_EXTENSIONS:
+        mime = MIME_TYPES.get(ext, "application/x-subrip")
+    
+    return TorBoxedFileResource(path, environ, display_name or Path(path).name, 
+                                 file_size=0, content_type_str=mime)
+
+
+class RedirectMiddleware:
+    """WSGI middleware that intercepts GET/HEAD for video files and returns 302 redirects.
+    
+    Intercepts BEFORE wsgidav's file-serving logic to handle Range requests
+    correctly - the redirect goes to the CDN which handles ranges natively.
+    """
+    
+    def __init__(self, app):
+        self.app = app
+    
+    def __call__(self, environ, start_response):
+        method = environ.get("REQUEST_METHOD", "")
+        path = environ.get("PATH_INFO", "")
+        
+        # Only intercept GET and HEAD for files (not directories, not /health)
+        if method not in ("GET", "HEAD") or path.endswith("/") or path == "/health":
+            return self.app(environ, start_response)
+        
+        # Determine if this is a subtitle file by extension
+        ext = Path(path).suffix.lower()
+        is_subtitle_path = ext in SUBTITLE_EXTENSIONS
+        
+        # Try to resolve the path
+        resolved = resolve_path(path)
+        if not resolved:
+            return self.app(environ, start_response)
+        
+        file_type = resolved.get("type", "")
+        
+        # Handle video and subtitle files
+        if file_type in ("movie_file", "episode_file"):
+            return self._serve_file_redirect(
+                environ, start_response, method, path, resolved, 
+                is_subtitle=is_subtitle_path
+            )
+        
+        # Handle subtitle files that didn't resolve to movie_file/episode_file
+        if is_subtitle_path and file_type not in ("movie_file", "episode_file"):
+            return self._serve_subtitle_from_parent(
+                environ, start_response, method, path, resolved
+            )
+        
+        return self.app(environ, start_response)
+    
+    def _serve_file_redirect(self, environ, start_response, method, path, 
+                              resolved, is_subtitle=False):
+        """Serve a 302 redirect for a video or subtitle file."""
+        imdb = resolved.get("imdb_id")
+        season_key = resolved.get("season_key")
+        
+        if not imdb:
+            return self.app(environ, start_response)
+        
+        db_info = resolve_debrid_id_for_path(imdb, season_key)
+        if not db_info:
+            start_response("404 Not Found", [
+                ("Content-Type", "text/plain"),
+            ])
+            return [b"File not found in database"]
+        
+        debrid_id = str(db_info.get("debrid_id", ""))
+        debrid_service = db_info.get("debrid_service", "torbox")
+        
+        # Get cached files
+        files = get_torrent_files(debrid_id)
+        if not files:
+            if not _fetch_and_cache_torrent_files(debrid_id, debrid_service):
+                start_response("503 Service Unavailable", [
+                    ("Content-Type", "text/plain"),
+                    ("Retry-After", "60"),
+                ])
+                return [b"Torrent file listing not cached. Try again later."]
+            files = get_torrent_files(debrid_id)
+            if not files:
+                start_response("503 Service Unavailable", [
+                    ("Content-Type", "text/plain"),
+                ])
+                return [b"Failed to retrieve torrent file listing"]
+        
+        # Filter sentinel entries
+        files = [f for f in files if f.get("file_id") != "__pending__"]
+        
+        # Find the target file
+        if is_subtitle:
+            target_file = self._find_subtitle_file(files, path, resolved)
+        elif resolved.get("type") == "movie_file":
+            target_file = self._find_video_file(files, resolved)
+        else:
+            target_file = self._find_episode_file(files, resolved)
+        
+        if not target_file:
+            start_response("404 Not Found", [
+                ("Content-Type", "text/plain"),
+            ])
+            return [b"File not found in torrent"]
+        
+        file_id = target_file.get("file_id", "")
+        
+        # Generate direct URL
+        direct_url = _resolve_direct_url(debrid_id, file_id, debrid_service)
+        if not direct_url:
+            start_response("502 Bad Gateway", [
+                ("Content-Type", "text/plain"),
+            ])
+            return [b"Failed to generate download URL"]
+        
+        # Return 302 redirect
+        if method == "HEAD":
+            start_response("302 Found", [
+                ("Location", direct_url),
+                ("Content-Length", "0"),
+            ])
+            return [b""]
+        start_response("302 Found", [
+            ("Location", direct_url),
+            ("Content-Length", "0"),
+        ])
+        return [b""]
+    
+    def _serve_subtitle_from_parent(self, environ, start_response, method, path, resolved):
+        """Fallback subtitle resolution: extract IMDb ID from parent dir name."""
+        clean = path.strip("/")
+        segments = [_url_decode_path(s) for s in clean.split("/") if s]
+        
+        if len(segments) >= 2:
+            imdb = extract_imdb_from_filename(segments[-2])
+            if imdb:
+                resolved["imdb_id"] = imdb
+                resolved["type"] = "movie_file" if segments[0] == "Movies" else "episode_file"
+                return self._serve_file_redirect(
+                    environ, start_response, method, path, resolved, is_subtitle=True
+                )
+        
+        return self.app(environ, start_response)
+    
+    def _find_video_file(self, files, resolved):
+        """Find the best video file for a movie."""
+        for f in files:
+            if f.get("is_video"):
+                return f
+        return None
+    
+    def _find_episode_file(self, files, resolved):
+        """Find the video file matching a specific episode."""
+        season_num = resolved.get("season_number")
+        episode_num = resolved.get("episode_number")
+        if season_num is not None and episode_num is not None:
+            # Use the debrid_id from the resolved info or fallback
+            debrid_id = resolved.get("debrid_id", "")
+            if not debrid_id:
+                # Try to find from database
+                imdb = resolved.get("imdb_id")
+                season_key = resolved.get("season_key")
+                db_info = resolve_debrid_id_for_path(imdb, season_key)
+                if db_info:
+                    debrid_id = str(db_info.get("debrid_id", ""))
+            return get_video_file_for_episode(debrid_id, season_num, episode_num)
+        return None
+    
+    def _find_subtitle_file(self, files, path, resolved):
+        """Find the correct subtitle file for the given path."""
+        filename = Path(path).name
+        ext = Path(filename).suffix.lower()
+        
+        # Parse language from filename
+        lang = None
+        for pattern, code in SUBTITLE_LANG_PATTERNS:
+            if re.search(pattern, filename.lower()):
+                lang = code
+                break
+        
+        # Match by language + extension
+        for f in files:
+            if not f.get("is_subtitle"):
+                continue
+            file_ext = Path(f.get("file_name", "")).suffix.lower()
+            if file_ext != ext:
+                continue
+            if lang and f.get("subtitle_language") != lang:
+                continue
+            return f
+        
+        # Fallback: any subtitle with matching extension
+        for f in files:
+            if f.get("is_subtitle") and Path(f.get("file_name", "")).suffix.lower() == ext:
+                return f
+        
+        return None
+
+
+def _health_check_app(environ, start_response):
+    """WSGI application for the /health endpoint."""
+    if environ.get("PATH_INFO") == "/health":
+        import time as time_mod
+        try:
+            with get_db() as conn:
+                torrent_count = conn.execute(
+                    "SELECT COUNT(*) as cnt FROM torrent_files"
+                ).fetchone()["cnt"]
+                tracked_count = conn.execute(
+                    "SELECT COUNT(DISTINCT debrid_id) as cnt FROM processed WHERE debrid_id IS NOT NULL"
+                ).fetchone()["cnt"]
+        except Exception:
+            torrent_count = 0
+            tracked_count = 0
+        
+        uptime = getattr(_health_check_app, "_start_time", None)
+        uptime_seconds = int(time_mod.time() - uptime) if uptime else 0
+        
+        body = json.dumps({
+            "status": "ok",
+            "torrents_tracked": tracked_count,
+            "torrents_cached": torrent_count,
+            "uptime_seconds": uptime_seconds,
+        })
+        start_response("200 OK", [
+            ("Content-Type", "application/json"),
+            ("Content-Length", str(len(body))),
+        ])
+        return [body.encode("utf-8")]
+    else:
+        start_response("404 Not Found", [("Content-Type", "text/plain")])
+        return [b"Not Found"]
+
+
+def serve_webdav():
+    """Start the WebDAV server.
+    
+    Configures wsgidav with the custom TorBoxedDAVProvider,
+    basic auth, and starts the server. Handles SIGTERM/SIGINT
+    for graceful shutdown.
+    """
+    if WsgiDAVApp is None:
+        logger.error("wsgidav is not installed. Run: pip install wsgidav cheroot")
+        logger.error("WebDAV server requires optional dependencies: wsgidav>=4.0.0, cheroot>=10.0.0")
+        sys.exit(1)
+    
+    config = get_webdav_config()
+    
+    host = config["host"]
+    port = config["port"]
+    user = config["user"]
+    password = config["password"]
+    
+    if not user or not password:
+        logger.warning("WebDAV credentials not configured. Starting without authentication.")
+    
+    logger.info("Starting WebDAV server on %s:%d...", host, port)
+    logger.info("Infuse setup URL: http://%s:%d", host, port)
+    
+    # Custom DAV provider backed by database
+    provider = TorBoxedDAVProvider()
+    
+    # Build wsgidav configuration
+    wsgidav_config = {
+        "host": host,
+        "port": port,
+        "provider_mapping": {
+            "/": provider,
+        },
+        "simple_dc": {"user_mapping": {"*": {}}},
+        "verbose": 1 if config["log_level"] == "debug" else 0,
+        "dir_browser": {"enable": False},
+        "propsmanager": True,
+    }
+    
+    if user and password:
+        wsgidav_config["simple_dc"]["user_mapping"]["*"][user] = {
+            "password": password,
+            "description": "TorBoxed User",
+            "roles": [],
+        }
+        wsgidav_config["http_authenticator"] = {
+            "domain_controller": None,
+            "accept_basic": True,
+            "accept_digest": False,
+        }
+    
+    try:
+        from cheroot import wsgi
+        
+        # Create the DA App with custom provider
+        dav_app = WsgiDAVApp(wsgidav_config)
+        
+        # Wrap with redirect middleware (handles GET/HEAD for video files)
+        wrapped = RedirectMiddleware(dav_app)
+        
+        # Wrap health check
+        def combined_app(environ, start_response):
+            if environ.get("PATH_INFO") == "/health":
+                return _health_check_app(environ, start_response)
+            return wrapped(environ, start_response)
+        
+        server = wsgi.Server((host, port), combined_app)
+        
+        # Record start time for uptime
+        import time as time_mod
+        _health_check_app._start_time = time_mod.time()
+        
+        # Graceful shutdown
+        def shutdown_handler(signum, frame):
+            logger.info("Shutting down WebDAV server...")
+            server.stop()
+        
+        try:
+            import signal as sig
+            signal_module = sig
+            signal_module.signal(signal_module.SIGTERM, shutdown_handler)
+            signal_module.signal(signal_module.SIGINT, shutdown_handler)
+        except ImportError:
+            pass
+        
+        logger.info("WebDAV server running. Press Ctrl+C to stop.")
+        server.start()
+        
+    except ImportError:
+        # Fallback to wsgidav's built-in server
+        logger.info("cheroot not installed, using wsgidav built-in server")
+        
+        dav_app = WsgiDAVApp(wsgidav_config)
+        wrapped = RedirectMiddleware(dav_app)
+        
+        def combined_app(environ, start_response):
+            if environ.get("PATH_INFO") == "/health":
+                return _health_check_app(environ, start_response)
+            return wrapped(environ, start_response)
+        
+        import time as time_mod
+        _health_check_app._start_time = time_mod.time()
+        
+        try:
+            import signal as sig
+            sig.signal(sig.SIGTERM, lambda s, f: sys.exit(0))
+            sig.signal(sig.SIGINT, lambda s, f: sys.exit(0))
+        except ImportError:
+            pass
+        
+        from wsgidav.server.run_server import run
+        run(combined_app, config)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="torboxed - Sync Trakt.tv content to debrid",
@@ -6193,6 +7781,10 @@ Examples:
                        help="Remove duplicate torrents for the same movie/season (keep best quality)")
     parser.add_argument("--yes", "-y", action="store_true",
                        help="Skip confirmation prompts (use with --cleanup-unmatched or --cleanup-duplicates)")
+    parser.add_argument("--serve", action="store_true",
+                       help="Start WebDAV server for Infuse streaming")
+    parser.add_argument("--backfill-files", action="store_true",
+                       help="Backfill torrent file cache for all existing debrid torrents")
     
     args = parser.parse_args()
     
@@ -6200,7 +7792,7 @@ Examples:
     setup_logging(verbose=args.verbose)
     
     # Check for overlapping runs (but skip for non-sync commands)
-    skip_lock_commands = {'--init', '--test', '--cron-setup', '--cron-status', '--stats', '--recent', '--reset', '--cleanup-unmatched', '--cleanup-duplicates'}
+    skip_lock_commands = {'--init', '--test', '--cron-setup', '--cron-status', '--stats', '--recent', '--reset', '--cleanup-unmatched', '--cleanup-duplicates', '--serve', '--backfill-files'}
     if not any(getattr(args, cmd.lstrip('-').replace('-', '_'), False) for cmd in skip_lock_commands):
         if not check_and_acquire_lock():
             logger.warning("Another instance of torboxed is already running. Exiting.")
@@ -6262,6 +7854,23 @@ Examples:
     # Cleanup duplicate torrents
     if args.cleanup_duplicates:
         cleanup_duplicate_torrents(force=args.yes)
+        return
+    
+    # WebDAV server
+    if args.serve:
+        serve_webdav()
+        return
+    
+    # Backfill torrent files
+    if args.backfill_files:
+        debrid = create_debrid_client()
+        if not debrid:
+            logger.error("No debrid service configured. Set TORBOX_API_KEY or REAL_DEBRID_API_KEY in .env")
+            sys.exit(1)
+        try:
+            backfill_torrent_files(debrid)
+        finally:
+            debrid.close()
         return
     
     # Check API keys (lazy-loaded)

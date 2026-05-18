@@ -60,3 +60,6 @@ data/
 # Agent-specific files (do not commit to remote)
 TODO.md
 AGENTS.md
+
+# Docs directory
+docs/
