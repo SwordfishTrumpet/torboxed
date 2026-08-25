@@ -6641,9 +6641,11 @@ def _setup_telegram_interactive():
         logger.info("  - Content is upgraded to better quality")
     else:
         logger.error("Failed to send test message. Please check your bot token and chat ID.")
-        logger.info("You can try setting this up later by adding these to your .env file:")
-        logger.info(f"  TELEGRAM_BOT_TOKEN={bot_token}")
-        logger.info(f"  TELEGRAM_CHAT_ID={chat_id}")
+        # VULN-005/#8: never echo the bot token (or chat ID) into the logs —
+        # log files are frequently shared in bug reports.
+        logger.info("You can re-run 'uv run torboxed.py --init' to try Telegram")
+        logger.info("setup again, or add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
+        logger.info("to your .env file manually once credentials are verified.")
 
 
 def show_cron_status():
