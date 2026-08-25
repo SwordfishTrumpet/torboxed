@@ -6595,5 +6595,155 @@ class TestWebDAVAndTorrentFiles(unittest.TestCase):
         self.assertEqual(result, "tt9999999")
 
 
+class TestRedirectMiddlewareAuth(unittest.TestCase):
+    """RedirectMiddleware must enforce Basic auth before serving 302 redirects.
+
+    Regression tests for the authentication bypass where intercepted GET/HEAD
+    requests were redirected to debrid CDN URLs without any credential check.
+    """
+
+    MOVIE_PATH = "/Movies/Fight Club (1999)/Fight Club (1999) {imdb-tt0137523}.mkv"
+    SUBTITLE_FALLBACK_PATH = "/TV Shows/Breaking Bad/subtitles.en.srt"
+    CDN_URL = "https://cdn.example.com/file.mkv"
+
+    def setUp(self):
+        import torboxed
+        self.torboxed = torboxed
+        self.middleware = torboxed.RedirectMiddleware(self._record_app)
+        self.app_calls = []
+        self.start_calls = []
+        self.body = None
+
+    def _record_app(self, environ, start_response):
+        """Downstream wsgidav app: records that a request fell through."""
+        self.app_calls.append(environ.get("PATH_INFO"))
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"dav-app"]
+
+    def _start_response(self, status, headers):
+        self.start_calls.append((status, list(headers)))
+
+    def _basic_header(self, user="admin", password="secret"):
+        import base64
+        encoded = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+        return f"Basic {encoded}"
+
+    def _environ(self, path, authorization=None, method="GET"):
+        environ = {
+            "REQUEST_METHOD": method,
+            "PATH_INFO": path,
+        }
+        if authorization is not None:
+            environ["HTTP_AUTHORIZATION"] = authorization
+        return environ
+
+    def _patch_env(self, extra=None):
+        env = {"WEBDAV_AUTH_USER": "admin", "WEBDAV_PASS": "", "WEBDAV_AUTH_PASS": "secret"}
+        if extra:
+            env.update(extra)
+        return patch.object(self.torboxed, "get_env", return_value=env)
+
+    def test_unauthenticated_get_movie_path_returns_401(self):
+        """Unauthenticated GET on a valid movie path returns 401, not 302."""
+        with self._patch_env():
+            result = self.middleware(self._environ(self.MOVIE_PATH), self._start_response)
+        status, headers = self.start_calls[0]
+        self.assertEqual(status, "401 Unauthorized")
+        self.assertIn(("WWW-Authenticate", 'Basic realm="TorBoxed"'), headers)
+        self.assertEqual(result, [b"Unauthorized"])
+        self.assertEqual(self.app_calls, [], "request must not reach downstream app or redirect")
+
+    def test_unauthenticated_head_movie_path_returns_401(self):
+        """Unauthenticated HEAD on a valid movie path returns 401."""
+        with self._patch_env():
+            self.middleware(self._environ(self.MOVIE_PATH, method="HEAD"), self._start_response)
+        self.assertEqual(self.start_calls[0][0], "401 Unauthorized")
+        self.assertEqual(self.app_calls, [])
+
+    def test_wrong_credentials_return_401(self):
+        """Basic auth with wrong password returns 401."""
+        header = self._basic_header(user="admin", password="wrong")
+        with self._patch_env():
+            self.middleware(self._environ(self.MOVIE_PATH, authorization=header), self._start_response)
+        self.assertEqual(self.start_calls[0][0], "401 Unauthorized")
+        self.assertEqual(self.app_calls, [])
+
+    def test_malformed_authorization_header_returns_401(self):
+        """Malformed Authorization headers are rejected, never crash through."""
+        for header in ("Bearer abc123", "Basic !!!!not-base64!!!", "Basic"):
+            self.setUp()
+            with self._patch_env():
+                self.middleware(
+                    self._environ(self.MOVIE_PATH, authorization=header),
+                    self._start_response,
+                )
+            self.assertEqual(self.start_calls[0][0], "401 Unauthorized", f"header={header!r}")
+            self.assertEqual(self.app_calls, [])
+
+    @patch("torboxed._resolve_direct_url")
+    @patch("torboxed.get_torrent_files")
+    @patch("torboxed.resolve_debrid_id_for_path")
+    def test_authenticated_get_returns_302_with_cdn_url(self, mock_db_info, mock_files, mock_url):
+        """Authenticated GET on a movie path still returns 302 to the CDN URL."""
+        mock_db_info.return_value = {"debrid_id": "deb123", "debrid_service": "torbox"}
+        mock_files.return_value = [{"file_id": "f1", "is_video": True}]
+        mock_url.return_value = self.CDN_URL
+
+        header = self._basic_header()
+        with self._patch_env():
+            self.middleware(self._environ(self.MOVIE_PATH, authorization=header), self._start_response)
+
+        status, headers = self.start_calls[0]
+        self.assertEqual(status, "302 Found")
+        self.assertIn(("Location", self.CDN_URL), headers)
+        self.assertEqual(mock_url.call_args[0][0], "deb123")
+
+    @patch("torboxed._resolve_direct_url")
+    @patch("torboxed.get_torrent_files")
+    @patch("torboxed.resolve_debrid_id_for_path")
+    def test_subtitle_fallback_requires_auth(self, mock_db_info, mock_files, mock_url):
+        """Subtitle fallback resolution is equally protected by the auth check."""
+        with self._patch_env():
+            self.middleware(
+                self._environ(self.SUBTITLE_FALLBACK_PATH), self._start_response
+            )
+        self.assertEqual(self.start_calls[0][0], "401 Unauthorized")
+        self.assertEqual(mock_db_info.call_count, 0)
+        self.assertEqual(self.app_calls, [])
+
+    @patch("torboxed._resolve_direct_url")
+    @patch("torboxed.get_torrent_files")
+    @patch("torboxed.resolve_debrid_id_for_path")
+    def test_anonymous_mode_allows_redirect_when_explicitly_enabled(self, mock_db_info, mock_files, mock_url):
+        """No configured credentials + WEBDAV_ALLOW_ANONYMOUS=true permits redirects."""
+        mock_db_info.return_value = {"debrid_id": "deb123", "debrid_service": "torbox"}
+        mock_files.return_value = [{"file_id": "f1", "is_video": True}]
+        mock_url.return_value = self.CDN_URL
+
+        with self._patch_env({"WEBDAV_AUTH_USER": "", "WEBDAV_AUTH_PASS": "", "WEBDAV_ALLOW_ANONYMOUS": "true"}):
+            self.middleware(self._environ(self.MOVIE_PATH), self._start_response)
+
+        status, headers = self.start_calls[0]
+        self.assertEqual(status, "302 Found")
+        self.assertIn(("Location", self.CDN_URL), headers)
+
+    def test_no_credentials_and_no_anonymous_flag_denies_access(self):
+        """Fail closed: no credentials configured and no anonymous flag => 401."""
+        with self._patch_env({"WEBDAV_AUTH_USER": "", "WEBDAV_AUTH_PASS": ""}):
+            self.middleware(self._environ(self.MOVIE_PATH), self._start_response)
+        self.assertEqual(self.start_calls[0][0], "401 Unauthorized")
+        self.assertEqual(self.app_calls, [])
+
+    def test_non_intercepted_paths_pass_through_unchanged(self):
+        """Directory listings and /health are untouched (wsgidav handles them)."""
+        with self._patch_env():
+            for path in ("/", "/health", "/Movies/"):
+                self.start_calls.clear()
+                self.app_calls.clear()
+                self.middleware(self._environ(path), self._start_response)
+                self.assertEqual(self.app_calls, [path], f"path {path} should pass through")
+                self.assertEqual(self.start_calls[0][0], "200 OK", f"path {path} not challenged")
+
+
 if __name__ == "__main__":
     unittest.main()

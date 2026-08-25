@@ -17,7 +17,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
+import base64
 import hashlib
+import hmac
 import re
 import shlex
 import shutil
@@ -7418,48 +7420,109 @@ def _create_resource_for_path(path: str, environ: dict,
 
 class RedirectMiddleware:
     """WSGI middleware that intercepts GET/HEAD for video files and returns 302 redirects.
-    
+
     Intercepts BEFORE wsgidav's file-serving logic to handle Range requests
     correctly - the redirect goes to the CDN which handles ranges natively.
+
+    Because intercepted requests never reach wsgidav's authenticator (which
+    lives downstream inside the wrapped app), this middleware enforces the
+    same HTTP Basic authentication itself before serving any redirect.
     """
-    
+
+    WWW_AUTHENTICATE_HEADER = ('WWW-Authenticate', 'Basic realm="TorBoxed"')
+
     def __init__(self, app):
         self.app = app
-    
+
+    def _is_authenticated(self, environ) -> bool:
+        """Validate Basic-auth credentials against the WebDAV user mapping.
+
+        Uses the same credentials configured in serve_webdav() so behavior is
+        identical whether a request is intercepted here or handled by
+        wsgidav. When no credentials are configured, access is only allowed
+        if WEBDAV_ALLOW_ANONYMOUS was explicitly enabled (fail closed).
+        """
+        config = get_webdav_config()
+        user = config.get("user", "")
+        password = config.get("password", "")
+
+        if not user or not password:
+            allow_anonymous = get_env().get("WEBDAV_ALLOW_ANONYMOUS", "").strip().lower() in ("1", "true", "yes")
+            return allow_anonymous
+
+        auth_header = environ.get("HTTP_AUTHORIZATION", "")
+        if not auth_header.startswith("Basic "):
+            return False
+
+        try:
+            decoded = base64.b64decode(auth_header[6:].strip()).decode("utf-8")
+            req_user, _, req_pass = decoded.partition(":")
+        except Exception:
+            return False
+
+        # Constant-time comparison of combined credentials avoids length leaks
+        expected = f"{user}:{password}".encode("utf-8")
+        provided = f"{req_user}:{req_pass}".encode("utf-8")
+        return hmac.compare_digest(expected, provided)
+
+    def _unauthorized(self, start_response):
+        """Emit 401 with a Basic challenge."""
+        body = b"Unauthorized"
+        start_response("401 Unauthorized", [
+            ("Content-Type", "text/plain"),
+            self.WWW_AUTHENTICATE_HEADER,
+            ("Content-Length", str(len(body))),
+        ])
+        return [body]
+
     def __call__(self, environ, start_response):
         method = environ.get("REQUEST_METHOD", "")
         path = environ.get("PATH_INFO", "")
-        
+
         # Only intercept GET and HEAD for files (not directories, not /health)
         if method not in ("GET", "HEAD") or path.endswith("/") or path == "/health":
             return self.app(environ, start_response)
-        
+
         # Determine if this is a subtitle file by extension
         ext = Path(path).suffix.lower()
         is_subtitle_path = ext in SUBTITLE_EXTENSIONS
-        
+
         # Try to resolve the path
         resolved = resolve_path(path)
         if not resolved:
             return self.app(environ, start_response)
-        
+
         file_type = resolved.get("type", "")
-        
+
+        will_intercept = (
+            file_type in ("movie_file", "episode_file")
+            or (is_subtitle_path and file_type not in ("movie_file", "episode_file"))
+        )
+
+        # Enforce auth BEFORE any redirect is served: intercepted requests
+        # bypass wsgidav's authenticator, which lives downstream.
+        if will_intercept and not self._is_authenticated(environ):
+            logger.warning(
+                "WebDAV: rejected unauthenticated %s request for %s",
+                method, path,
+            )
+            return self._unauthorized(start_response)
+
         # Handle video and subtitle files
         if file_type in ("movie_file", "episode_file"):
             return self._serve_file_redirect(
-                environ, start_response, method, path, resolved, 
+                environ, start_response, method, path, resolved,
                 is_subtitle=is_subtitle_path
             )
-        
+
         # Handle subtitle files that didn't resolve to movie_file/episode_file
         if is_subtitle_path and file_type not in ("movie_file", "episode_file"):
             return self._serve_subtitle_from_parent(
                 environ, start_response, method, path, resolved
             )
-        
+
         return self.app(environ, start_response)
-    
+
     def _serve_file_redirect(self, environ, start_response, method, path, 
                               resolved, is_subtitle=False):
         """Serve a 302 redirect for a video or subtitle file."""
