@@ -357,6 +357,10 @@ uv run torboxed.py --serve
 4. **Episode Granularity**: Season packs are expanded into per-episode virtual files for Infuse "Up Next" support
 5. **Subtitle Support**: External subtitle files (.srt, .ass, .vtt) from torrents appear alongside videos
 
+### Authentication & Security
+
+All requests — including the 302 media redirects — require HTTP Basic authentication when `WEBDAV_AUTH_USER` / `WEBDAV_AUTH_PASS` are set. The 302 redirect layer enforces the same credentials as the WebDAV app itself, so unauthenticated clients cannot obtain CDN links. Without credentials configured, the server refuses to start unless `WEBDAV_ALLOW_ANONYMOUS=true` is explicitly set (which disables all authentication).
+
 ### Infuse Setup
 
 1. Settings → Manage Shares → Add Share → WebDAV
