@@ -295,6 +295,16 @@ sqlite3 torboxed.db "UPDATE config SET sources = '[\"users/liked\", \"movies/tre
 - Shows: trending, popular, watched, collected, anticipated
 - Personal: liked lists (requires `TRAKT_ACCESS_TOKEN`)
 
+**File locations** can be overridden via environment variables (also settable in `.env`):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DB_PATH` | `torboxed.db` | SQLite database location |
+| `LOG_PATH` | `torboxed.log` | Rotating log file location |
+| `ENV_PATH` | `.env` | Location of the environment file (read from the process environment only) |
+
+For security, custom `DB_PATH`/`LOG_PATH` values must resolve inside an allowed root (`~/.local/share/torboxed`, `/data`, the current directory, or the system temp directory; `/var/log` is also allowed for logs). Paths outside these roots — including symlinks escaping them — are rejected at startup. The Docker image already sets all three to `/data/...`.
+
 ---
 
 ## 🔐 Getting API Keys
