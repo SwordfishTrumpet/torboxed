@@ -2421,9 +2421,47 @@ COMPLETENESS_ORDER = {
 }
 
 
+def _apply_multi_season_updates(updates: List[Dict[str, Any]]) -> None:
+    """Associate newly discovered multi-season packs with additional season rows.
+
+    Only inserts when the season row exists without a debrid_id (or not at all).
+    The debrid_service label comes from each update dict (set by the caller via
+    get_debrid_service()) so Real Debrid accounts are never mislabeled as torbox.
+
+    Args:
+        updates: List of dicts with keys imdb_id, season, debrid_id, title,
+                 year, and debrid_service.
+    """
+    logger.info("Updating %d additional season records for multi-season packs...", len(updates))
+    with get_db() as conn:
+        for update in updates:
+            # Only update if this season doesn't already have this debrid_id
+            existing = conn.execute(
+                "SELECT debrid_id FROM processed WHERE imdb_id=? AND season=?",
+                (update['imdb_id'], update['season'])
+            ).fetchone()
+
+            if not existing or not existing['debrid_id']:
+                conn.execute('''
+                    INSERT OR REPLACE INTO processed
+                    (imdb_id, season, title, year, content_type, action, reason, debrid_service, debrid_id,
+                     quality_score, quality_label, processed_at)
+                    VALUES (?, ?, ?, ?, 'show', 'added', 'multi_season_pack_discovery', ?, ?,
+                            NULL, NULL, ?)
+                ''', (update['imdb_id'], update['season'], update['title'], update['year'],
+                      update.get('debrid_service') or get_debrid_service(), update['debrid_id'],
+                      datetime.now(timezone.utc).isoformat()))
+                logger.debug("Updated season %s for %s with debrid_id %s (%s)",
+                            update['season'], update['imdb_id'], update['debrid_id'],
+                            update.get('debrid_service'))
+        conn.commit()
+
+    logger.info("Updated database with %d multi-season pack associations", len(updates))
+
+
 def _count_seasons_in_key(season_key: str) -> int:
     """Extract number of seasons covered from a season key string.
-    
+
     Returns number of seasons, or 999 for "Complete".
     """
     if season_key == "Complete":
@@ -4665,7 +4703,8 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
                                     'season': show_season,
                                     'debrid_id': debrid_id,
                                     'title': db_title,
-                                    'year': db_year or torrent_year or 0
+                                    'year': db_year or torrent_year or 0,
+                                    'debrid_service': get_debrid_service(),
                                 })
                                 matched_seasons.append(show_season)
                     
@@ -4688,28 +4727,7 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
     
     # Update database with multi-season pack info for any newly matched seasons
     if multi_season_updates:
-        logger.info("Updating %d additional season records for multi-season packs...", len(multi_season_updates))
-        with get_db() as conn:
-            for update in multi_season_updates:
-                    # Only update if this season doesn't already have this debrid_id
-                    existing = conn.execute(
-                        "SELECT debrid_id FROM processed WHERE imdb_id=? AND season=?",
-                        (update['imdb_id'], update['season'])
-                    ).fetchone()
-                    
-                    if not existing or not existing['debrid_id']:
-                        conn.execute('''
-                            INSERT OR REPLACE INTO processed 
-                            (imdb_id, season, title, year, content_type, action, reason, debrid_service, debrid_id, 
-                             quality_score, quality_label, processed_at)
-                            VALUES (?, ?, ?, ?, 'show', 'added', 'multi_season_pack_discovery', ?, ?, 
-                                    NULL, NULL, ?)
-                        ''', (update['imdb_id'], update['season'], update['title'], update['year'], 
-                              update.get('debrid_service', 'torbox'), update['debrid_id'], datetime.now(timezone.utc).isoformat()))
-                        logger.debug("Updated season %s for %s with debrid_id %s", 
-                                    update['season'], update['imdb_id'], update['debrid_id'])
-        
-        logger.info("Updated database with %d multi-season pack associations", len(multi_season_updates))
+        _apply_multi_season_updates(multi_season_updates)
     
     total_matches = id_matches + name_matches
     if unmatched:

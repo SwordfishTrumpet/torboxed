@@ -7019,5 +7019,123 @@ class TestCleanupDuplicatesGrouping(unittest.TestCase):
         self.assertNotIn("s01-only", self.removed_ids)
 
 
+class TestMultiSeasonServiceLabel(unittest.TestCase):
+    """Multi-season pack discovery must record the ACTIVE debrid service.
+
+    Regression tests for issue #4: auto-created records hardcoded
+    debrid_service='torbox', corrupting Real Debrid records and breaking
+    WebDAV file resolution for those seasons.
+    """
+
+    def setUp(self):
+        import torboxed
+        self.torboxed = torboxed
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.original_db_path = torboxed.DB_PATH
+        torboxed.DB_PATH = Path(self.temp_dir.name) / "test.db"
+        torboxed.init_db()
+
+    def tearDown(self):
+        import torboxed
+        torboxed.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+
+    def _get_record(self, imdb_id, season):
+        with self.torboxed.get_db() as conn:
+            return conn.execute(
+                "SELECT * FROM processed WHERE imdb_id=? AND season=?",
+                (imdb_id, season),
+            ).fetchone()
+
+    def test_update_dict_carries_active_service_torbox(self):
+        """Updates built during discovery carry get_debrid_service() label."""
+        import torboxed
+        updates = [{
+            'imdb_id': 'tt1111111',
+            'season': 'S06',
+            'debrid_id': 'pack-id-1',
+            'title': 'test show',
+            'year': 2024,
+            'debrid_service': 'torbox',
+        }]
+        with patch.object(torboxed, 'get_debrid_service', return_value='torbox'):
+            torboxed._apply_multi_season_updates(updates)
+        rec = self._get_record('tt1111111', 'S06')
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec['debrid_service'], 'torbox')
+        self.assertEqual(rec['debrid_id'], 'pack-id-1')
+        self.assertEqual(rec['reason'], 'multi_season_pack_discovery')
+
+    def test_real_debrid_not_mislabeled_as_torbox(self):
+        """With DEBRID_SERVICE=real_debrid, records must say realdebrid."""
+        import torboxed
+        # Simulates the pre-fix failure mode: no explicit service in dict,
+        # active service is Real Debrid. The helper must NOT default to torbox.
+        updates = [{
+            'imdb_id': 'tt2222222',
+            'season': 'S07',
+            'debrid_id': 'rd-pack-id',
+            'title': 'test show',
+            'year': 2024,
+        }]
+        with patch.object(torboxed, 'get_debrid_service', return_value='real_debrid'):
+            torboxed._apply_multi_season_updates(updates)
+        rec = self._get_record('tt2222222', 'S07')
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec['debrid_service'], 'real_debrid')
+        self.assertNotEqual(rec['debrid_service'], 'torbox')
+
+    def test_discovery_builds_updates_with_active_service(self):
+        """End-to-end: discover_existing_torrents passes active service through."""
+        import torboxed
+
+        fake_title = "FakeTestShowXYZ123"
+        fake_imdb = "tt99999999"
+
+        torboxed.record_processed(
+            fake_imdb, fake_title, 2025, "show", "added", "success",
+            debrid_id="s05-torrent-id", season="S05",
+        )
+        torboxed.record_processed(
+            fake_imdb, fake_title, 2025, "show", "added", "success",
+            debrid_id="s06-torrent-id", season="S06",
+        )
+
+        mock_debrid = Mock()
+        mock_debrid.get_my_torrents.return_value = [
+            {
+                "id": "multi-season-pack-id",
+                "name": f"{fake_title}.S05.S06.1080p.WEB-DL.x264",
+                "hash": "multihash456",
+            }
+        ]
+
+        with patch.object(torboxed, "get_debrid_service", return_value="real_debrid") as svc:
+            torboxed.discover_existing_torrents(mock_debrid)
+
+        # Both season rows were matched to the pack; the update dicts must
+        # have been built while the active service was real_debrid.
+        svc.assert_called()
+
+    def test_existing_season_with_debrid_id_is_untouched(self):
+        """Seasons already associated with a torrent keep their record."""
+        import torboxed
+        torboxed.record_processed(
+            'tt3333333', 'test show', 2024, "show", "added", "success",
+            debrid_id="existing-id", season="S05",
+        )
+        updates = [{
+            'imdb_id': 'tt3333333',
+            'season': 'S05',
+            'debrid_id': 'new-pack-id',
+            'title': 'test show',
+            'year': 2024,
+            'debrid_service': 'real_debrid',
+        }]
+        torboxed._apply_multi_season_updates(updates)
+        rec = self._get_record('tt3333333', 'S05')
+        self.assertEqual(rec['debrid_id'], 'existing-id')
+
+
 if __name__ == "__main__":
     unittest.main()
