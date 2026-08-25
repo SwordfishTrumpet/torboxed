@@ -4912,9 +4912,11 @@ def cleanup_unmatched_torrents(force: bool = False) -> None:
 def cleanup_duplicate_torrents(force: bool = False) -> None:
     """Remove duplicate torrents for the same movie/season from the debrid account.
 
-    A duplicate is when the same IMDb ID has multiple torrents for the same season.
+    A duplicate is when the same IMDb ID has multiple torrents covering the
+    exact same content granularity.
     For movies: more than 1 torrent for the same movie.
-    For shows: more than 1 torrent for the same season (S01, S02, Complete, etc.).
+    For shows: more than 1 torrent for the same season pack (S01), episode
+    (S01E01), multi-season range (S01-S05), or complete pack.
 
     Keeps the best quality torrent and removes the rest.
 
@@ -4996,10 +4998,12 @@ def cleanup_duplicate_torrents(force: bool = False) -> None:
                 continue
 
             season_info = parse_season_info(torrent_name)
-            if season_info and season_info.is_complete:
-                season = "Complete"
-            elif season_info and season_info.seasons:
-                season = f"S{season_info.seasons[0]:02d}"
+            if season_info:
+                # Use the full season label (S01, S01E02, S01-S03, Complete) so
+                # distinct episodes of one season are never grouped as duplicates.
+                # Issue #3: collapsing episodes to "S01" caused --cleanup-duplicates
+                # to delete legitimate episode-level coverage.
+                season = season_info.season_label
 
             matched = False
             for key, show_records in db_by_title_year.items():

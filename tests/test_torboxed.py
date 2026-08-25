@@ -6908,5 +6908,116 @@ class TestTraktPagination(unittest.TestCase):
                 self.assertEqual(fp.call_count, 1, method_name)
 
 
+class TestCleanupDuplicatesGrouping(unittest.TestCase):
+    """--cleanup-duplicates must only remove true duplicates.
+
+    Regression tests for issue #3: grouping by (imdb_id, "S01") collapsed all
+    individual episodes of a season into one duplicate group and deleted all
+    but one. Group keys now use the full season label (S01E01 etc.).
+    """
+
+    IMDB = "tt0903747"
+
+    def setUp(self):
+        import torboxed
+        self.torboxed = torboxed
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.original_db_path = torboxed.DB_PATH
+        torboxed.DB_PATH = Path(self.temp_dir.name) / "test.db"
+        torboxed.init_db()
+
+        # DB record loaded into the title/year index but NOT matching any
+        # torrent debrid_id -> forces the name-match path (where the bug was)
+        self.torboxed.record_processed(
+            self.IMDB, "Breaking Bad", 2008, "show", "added", "test",
+            debrid_id="unrelated-id", season="S01",
+        )
+
+        self.removed_ids = []
+
+        class FakeDebridClient:
+            def get_my_torrents(self_inner):
+                return self.torrents_in_account
+
+            def remove_torrent(self_inner, torrent_id):
+                self.removed_ids.append(str(torrent_id))
+                return True
+
+        self.fake_client_cls = FakeDebridClient
+
+    def tearDown(self):
+        import torboxed
+        torboxed.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+
+    def _torrent(self, tid, name, size=10_000_000_000):
+        return {"id": tid, "name": name, "size": size}
+
+    def _run_cleanup(self):
+        with patch("torboxed.create_debrid_client", return_value=self.fake_client_cls()):
+            self.torboxed.cleanup_duplicate_torrents(force=True)
+
+    def test_distinct_episodes_of_one_season_are_not_duplicates(self):
+        """S01E01..S01E08 are distinct content; none may be removed."""
+        self.torrents_in_account = [
+            self._torrent(f"ep{i}", f"Breaking.Bad.S01E{i:02d}.720p.WEB-DL")
+            for i in range(1, 9)
+        ]
+        self._run_cleanup()
+        self.assertEqual(self.removed_ids, [], "distinct episodes must never be removed")
+
+    def test_two_copies_of_same_season_pack_remove_one(self):
+        """Two S01 season packs: lower-quality copy is removed."""
+        self.torrents_in_account = [
+            self._torrent("pack-1080p", "Breaking.Bad.S01.1080p.BluRay.x264", size=30_000_000_000),
+            self._torrent("pack-720p", "Breaking.Bad.S01.720p.WEB-DL.x264", size=10_000_000_000),
+        ]
+        self._run_cleanup()
+        self.assertEqual(self.removed_ids, ["pack-720p"])
+
+    def test_two_copies_of_same_episode_remove_one(self):
+        """Two copies of S01E05 group together; best kept."""
+        self.torrents_in_account = [
+            self._torrent("e5-1080p", "Breaking.Bad.S01E05.1080p.BluRay.x264"),
+            self._torrent("e5-720p", "Breaking.Bad.S01E05.720p.WEB-DL.x264"),
+        ]
+        self._run_cleanup()
+        self.assertEqual(self.removed_ids, ["e5-720p"])
+
+    def test_complete_pack_and_season_pack_coexist(self):
+        """Complete pack + season pack + episode cover different granularity;
+        cleanup must not treat them as duplicates of each other."""
+        self.torrents_in_account = [
+            self._torrent("complete", "Breaking.Bad.Complete.Series.1080p.BluRay"),
+            self._torrent("s02-pack", "Breaking.Bad.S02.1080p.WEB-DL.x264"),
+            self._torrent("s02e05", "Breaking.Bad.S02E05.1080p.WEB-DL.x264"),
+        ]
+        self._run_cleanup()
+        self.assertEqual(self.removed_ids, [])
+
+    def test_episode_and_other_episode_of_same_season_coexist_with_pack(self):
+        """A season pack does not absorb distinct episodes into its group."""
+        self.torrents_in_account = [
+            self._torrent("s01-pack", "Breaking.Bad.S01.1080p.BluRay.x264"),
+            self._torrent("s01e01", "Breaking.Bad.S01E01.1080p.WEB-DL.x264"),
+            self._torrent("s01e02", "Breaking.Bad.S01E02.1080p.WEB-DL.x264"),
+        ]
+        self._run_cleanup()
+        self.assertEqual(self.removed_ids, [])
+
+    def test_multi_season_range_groups_only_same_range(self):
+        """S01-S03 packs group together; a plain S01 pack stays separate."""
+        self.torrents_in_account = [
+            self._torrent("range-a", "Breaking.Bad.S01-S03.1080p.BluRay.x264"),
+            self._torrent("range-b", "Breaking.Bad.S01-S03.720p.WEB-DL.x264"),
+            self._torrent("s01-only", "Breaking.Bad.S01.1080p.BluRay.x264"),
+        ]
+        self._run_cleanup()
+        # Only one of the two identical-range packs is removed
+        self.assertEqual(len(self.removed_ids), 1)
+        self.assertIn(self.removed_ids[0], ("range-a", "range-b"))
+        self.assertNotIn("s01-only", self.removed_ids)
+
+
 if __name__ == "__main__":
     unittest.main()
