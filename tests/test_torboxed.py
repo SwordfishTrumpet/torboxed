@@ -7222,6 +7222,68 @@ class TestPathConfiguration(unittest.TestCase):
             validate_log_path(Path("/etc/passwd"))
 
 
+class TestLimiterMarkSuccessOnFailure(unittest.TestCase):
+    """Regression test for issue #7 (timeout → 429 cascade on Real Debrid).
+
+    Both debrid clients must advance their rate limiter (mark_success) when
+    the underlying transport fails (timeout/connection error), so the next
+    request enforces the full interval instead of a stale short wait.
+    """
+
+    def _fresh_limiter(self, name="Test"):
+        return RateLimiter(1.0, name=name)
+
+    def test_rd_client_marks_success_on_api_error(self):
+        """RealDebridClient._request advances limiter on APIError and re-raises."""
+        import torboxed
+        client = RealDebridClient(api_key="test-key")
+        limiter = client._limiter
+        before = limiter.last_successful_request
+
+        with patch.object(torboxed, "make_request_with_backoff",
+                          side_effect=torboxed.APIError("Simulated timeout", status_code=None)):
+            with self.assertRaises(torboxed.APIError):
+                client._request("POST", "/torrents/addMagnet", use_creation_limiter=True,
+                                data={"magnet": "magnet:test"})
+
+        creation_limiter = client._creation_limiter
+        self.assertGreater(creation_limiter.last_successful_request, before)
+
+    def test_torbox_client_marks_success_on_api_error(self):
+        """TorboxClient keeps the LOG-FIX behavior via the shared helper."""
+        import torboxed
+        from torboxed import torbox_creation_limiter
+        client = TorboxClient(api_key="test-key")
+        before = torbox_creation_limiter.last_successful_request
+
+        with patch.object(torboxed, "make_request_with_backoff",
+                          side_effect=torboxed.APIError("Simulated timeout", status_code=None)):
+            with self.assertRaises(torboxed.APIError):
+                client._request("POST", "/v1/api/torrents/createtorrent",
+                                use_creation_limiter=True, data={"magnet": "magnet:test"})
+
+        self.assertGreater(torbox_creation_limiter.last_successful_request, before)
+
+    def test_shared_helper_passes_kwargs_through(self):
+        """_request_with_limiter forwards extra kwargs (e.g. suppress_500_warnings)."""
+        import torboxed
+        client = RealDebridClient(api_key="test-key")
+        limiter = self._fresh_limiter()
+        fake_response = Mock(status_code=200)
+        fake_response.text = "{\"ok\": true}"
+
+        with patch.object(torboxed, "make_request_with_backoff",
+                          return_value=fake_response) as mock_call:
+            result = client._request_with_limiter("GET", "https://api.example.com/x",
+                                                  limiter, suppress_500_warnings=True)
+
+        self.assertIs(result, fake_response)
+        self.assertTrue(mock_call.call_args.kwargs.get("suppress_500_warnings"))
+        # Success path: helper must NOT touch last_successful_request itself;
+        # callers mark success after validating the response.
+        self.assertEqual(limiter.last_successful_request, 0)
+
+
 class TestRecordProcessedHistoryPreservation(unittest.TestCase):
     """record_processed must not erase history on skip/fail writes.
 
