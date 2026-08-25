@@ -7137,5 +7137,102 @@ class TestMultiSeasonServiceLabel(unittest.TestCase):
         self.assertEqual(rec['debrid_id'], 'existing-id')
 
 
+class TestRecordProcessedHistoryPreservation(unittest.TestCase):
+    """record_processed must not erase history on skip/fail writes.
+
+    Regression tests for issue #5: INSERT OR REPLACE replaced the whole row,
+    so a "skipped"/"not_cached" record written after a transient discovery
+    failure nulled out debrid_id/magnet and erased quality + upgrade history.
+    """
+
+    IMDB = "tt5555555"
+
+    def setUp(self):
+        import torboxed
+        self.torboxed = torboxed
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.original_db_path = torboxed.DB_PATH
+        torboxed.DB_PATH = Path(self.temp_dir.name) / "test.db"
+        torboxed.init_db()
+
+    def tearDown(self):
+        import torboxed
+        torboxed.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+
+    def _seed_tracked_movie(self):
+        """Simulate state built by an earlier successful run."""
+        self.torboxed.record_processed(
+            self.IMDB, "Some Movie", 2023, "movie", "added", "success",
+            debrid_id="orig-debrid-id", magnet="magnet:orig",
+            quality_score=4500, quality_label="1080p WEB-DL",
+            season="unknown",
+        )
+
+    def _get_row(self):
+        return self.torboxed.get_processed_item(self.IMDB, "unknown")
+
+    def test_skip_after_transient_discovery_failure_retains_debrid_id(self):
+        """not_cached skip must not null the stored debrid association."""
+        self._seed_tracked_movie()
+        # Sync hiccup: discovery failed, search found nothing -> skip record
+        self.torboxed.record_processed(
+            self.IMDB, "Some Movie", 2023, "movie", "skipped", "not_cached",
+            season="unknown",
+        )
+        row = self._get_row()
+        self.assertEqual(row["action"], "skipped", "action should update")
+        self.assertEqual(row["reason"], "not_cached")
+        self.assertEqual(row["debrid_id"], "orig-debrid-id")
+        self.assertEqual(row["magnet"], "magnet:orig")
+        self.assertEqual(row["quality_score"], 4500)
+        self.assertEqual(row["quality_label"], "1080p WEB-DL")
+
+    def test_already_in_debrid_skip_retains_quality_label_and_magnet(self):
+        """already_in_debrid path passes only debrid_id+score; rest survives."""
+        self._seed_tracked_movie()
+        self.torboxed.record_processed(
+            self.IMDB, "Some Movie", 2023, "movie", "skipped",
+            "already_in_debrid", debrid_id="orig-debrid-id", quality_score=4500,
+            season="unknown",
+        )
+        row = self._get_row()
+        self.assertEqual(row["debrid_id"], "orig-debrid-id")
+        self.assertEqual(row["quality_score"], 4500)
+        self.assertEqual(row["quality_label"], "1080p WEB-DL")
+        self.assertEqual(row["magnet"], "magnet:orig")
+
+    def test_upgrade_record_still_overwrites_supplied_fields(self):
+        """Supplied values (upgrade history) overwrite, not just preserve."""
+        self._seed_tracked_movie()
+        self.torboxed.record_processed(
+            self.IMDB, "Some Movie", 2023, "movie", "upgraded", "quality_better",
+            debrid_id="new-debrid-id", magnet="magnet:new",
+            quality_score=7000, quality_label="2160p BluRay",
+            replaced_id="orig-debrid-id", replaced_score=4500,
+            season="unknown",
+        )
+        row = self._get_row()
+        self.assertEqual(row["debrid_id"], "new-debrid-id")
+        self.assertEqual(row["magnet"], "magnet:new")
+        self.assertEqual(row["quality_score"], 7000)
+        self.assertEqual(row["quality_label"], "2160p BluRay")
+        self.assertEqual(row["replaced_id"], "orig-debrid-id")
+        self.assertEqual(row["replaced_score"], 4500)
+
+    def test_fresh_insert_without_history_unchanged(self):
+        """First-time records behave exactly as before (no phantom merges)."""
+        self.torboxed.record_processed(
+            self.IMDB, "Some Movie", 2023, "movie", "skipped", "not_cached",
+            season="unknown",
+        )
+        row = self._get_row()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["action"], "skipped")
+        self.assertIsNone(row["debrid_id"])
+        self.assertIsNone(row["quality_score"])
+        self.assertIsNone(row["replaced_id"])
+
+
 if __name__ == "__main__":
     unittest.main()

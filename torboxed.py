@@ -1906,6 +1906,31 @@ def record_processed(imdb_id: str, title: str, year: int, content_type: str,
         debrid_service = get_debrid_service()
     
     with get_db() as conn:
+        # Issue #5 fix: preserve history across skip/fail writes.
+        # INSERT OR REPLACE replaces the whole row; a "skipped" record written
+        # after a transient discovery failure would otherwise null out the
+        # stored debrid_id/magnet and erase quality + upgrade audit history.
+        # Merge: fields the caller does not supply (None) carry forward the
+        # previously stored values. Callers that supply values still overwrite.
+        existing = conn.execute(
+            "SELECT debrid_id, magnet, quality_score, quality_label, replaced_id, replaced_score "
+            "FROM processed WHERE imdb_id=? AND season=?",
+            (imdb_id, season)
+        ).fetchone()
+        if existing:
+            if debrid_id is None:
+                debrid_id = existing['debrid_id']
+            if magnet is None:
+                magnet = existing['magnet']
+            if quality_score is None:
+                quality_score = existing['quality_score']
+            if quality_label is None:
+                quality_label = existing['quality_label']
+            if replaced_id is None:
+                replaced_id = existing['replaced_id']
+            if replaced_score is None:
+                replaced_score = existing['replaced_score']
+
         conn.execute('''
             INSERT OR REPLACE INTO processed 
             (imdb_id, season, title, year, content_type, action, reason, debrid_service, debrid_id, magnet, 
