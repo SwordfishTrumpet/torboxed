@@ -161,15 +161,15 @@ TRAKT_RATE_LIMIT = 0.6         # ~1.67 requests per second (conservative for Tra
 
 # HTTP Timeouts (seconds)
 DEFAULT_TIMEOUT_SHORT = 30.0   # For simple API calls (Trakt, Telegram)
-DEFAULT_TIMEOUT_LONG = 60.0    # For search operations (Prowlarr, Jackett, Torbox)
+DEFAULT_TIMEOUT_LONG = 120.0   # For search operations (Prowlarr, Jackett, Torbox, mylist)
 DEFAULT_TIMEOUT_CREATION = 120.0  # For torrent creation (large multi-season packs need more time)
 
 # Search result limits
 SEARCH_LIMIT_IMDB = 500        # Higher limit for IMDb ID searches (ensure season packs)
 SEARCH_LIMIT_TITLE = 100       # Standard limit for title searches
 RD_CACHE_CHECK_BATCH = 100     # Max hashes per Real Debrid instantAvailability call
-TORBOX_LIST_LIMIT = 5000       # Max torrents per request from Torbox mylist (API default is 1000, but supports up to 5000)
-REAL_DEBRID_LIST_LIMIT = 5000  # Max torrents per request from Real Debrid (API default is 100, but supports up to 5000 for large libraries)
+TORBOX_LIST_LIMIT = 5000       # Max torrents per request from Torbox mylist (API supports up to 5000; server may return 504 for large libraries, handled gracefully)
+REAL_DEBRID_LIST_LIMIT = 500   # Max torrents per request from Real Debrid (API default is 100, 500 is a good balance)
 
 # Discovery threshold for dropped torrent detection
 # If we discover fewer than 95% of tracked torrents, skip clearing to avoid false positives
@@ -230,10 +230,12 @@ MIME_TYPES = {
 }
 
 # WebDAV server defaults
+# Credentials must be provided via WEBDAV_AUTH_USER / WEBDAV_AUTH_PASS env vars.
+# Never hard-code real credentials here.
 WEBDAV_DEFAULT_HOST = "0.0.0.0"
 WEBDAV_DEFAULT_PORT = 8080
-WEBDAV_DEFAULT_USER = "***REDACTED***"
-WEBDAV_DEFAULT_PASS = "***REDACTED***"
+WEBDAV_DEFAULT_USER = ""
+WEBDAV_DEFAULT_PASS = ""
 WEBDAV_DEFAULT_LOG_LEVEL = "info"
 
 # Backfill rate limit (one get_torrent_files call every 3 seconds)
@@ -524,6 +526,7 @@ class ZileanClient:
         """
         self.database_url = database_url or self._get_database_url_from_env()
         self._connection: Optional[Any] = None
+        self._invalid_hash_count = 0
     
     def _get_database_url_from_env(self) -> str:
         """Load ZILEAN_DATABASE_URL from environment."""
@@ -601,14 +604,12 @@ class ZileanClient:
         """
         info_hash = torrent["infoHash"]
         if not info_hash or len(info_hash) != 40:
-            logger.debug("Skipping torrent without valid infohash (wrong length): %s", 
-                       torrent.get("rawTitle") or torrent.get("parsedTitle") or "Unknown")
+            self._invalid_hash_count = getattr(self, '_invalid_hash_count', 0) + 1
             return None
         try:
             int(info_hash, 16)
         except ValueError:
-            logger.debug("Skipping torrent with invalid hex infohash: %s", 
-                       torrent.get("rawTitle") or torrent.get("parsedTitle") or "Unknown")
+            self._invalid_hash_count = getattr(self, '_invalid_hash_count', 0) + 1
             return None
         
         name = torrent["rawTitle"] or torrent["parsedTitle"] or "Unknown"
@@ -668,12 +669,16 @@ class ZileanClient:
                 rows = cur.fetchall()
                 
                 results = []
+                self._invalid_hash_count = 0
                 for row in rows:
                     torrent = self._row_to_dict(row)
                     result = self._build_torrent_result(torrent)
                     if result is not None:
                         results.append(result)
                 
+                if self._invalid_hash_count > 0:
+                    logger.debug("Zilean skipped %d torrents with invalid infohashes for IMDb ID: %s",
+                               self._invalid_hash_count, imdb_id)
                 logger.debug("Zilean found %d torrents for IMDb ID: %s", len(results), imdb_id)
                 return results
                 
@@ -736,12 +741,16 @@ class ZileanClient:
                 rows = cur.fetchall()
                 
                 results = []
+                self._invalid_hash_count = 0
                 for row in rows:
                     torrent = self._row_to_dict(row)
                     result = self._build_torrent_result(torrent)
                     if result is not None:
                         results.append(result)
                 
+                if self._invalid_hash_count > 0:
+                    logger.debug("Zilean skipped %d torrents with invalid infohashes for: %s",
+                               self._invalid_hash_count, query)
                 logger.info("Zilean found %d torrents for: %s", len(results), query)
                 return results
                 
@@ -1455,10 +1464,14 @@ _env_cache: Optional[Dict[str, str]] = None
 
 
 def get_env() -> Dict[str, str]:
-    """Lazy-load environment variables from .env file."""
+    """Lazy-load environment variables from os.environ and .env file.
+
+    os.environ takes precedence over .env (for Docker compose overrides).
+    Native runs (no os.environ overrides) use .env values.
+    """
     global _env_cache
     if _env_cache is None:
-        _env_cache = load_env()
+        _env_cache = {**load_env(), **os.environ}
     return _env_cache
 
 
@@ -2730,7 +2743,7 @@ def make_request_with_backoff(client: httpx.Client, method: str, url: str,
             return response
             
         except httpx.TimeoutException:
-            logger.warning("Timeout (request waited 60s). Retrying in ~%ds...", 60 + backoff)
+            logger.warning("Timeout (request timed out). Retrying in ~%ds...", backoff)
             time.sleep(backoff)
             retries += 1
             backoff = min(backoff * 2, 60)
@@ -3676,9 +3689,16 @@ class TorboxClient(DebridClient):
             
             url = f"{TORBOX_BASE_URL}{path}"
             # BUG-006 FIX: Pass rate_limiter so it gets updated on 429
-            response = make_request_with_backoff(self.client, method, url, 
-                                                  rate_limiter=current_limiter,
-                                                  suppress_500_warnings=suppress_500_warnings, **kwargs)
+            try:
+                response = make_request_with_backoff(self.client, method, url, 
+                                                      rate_limiter=current_limiter,
+                                                      suppress_500_warnings=suppress_500_warnings, **kwargs)
+            except (APIError, APIResponseError):
+                # LOG-FIX: On request failure (timeout, connection error), update rate limiter
+                # so the next wait() call enforces the full interval instead of a stale short wait.
+                # This prevents cascading timeouts → 429 when the creation rate limit is breached.
+                current_limiter.mark_success()
+                raise
             
             # Handle 429 specially
             if response.status_code == 429:
@@ -4009,7 +4029,7 @@ class TorboxClient(DebridClient):
         try:
             response = self._request(
                 "GET",
-                "/v1/api/torrents/myid",
+                "/v1/api/torrents/mylist",
                 params={"id": str(debrid_id)},
                 suppress_500_warnings=True
             )
@@ -4058,7 +4078,7 @@ class TorboxClient(DebridClient):
         try:
             response = self._request(
                 "GET",
-                "/v1/api/torrents/myid",
+                "/v1/api/torrents/mylist",
                 params={"id": str(debrid_id)},
                 suppress_500_warnings=True
             )
@@ -7641,7 +7661,15 @@ def serve_webdav():
     password = config["password"]
     
     if not user or not password:
-        logger.warning("WebDAV credentials not configured. Starting without authentication.")
+        allow_anonymous = get_env().get("WEBDAV_ALLOW_ANONYMOUS", "").strip().lower() in ("1", "true", "yes")
+        if not allow_anonymous:
+            logger.error(
+                "WebDAV credentials not configured (set WEBDAV_AUTH_USER / WEBDAV_AUTH_PASS). "
+                "Refusing to start without authentication. "
+                "Set WEBDAV_ALLOW_ANONYMOUS=true to explicitly run an unauthenticated server."
+            )
+            sys.exit(1)
+        logger.warning("WEBDAV_ALLOW_ANONYMOUS=true - starting WITHOUT authentication.")
     
     logger.info("Starting WebDAV server on %s:%d...", host, port)
     logger.info("Infuse setup URL: http://%s:%d", host, port)
