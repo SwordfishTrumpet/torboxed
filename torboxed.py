@@ -368,10 +368,6 @@ WEBDAV_DEFAULT_LOG_LEVEL = "info"
 # Backfill rate limit (one get_torrent_files call every 3 seconds)
 BACKFILL_RATE_LIMIT = 3.0
 
-# Declared as passed to access checks for non-existent permissions
-WEBDAV_METHODS_TO_PASS = {'OPTIONS', 'PROPFIND', 'PROPPATCH', 'MKCOL', 'COPY', 'MOVE', 'LOCK', 'UNLOCK'}
-
-
 # =============================================================================
 # ADDITIONAL SECURITY FUNCTIONS
 # =============================================================================
@@ -574,7 +570,6 @@ class ZileanClient:
             database_url: PostgreSQL connection string. If None, loads from ZILEAN_DATABASE_URL env var.
         """
         self.database_url = database_url or self._get_database_url_from_env()
-        self._connection: Optional[Any] = None
         self._invalid_hash_count = 0
     
     def _get_database_url_from_env(self) -> str:
@@ -586,19 +581,6 @@ class ZileanClient:
         if psycopg is None:
             return False
         return bool(self.database_url)
-    
-    def _get_connection(self):
-        """Get or create database connection with timeout."""
-        if psycopg is None:
-            raise ImportError("psycopg is not installed. Run: pip install psycopg")
-        if self._connection is None or self._connection.closed:
-            # Connect with 5 second timeout - fail fast if Zilean is unavailable
-            self._connection = psycopg.connect(
-                self.database_url, 
-                connect_timeout=5,
-                options='-c statement_timeout=10000'  # 10 second query timeout
-            )
-        return self._connection
     
     def _get_fresh_connection(self):
         """Get a fresh database connection for single query use.
@@ -613,12 +595,6 @@ class ZileanClient:
             connect_timeout=5,
             options='-c statement_timeout=10000'  # 10 second query timeout
         )
-    
-    def close(self):
-        """Close database connection."""
-        if self._connection and not self._connection.closed:
-            self._connection.close()
-            self._connection = None
     
     def _row_to_dict(self, row) -> Dict[str, Any]:
         """Convert database row to dictionary with proper field names."""
@@ -3428,7 +3404,8 @@ class DebridClient(ABC):
             except Exception:
                 pass  # Ignore close errors
         
-        # Zilean uses PostgreSQL connections which are managed separately
+        # Zilean opens a fresh PostgreSQL connection per search and closes it
+        # in each search method's finally block; nothing to clean up here.
     
     def __del__(self):
         """Destructor to ensure clients are closed on garbage collection."""
@@ -3881,20 +3858,6 @@ class TorboxClient(DebridClient):
             logger.debug("Error checking cached torrents: %s", e)
             return {h.lower(): False for h in hashes}
     
-    def get_search_engines(self) -> List[Dict[str, Any]]:
-        """Get user's configured search engines (Prowlarr/Jackett)."""
-        try:
-            response = self._request("GET", "/v1/api/user/settings/searchengines")
-            if response and isinstance(response, dict):
-                data = response.get("data", [])
-                if isinstance(data, list):
-                    return data
-            return []
-        except (APIError, APIResponseError) as e:
-            logger.debug("Search engines traceback:", exc_info=True)
-            logger.debug("Error getting search engines: %s", e)
-            return []
-
     def get_my_torrents(self) -> Optional[List[Dict[str, Any]]]:
         """Get all torrents in user's Torbox account.
 

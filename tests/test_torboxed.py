@@ -5143,19 +5143,6 @@ class TestZileanClientMethods(unittest.TestCase):
         # Should return False when no database_url
         self.assertFalse(client.is_configured())
     
-    def test_close_with_no_connection(self):
-        """Test close handles when no connection exists."""
-        from torboxed import ZileanClient
-        
-        client = ZileanClient.__new__(ZileanClient)
-        client._connection = None
-        
-        # Should not raise error
-        client.close()
-        
-        # Connection should still be None
-        self.assertIsNone(client._connection)
-    
     def test_row_to_dict_conversion(self):
         """Test _row_to_dict converts database row correctly."""
         from torboxed import ZileanClient
@@ -5249,31 +5236,6 @@ class TestTorboxClientMethods(unittest.TestCase):
         self.client = TorboxClient.__new__(TorboxClient)
         self.client.api_key = "test-key"
     
-    def test_get_search_engines_empty_response(self):
-        """Test get_search_engines handles empty response."""
-        from torboxed import TorboxClient
-        
-        with patch.object(TorboxClient, '_request', return_value=None):
-            result = self.client.get_search_engines()
-            self.assertEqual(result, [])
-    
-    def test_get_search_engines_success(self):
-        """Test get_search_engines returns list of engines."""
-        from torboxed import TorboxClient
-        
-        mock_response = {
-            "data": [
-                {"id": 1, "name": "1337x"},
-                {"id": 2, "name": "Knaben"},
-            ]
-        }
-        
-        with patch.object(TorboxClient, '_request', return_value=mock_response):
-            result = self.client.get_search_engines()
-            self.assertEqual(len(result), 2)
-            self.assertEqual(result[0]["name"], "1337x")
-
-
     @patch('time.sleep')
     def test_remove_torrent_retries_on_database_error(self, mock_sleep):
         """Test that remove_torrent retries on DATABASE_ERROR when torrent still exists.
