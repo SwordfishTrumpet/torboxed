@@ -8,7 +8,6 @@ requires-python = ">=3.9"
 dependencies = [
     "httpx>=0.24.0",
     "guessit>=3.7.0",
-    "python-dotenv>=1.2.1",
 ]
 
 [project.optional-dependencies]
