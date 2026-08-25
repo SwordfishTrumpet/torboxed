@@ -3380,6 +3380,35 @@ class DebridClient(ABC):
         self.searcher_prowlarr = ProwlarrClient()
         self.searcher_jackett = JackettClient()
     
+    def _request_with_limiter(self, method: str, url: str, limiter: 'RateLimiter', **kwargs):
+        """Shared limiter-aware request call for both debrid clients.
+
+        BUG-006 FIX: Passes rate_limiter so it gets updated on 429.
+        LOG-FIX (#7): On request failure (timeout, connection error), advances the
+        rate limiter via mark_success() so the next wait() call enforces the full
+        interval instead of a stale short wait. This prevents cascading
+        timeouts → 429 when a creation rate limit is breached. Keeping this logic
+        in one place ensures Torbox and Real Debrid cannot diverge again.
+
+        Args:
+            method: HTTP method
+            url: Full request URL
+            limiter: The RateLimiter guarding this endpoint
+            **kwargs: Additional arguments passed to make_request_with_backoff()
+
+        Returns:
+            httpx.Response from the transport
+
+        Raises:
+            APIError, APIResponseError: after marking the limiter successful
+        """
+        try:
+            return make_request_with_backoff(self.client, method, url,
+                                             rate_limiter=limiter, **kwargs)
+        except (APIError, APIResponseError):
+            limiter.mark_success()
+            raise
+
     def close(self):
         """BUG-004 FIX: Close all HTTP clients to prevent connection leaks.
         
@@ -3764,17 +3793,11 @@ class TorboxClient(DebridClient):
             current_limiter.wait()
             
             url = f"{TORBOX_BASE_URL}{path}"
-            # BUG-006 FIX: Pass rate_limiter so it gets updated on 429
-            try:
-                response = make_request_with_backoff(self.client, method, url, 
-                                                      rate_limiter=current_limiter,
-                                                      suppress_500_warnings=suppress_500_warnings, **kwargs)
-            except (APIError, APIResponseError):
-                # LOG-FIX: On request failure (timeout, connection error), update rate limiter
-                # so the next wait() call enforces the full interval instead of a stale short wait.
-                # This prevents cascading timeouts → 429 when the creation rate limit is breached.
-                current_limiter.mark_success()
-                raise
+            # BUG-006 FIX + LOG-FIX: shared helper updates limiter on 429 and
+            # on failure (timeout/connection error) so the next wait() enforces
+            # the full creation interval instead of a stale short wait.
+            response = self._request_with_limiter(method, url, current_limiter,
+                                                   suppress_500_warnings=suppress_500_warnings, **kwargs)
             
             # Handle 429 specially
             if response.status_code == 429:
@@ -4241,9 +4264,10 @@ class RealDebridClient(DebridClient):
             current_limiter.wait()
 
             url = f"{REAL_DEBRID_BASE_URL}{path}"
-            # BUG-006 FIX: Pass rate_limiter so it gets updated on 429
-            response = make_request_with_backoff(self.client, method, url, 
-                                                  rate_limiter=current_limiter, **kwargs)
+            # BUG-006 FIX + LOG-FIX (#7): shared helper keeps limiter behavior
+            # identical to TorboxClient (updates limiter on 429 and on failure),
+            # preventing the timeout → 429 cascade on the Real Debrid path.
+            response = self._request_with_limiter(method, url, current_limiter, **kwargs)
 
             # Handle 429 specially
             if response.status_code == 429:
