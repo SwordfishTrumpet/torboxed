@@ -8057,6 +8057,7 @@ Examples:
     
     # Run sync
     telegram = None
+    debrid = None
     sync_start_time = time.time()
     try:
         config = get_config()
