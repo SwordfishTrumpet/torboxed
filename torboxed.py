@@ -183,6 +183,7 @@ COMPLETE_PACK_MIN_SIZE = 10 * 1024**3  # 10 GB
 
 # Trakt pagination
 TRAKT_PER_PAGE = 100           # Maximum items per page (Trakt API max)
+TRAKT_MAX_PAGES = 100          # Safety cap on pagination loops per source
 
 # Zilean database config
 # Default connection string for Docker network (postgres container hostname)
@@ -2780,13 +2781,16 @@ class TraktClient:
             verify=True
         )
     
-    def _request(self, method: str, path: str, use_auth: bool = False, **kwargs) -> Any:
+    def _request(self, method: str, path: str, use_auth: bool = False,
+                 return_response: bool = False, **kwargs) -> Any:
         """Make rate-limited request to Trakt API.
         
         Args:
             method: HTTP method
             path: API endpoint path
             use_auth: If True, adds Authorization header with access token
+            return_response: If True, return the raw httpx.Response instead of
+                parsed JSON (used by pagination to read response headers)
             **kwargs: Additional request arguments
         """
         # Build headers
@@ -2814,53 +2818,92 @@ class TraktClient:
         if response.status_code >= 400:
             # VULN-005: Sanitize error text to prevent information disclosure
             error_text = sanitize_response_error(response)
-            raise APIError(f"Trakt API error: {response.status_code} - {error_text}", 
+            raise APIError(f"Trakt API error: {response.status_code} - {error_text}",
                           status_code=response.status_code)
-        
+
         # Mark successful request for rate limiting
         trakt_limiter.mark_success()
-        
+
+        if return_response:
+            return response
         return response.json() if response.text else None
-    
+
+    def _fetch_paginated(self, path: str, limit: Optional[int] = None,
+                         use_auth: bool = False,
+                         context: str = "Trakt response") -> List[Dict[str, Any]]:
+        """Fetch ALL pages of a paginated Trakt list endpoint.
+
+        Mirrors Trakt pagination semantics: requests ?page=N&limit=...
+        until X-Pagination-Page-Count is reached or a short page returns.
+        Capped at TRAKT_MAX_PAGES pages as a safety guard against a
+        misbehaving API that always returns full pages.
+
+        Args:
+            path: API endpoint path WITHOUT query string
+            limit: Maximum total items to fetch (None = all pages)
+            use_auth: Passed through to _request (authenticated endpoints)
+            context: Label used in validation error messages and logs
+
+        Returns:
+            Validated list of raw item dicts across all fetched pages
+        """
+        all_items: List[Dict[str, Any]] = []
+        remaining = limit
+        page_count_known = None
+        pages_fetched = 0
+
+        for page in range(1, TRAKT_MAX_PAGES + 1):
+            if remaining is not None and remaining <= 0:
+                break
+
+            per_page = TRAKT_PER_PAGE if remaining is None else min(TRAKT_PER_PAGE, remaining)
+            data = self._request(
+                "GET", f"{path}?page={page}&limit={per_page}",
+                use_auth=use_auth, return_response=True,
+            )
+
+            if data is None:
+                logger.warning("Failed to fetch %s (page %d) - stopping pagination", path, page)
+                break
+
+            validated = validate_list_response(data.json() if data.text else None, context=context)
+            all_items.extend(validated)
+            pages_fetched += 1
+            if remaining is not None:
+                remaining -= len(validated)
+
+            # Prefer authoritative header; fall back to short-page detection
+            try:
+                page_count_known = int(data.headers.get("x-pagination-page-count", ""))
+            except (TypeError, ValueError):
+                page_count_known = None
+
+            if page_count_known is not None:
+                if page >= page_count_known:
+                    break
+            elif len(validated) < TRAKT_PER_PAGE:
+                break
+        else:
+            logger.warning("%s: hit TRAKT_MAX_PAGES (%d) safety cap", context, TRAKT_MAX_PAGES)
+
+        logger.debug("Fetched %d items across %d page(s) from %s", len(all_items), pages_fetched, path)
+        return all_items
+
     def get_trending_movies(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get trending movies from Trakt."""
-        query = f"?limit={limit}" if limit else ""
-        data = self._request("GET", f"/movies/trending{query}")
-        # Validate response is a list of items with 'movie' key
-        return validate_list_response(
-            data, 
-            context="Trakt trending movies"
-        )
-    
+        return self._fetch_paginated("/movies/trending", limit, context="Trakt trending movies")
+
     def get_popular_movies(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get popular movies from Trakt."""
-        query = f"?limit={limit}" if limit else ""
-        data = self._request("GET", f"/movies/popular{query}")
-        # Validate response is a list of movie objects
-        return validate_list_response(
-            data,
-            context="Trakt popular movies"
-        )
-    
+        return self._fetch_paginated("/movies/popular", limit, context="Trakt popular movies")
+
     def get_trending_shows(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get trending shows from Trakt."""
-        query = f"?limit={limit}" if limit else ""
-        data = self._request("GET", f"/shows/trending{query}")
-        # Validate response is a list of items with 'show' key
-        return validate_list_response(
-            data,
-            context="Trakt trending shows"
-        )
+        return self._fetch_paginated("/shows/trending", limit, context="Trakt trending shows")
     
     def get_popular_shows(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get popular shows from Trakt."""
-        query = f"?limit={limit}" if limit else ""
-        data = self._request("GET", f"/shows/popular{query}")
-        # Validate response is a list of show objects
-        return validate_list_response(
-            data,
-            context="Trakt popular shows"
-        )
+        return self._fetch_paginated("/shows/popular", limit, context="Trakt popular shows")
     
     # =========================================================================
     # WATCHED MOVIES (all periods)
@@ -2875,11 +2918,9 @@ class TraktClient:
         """
         if period not in VALID_PERIODS:
             period = "weekly"
-        query = f"?limit={limit}" if limit else ""
-        data = self._request("GET", f"/movies/watched/{period}{query}")
-        return validate_list_response(
-            data,
-            context=f"Trakt watched movies ({period})"
+        return self._fetch_paginated(
+            "/movies/watched/{period}".format(period=period), limit,
+            context=f"Trakt watched movies ({period})".format(period=period)
         )
     
     # =========================================================================
@@ -2895,11 +2936,9 @@ class TraktClient:
         """
         if period not in VALID_PERIODS:
             period = "weekly"
-        query = f"?limit={limit}" if limit else ""
-        data = self._request("GET", f"/movies/collected/{period}{query}")
-        return validate_list_response(
-            data,
-            context=f"Trakt collected movies ({period})"
+        return self._fetch_paginated(
+            "/movies/collected/{period}".format(period=period), limit,
+            context=f"Trakt collected movies ({period})".format(period=period)
         )
     
     # =========================================================================
@@ -2908,21 +2947,11 @@ class TraktClient:
     
     def get_anticipated_movies(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get most anticipated upcoming movies."""
-        query = f"?limit={limit}" if limit else ""
-        data = self._request("GET", f"/movies/anticipated{query}")
-        return validate_list_response(
-            data,
-            context="Trakt anticipated movies"
-        )
+        return self._fetch_paginated("/movies/anticipated", limit, context="Trakt anticipated movies")
     
     def get_boxoffice_movies(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get box office top 10 movies."""
-        query = f"?limit={limit}" if limit else ""
-        data = self._request("GET", f"/movies/boxoffice{query}")
-        return validate_list_response(
-            data,
-            context="Trakt boxoffice movies"
-        )
+        return self._fetch_paginated("/movies/boxoffice", limit, context="Trakt boxoffice movies")
     
     # =========================================================================
     # WATCHED SHOWS (all periods)
@@ -2937,11 +2966,9 @@ class TraktClient:
         """
         if period not in VALID_PERIODS:
             period = "weekly"
-        query = f"?limit={limit}" if limit else ""
-        data = self._request("GET", f"/shows/watched/{period}{query}")
-        return validate_list_response(
-            data,
-            context=f"Trakt watched shows ({period})"
+        return self._fetch_paginated(
+            "/shows/watched/{period}".format(period=period), limit,
+            context=f"Trakt watched shows ({period})".format(period=period)
         )
     
     # =========================================================================
@@ -2957,11 +2984,9 @@ class TraktClient:
         """
         if period not in VALID_PERIODS:
             period = "weekly"
-        query = f"?limit={limit}" if limit else ""
-        data = self._request("GET", f"/shows/collected/{period}{query}")
-        return validate_list_response(
-            data,
-            context=f"Trakt collected shows ({period})"
+        return self._fetch_paginated(
+            "/shows/collected/{period}".format(period=period), limit,
+            context=f"Trakt collected shows ({period})".format(period=period)
         )
     
     # =========================================================================
@@ -2970,12 +2995,7 @@ class TraktClient:
     
     def get_anticipated_shows(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get most anticipated upcoming shows."""
-        query = f"?limit={limit}" if limit else ""
-        data = self._request("GET", f"/shows/anticipated{query}")
-        return validate_list_response(
-            data,
-            context="Trakt anticipated shows"
-        )
+        return self._fetch_paginated("/shows/anticipated", limit, context="Trakt anticipated shows")
     
     def get_all_content(self, sources: List[str]) -> List[Dict[str, Any]]:
         """Get content from specified Trakt sources.
@@ -2986,8 +3006,10 @@ class TraktClient:
         - Shows: trending, popular, watched/{weekly,monthly,yearly,all},
                   collected/{weekly,monthly,yearly,all}, anticipated
         
-        Returns ALL items from ALL sources (no limits, no deduplication at API level).
-        Database handles duplicates via is_processed() check.
+        Returns ALL items from ALL sources: public curated lists are fully
+        paginated via _fetch_paginated(), liked lists likewise fetch every
+        page. No deduplication at API level; database handles duplicates
+        via is_processed() check.
         """
         content = []
         
@@ -3111,43 +3133,14 @@ class TraktClient:
         Returns:
             List of liked list objects containing list metadata
         """
-        all_liked_lists = []
-        page = 1
-        per_page = TRAKT_PER_PAGE
+        validated = self._fetch_paginated(
+            "/users/likes/lists", limit, use_auth=True, context="Trakt liked lists"
+        )
         
-        while True:
-            # Build query with pagination
-            if limit:
-                query = f"?page={page}&limit={min(per_page, limit - len(all_liked_lists))}"
-            else:
-                query = f"?page={page}&limit={per_page}"
-            
-            data = self._request("GET", f"/users/likes/lists{query}", use_auth=True)
-            
-            if data is None:
-                logger.warning("Failed to fetch liked lists - authentication may be required")
-                break
-            
-            # Validate response is a list
-            validated = validate_list_response(
-                data,
-                context="Trakt liked lists"
-            )
-            
-            # Extract list info from each liked item
-            for item in validated:
-                if isinstance(item, dict) and "list" in item:
-                    all_liked_lists.append(item)
-            
-            # Check if we've reached the limit or got fewer items than requested
-            if limit and len(all_liked_lists) >= limit:
-                break
-            
-            if len(validated) < per_page:
-                # No more pages
-                break
-            
-            page += 1
+        # Extract list info from each liked item
+        all_liked_lists = [
+            item for item in validated if isinstance(item, dict) and "list" in item
+        ]
         
         logger.info("Found %d liked lists from Trakt", len(all_liked_lists))
         return all_liked_lists
