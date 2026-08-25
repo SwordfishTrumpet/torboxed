@@ -7419,5 +7419,64 @@ class TestRecordProcessedHistoryPreservation(unittest.TestCase):
         self.assertIsNone(row["replaced_id"])
 
 
+class TestMainCrashHandler(unittest.TestCase):
+    """Regression tests for the sync-block cleanup in main().
+
+    The finally block must not raise NameError for resources that were
+    never assigned when an early statement in the sync block fails.
+    """
+
+    def _run_main_with_failing_config(self):
+        """Run main()'s sync path with get_config() raising; return exit code."""
+        import torboxed
+
+        db_dir = Path(tempfile.mkdtemp())
+        (db_dir / 'torboxed.db').touch()
+
+        with patch.object(sys, 'argv', ['torboxed.py']), \
+             patch.object(torboxed, 'DB_PATH', new=db_dir / 'torboxed.db'), \
+             patch.object(torboxed, 'check_and_acquire_lock', return_value=True), \
+             patch.object(torboxed, 'migrate_db'), \
+             patch.object(torboxed, 'get_trakt_id', return_value='tt0111161'), \
+             patch.object(torboxed, 'get_config', side_effect=ValueError('corrupt config JSON')):
+            # create_debrid_client must never be reached; if it is, fail loudly
+            with patch.object(torboxed, 'create_debrid_client',
+                              side_effect=AssertionError('should not be reached')):
+                with self.assertRaises(SystemExit) as cm:
+                    torboxed.main()
+        return cm.exception.code
+
+    def test_early_sync_failure_exits_1_without_name_error(self):
+        """A failure before debrid assignment must surface SystemExit(1), not NameError."""
+        code = self._run_main_with_failing_config()
+        self.assertEqual(code, 1)
+
+    def test_original_exception_is_reported_not_masked(self):
+        """The logged fatal error should be the original exception."""
+        import torboxed
+
+        db_dir = Path(tempfile.mkdtemp())
+        (db_dir / 'torboxed.db').touch()
+
+        logged = []
+        with patch.object(sys, 'argv', ['torboxed.py']), \
+             patch.object(torboxed, 'DB_PATH', new=db_dir / 'torboxed.db'), \
+             patch.object(torboxed, 'check_and_acquire_lock', return_value=True), \
+             patch.object(torboxed, 'migrate_db'), \
+             patch.object(torboxed, 'get_trakt_id', return_value='tt0111161'), \
+             patch.object(torboxed, 'get_config', side_effect=ValueError('corrupt config JSON')):
+            # Capture the fatal log line emitted by the top-level handler.
+            orig_exception = torboxed.logger.exception
+            torboxed.logger.exception = lambda msg, *a, **k: logged.append(msg % a if a else msg)
+            try:
+                with self.assertRaises(SystemExit):
+                    torboxed.main()
+            finally:
+                torboxed.logger.exception = orig_exception
+        combined = '\n'.join(logged)
+        self.assertIn('Fatal error during sync', combined)
+        self.assertIn('corrupt config JSON', combined)
+
+
 if __name__ == "__main__":
     unittest.main()
