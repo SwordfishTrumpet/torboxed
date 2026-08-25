@@ -6745,5 +6745,168 @@ class TestRedirectMiddlewareAuth(unittest.TestCase):
                 self.assertEqual(self.start_calls[0][0], "200 OK", f"path {path} not challenged")
 
 
+class TestTraktPagination(unittest.TestCase):
+    """Public Trakt source methods must fetch ALL pages, not just page 1.
+
+    Regression tests for the silent ~60% data loss where public curated
+    list endpoints issued a single unpaginated request (limit=100).
+    """
+
+    def _make_client(self):
+        from torboxed import TraktClient
+        return TraktClient.__new__(TraktClient)
+
+    class _FakePage:
+        """Minimal httpx.Response stand-in for pagination tests."""
+
+        def __init__(self, items, page_count=None):
+            self._items = items
+            self._text = json.dumps(items)
+            headers = {"x-pagination-item-count": str(len(items))}
+            if page_count is not None:
+                headers["x-pagination-page-count"] = str(page_count)
+            self.headers = headers
+            self.status_code = 200
+
+        @property
+        def text(self):
+            return self._text
+
+        def json(self):
+            return self._items
+
+    def _patch_request(self, pages, total_page_count=None):
+        """Patch TraktClient._request to serve canned pages keyed by page number."""
+        client = self._make_client()
+        state = {"requested": []}
+
+        def fake_request(method, path, use_auth=False, return_response=False, **kwargs):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(path).query)
+            page = int(qs["page"][0])
+            limit = int(qs["limit"][0])
+            state["requested"].append((page, limit))
+            items = pages.get(page, [])
+            # Respect the requested per-page limit (simulates truncated fetch)
+            pc = total_page_count
+            return self._FakePage(items[:limit], page_count=pc)
+
+        return client, state, patch.object(client, "_request", side_effect=fake_request)
+
+    def test_multi_page_collection_via_header(self):
+        """Trending movies: all pages fetched when X-Pagination-Page-Count known."""
+        pages = {
+            1: [{"movie": {"title": f"M{i}"}} for i in range(100)],
+            2: [{"movie": {"title": f"M{i}"}} for i in range(100, 200)],
+            3: [{"movie": {"title": f"M{i}"}} for i in range(200, 251)],
+        }
+        client, state, p = self._patch_request(pages, total_page_count=3)
+        with p:
+            result = client.get_trending_movies()
+        self.assertEqual(len(result), 251)
+        self.assertEqual([pg for pg, _ in state["requested"]], [1, 2, 3])
+        self.assertTrue(all(lim == 100 for _, lim in state["requested"]))
+
+    def test_short_page_stops_without_header(self):
+        """Without page-count header, a short page terminates pagination."""
+        pages = {
+            1: [{"show": {"title": f"S{i}"}} for i in range(100)],
+            2: [{"show": {"title": "LastOne"}}],
+        }
+        client, state, p = self._patch_request(pages)  # no page-count header
+        with p:
+            result = client.get_trending_shows()
+        self.assertEqual(len(result), 101)
+        self.assertEqual([pg for pg, _ in state["requested"]], [1, 2])
+
+    def test_explicit_limit_caps_requests(self):
+        """Explicit limit fetches exactly that many items across pages."""
+        pages = {
+            1: [{"movie": {"title": f"M{i}"}} for i in range(100)],
+            2: [{"movie": {"title": f"M{i}"}} for i in range(100, 200)],
+        }
+        client, state, p = self._patch_request(pages, total_page_count=2)
+        with p:
+            result = client.get_popular_movies(limit=150)
+        self.assertEqual(len(result), 150)
+        self.assertEqual(state["requested"][0], (1, 100))
+        self.assertEqual(state["requested"][1], (2, 50))
+
+    def test_max_pages_safety_cap(self):
+        """An API that always returns full pages without headers is capped."""
+        import torboxed
+        full_page = [{"movie": {"title": "X"}} for _ in range(100)]
+        pages = {i: full_page for i in range(1, 11)}
+        client, state, p = self._patch_request(pages)  # no headers => short-page never triggers
+        with patch.object(torboxed, "TRAKT_MAX_PAGES", 3):
+            with p:
+                result = client.get_trending_movies()
+        self.assertEqual(len(result), 300)
+        self.assertEqual(len(state["requested"]), 3)
+
+    def test_request_failure_stops_with_partial_results(self):
+        """A failed page (None from _request, e.g. auth/429) keeps earlier pages."""
+        client = self._make_client()
+        first_page = self._FakePage([{"movie": {"title": "Only"}}], page_count=5)
+        responses = [first_page, None]
+
+        with patch.object(client, "_request", side_effect=lambda *a, **k: responses.pop(0)):
+            result = client.get_boxoffice_movies()
+        self.assertEqual(len(result), 1)
+
+    def test_period_endpoints_pass_full_path(self):
+        """Watched/collected endpoints build path including period."""
+        client = self._make_client()
+        for method_name, expected_path in [
+            ("get_watched_movies", "/movies/watched/monthly"),
+            ("get_collected_shows", "/shows/collected/all"),
+        ]:
+            period = "monthly" if "movies" in method_name else "all"
+            with patch.object(client, "_fetch_paginated", return_value=[]) as fp:
+                getattr(client, method_name)(period=period)
+                fp.assert_called_once()
+                self.assertEqual(fp.call_args[0][0], expected_path)
+
+    def test_invalid_period_defaults_to_weekly(self):
+        """Invalid period falls back to weekly before building the path."""
+        client = self._make_client()
+        with patch.object(client, "_fetch_paginated", return_value=[]) as fp:
+            client.get_collected_movies(period="bogus")
+        self.assertEqual(fp.call_args[0][0], "/movies/collected/weekly")
+
+    def test_liked_lists_reuse_helper_and_filter(self):
+        """get_liked_lists delegates to _fetch_paginated and keeps list items."""
+        client = self._make_client()
+        validated = [
+            {"list": {"name": "My List", "ids": {}, "user": {}}},
+            {"not_a_list": True},
+        ]
+        with patch.object(client, "_fetch_paginated", return_value=validated) as fp:
+            result = client.get_liked_lists(limit=5)
+        fp.assert_called_once_with(
+            "/users/likes/lists", 5, use_auth=True, context="Trakt liked lists"
+        )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["list"]["name"], "My List")
+
+    def test_all_public_sources_route_through_helper(self):
+        """Every public source method goes through the paginated helper."""
+        client = self._make_client()
+        cases = [
+            (("get_popular_movies",), {}),
+            (("get_popular_shows",), {}),
+            (("get_anticipated_movies",), {}),
+            (("get_anticipated_shows",), {}),
+            (("get_watched_movies",), {"period": "weekly"}),
+            (("get_watched_shows",), {"period": "yearly"}),
+            (("get_collected_movies",), {}),
+            (("get_collected_shows",), {}),
+        ]
+        for (method_name,), kwargs in cases:
+            with patch.object(client, "_fetch_paginated", return_value=[]) as fp:
+                getattr(client, method_name)(**kwargs)
+                self.assertEqual(fp.call_count, 1, method_name)
+
+
 if __name__ == "__main__":
     unittest.main()
