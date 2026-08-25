@@ -136,10 +136,134 @@ def create_httpx_client(**kwargs) -> httpx.Client:
     return httpx.Client(**kwargs)
 
 
-# Paths (using secure defaults)
-DB_PATH = Path("torboxed.db")
-ENV_PATH = Path(".env")
-LOG_PATH = Path("torboxed.log")
+def load_env() -> Dict[str, str]:
+    """Parse .env file manually (no python-dotenv dependency)."""
+    env = {}
+    if ENV_PATH.exists():
+        for line in ENV_PATH.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                env[key] = value
+    return env
+
+
+# Global cache for lazy-loaded API keys
+_env_cache: Optional[Dict[str, str]] = None
+
+
+def get_env() -> Dict[str, str]:
+    """Lazy-load environment variables from os.environ and .env file.
+
+    os.environ takes precedence over .env (for Docker compose overrides).
+    Native runs (no os.environ overrides) use .env values.
+    """
+    global _env_cache
+    if _env_cache is None:
+        _env_cache = {**load_env(), **os.environ}
+    return _env_cache
+
+
+def validate_db_path(path: Path) -> Path:
+    """Validate database path is within allowed directories.
+
+    VULN-004 Fix: Prevent path traversal via DB_PATH environment variable.
+    BUG-007 FIX: Use os.path.realpath() to prevent symlink bypass attacks.
+
+    Args:
+        path: Database path to validate
+
+    Returns:
+        Validated path
+
+    Raises:
+        ValueError: If path is outside allowed directories
+    """
+    # BUG-007 FIX: Use realpath to resolve all symlinks before validation
+    resolved = Path(os.path.realpath(path))
+
+    # Allowed root directories (in order of preference)
+    # BUG-007 FIX: Also resolve symlinks in allowed roots
+    allowed_roots = [
+        Path(os.path.realpath(Path.home() / '.local' / 'share' / 'torboxed')),
+        Path(os.path.realpath(Path('/data'))),  # Docker mount
+        Path(os.path.realpath(Path.cwd())),
+        Path(os.path.realpath(Path(tempfile.gettempdir()))),  # Temp directory for tests
+    ]
+
+    # Check if path is within any allowed root
+    for root in allowed_roots:
+        try:
+            resolved.relative_to(root)
+            return resolved
+        except ValueError:
+            continue
+
+    raise ValueError(f"DB_PATH {path} is outside allowed directories. "
+                     f"Allowed: home/.local/share/torboxed, /data, current directory")
+
+
+def validate_log_path(path: Path) -> Path:
+    """Validate log path is within allowed directories.
+
+    VULN-004 Fix: Prevent path traversal via LOG_PATH environment variable.
+    BUG-007 FIX: Use os.path.realpath() to prevent symlink bypass attacks.
+
+    Args:
+        path: Log path to validate
+
+    Returns:
+        Validated path
+
+    Raises:
+        ValueError: If path is outside allowed directories
+    """
+    # BUG-007 FIX: Use realpath to resolve all symlinks before validation
+    resolved = Path(os.path.realpath(path))
+
+    # Allowed root directories
+    # BUG-007 FIX: Also resolve symlinks in allowed roots
+    allowed_roots = [
+        Path(os.path.realpath(Path.home() / '.local' / 'share' / 'torboxed')),
+        Path(os.path.realpath(Path('/data'))),
+        Path(os.path.realpath(Path('/var/log'))),
+        Path(os.path.realpath(Path.cwd())),
+        Path(os.path.realpath(Path(tempfile.gettempdir()))),  # Temp directory for tests
+    ]
+
+    # Check if path is within any allowed root
+    for root in allowed_roots:
+        try:
+            resolved.relative_to(root)
+            return resolved
+        except ValueError:
+            continue
+
+    raise ValueError(f"LOG_PATH {path} is outside allowed directories. "
+                     f"Allowed: home/.local/share/torboxed, /data, /var/log, current directory")
+
+
+def _path_from_env(env_var: str, default: str) -> Path:
+    """Resolve a configurable filesystem path setting.
+
+    Reads env_var from the merged environment (os.environ takes precedence
+    over the .env file, matching get_env()). Falls back to default when unset.
+    Callers are expected to run the result through validate_db_path() or
+    validate_log_path().
+    """
+    raw = get_env().get(env_var)
+    return Path(raw) if raw else Path(default)
+
+
+# Paths. ENV_PATH must come from os.environ directly (the location of the
+# .env file cannot itself be configured inside the .env file). DB_PATH and
+# LOG_PATH honor their documented environment variables via the merged
+# environment and are validated against the VULN-004/BUG-007 path-traversal
+# rules before use, so a hostile value fails fast instead of silently
+# pointing writes outside the allowed roots.
+ENV_PATH = Path(os.environ.get("ENV_PATH", ".env"))
+DB_PATH = validate_db_path(_path_from_env("DB_PATH", "torboxed.db"))
+LOG_PATH = validate_log_path(_path_from_env("LOG_PATH", "torboxed.log"))
 LOCK_PATH = get_lock_path()
 
 # Logging configuration
@@ -302,84 +426,6 @@ def sanitize_response_error(response: Any) -> str:
     except (UnicodeDecodeError, AttributeError):
         return "<unable to decode response>"
 
-
-def validate_db_path(path: Path) -> Path:
-    """Validate database path is within allowed directories.
-    
-    VULN-004 Fix: Prevent path traversal via DB_PATH environment variable.
-    BUG-007 FIX: Use os.path.realpath() to prevent symlink bypass attacks.
-    
-    Args:
-        path: Database path to validate
-        
-    Returns:
-        Validated path
-        
-    Raises:
-        ValueError: If path is outside allowed directories
-    """
-    # BUG-007 FIX: Use realpath to resolve all symlinks before validation
-    resolved = Path(os.path.realpath(path))
-    
-    # Allowed root directories (in order of preference)
-    # BUG-007 FIX: Also resolve symlinks in allowed roots
-    allowed_roots = [
-        Path(os.path.realpath(Path.home() / '.local' / 'share' / 'torboxed')),
-        Path(os.path.realpath(Path('/data'))),  # Docker mount
-        Path(os.path.realpath(Path.cwd())),
-        Path(os.path.realpath(Path(tempfile.gettempdir()))),  # Temp directory for tests
-    ]
-    
-    # Check if path is within any allowed root
-    for root in allowed_roots:
-        try:
-            resolved.relative_to(root)
-            return resolved
-        except ValueError:
-            continue
-    
-    raise ValueError(f"DB_PATH {path} is outside allowed directories. "
-                     f"Allowed: home/.local/share/torboxed, /data, current directory")
-
-
-def validate_log_path(path: Path) -> Path:
-    """Validate log path is within allowed directories.
-    
-    VULN-004 Fix: Prevent path traversal via LOG_PATH environment variable.
-    BUG-007 FIX: Use os.path.realpath() to prevent symlink bypass attacks.
-    
-    Args:
-        path: Log path to validate
-        
-    Returns:
-        Validated path
-        
-    Raises:
-        ValueError: If path is outside allowed directories
-    """
-    # BUG-007 FIX: Use realpath to resolve all symlinks before validation
-    resolved = Path(os.path.realpath(path))
-    
-    # Allowed root directories
-    # BUG-007 FIX: Also resolve symlinks in allowed roots
-    allowed_roots = [
-        Path(os.path.realpath(Path.home() / '.local' / 'share' / 'torboxed')),
-        Path(os.path.realpath(Path('/data'))),
-        Path(os.path.realpath(Path('/var/log'))),
-        Path(os.path.realpath(Path.cwd())),
-        Path(os.path.realpath(Path(tempfile.gettempdir()))),  # Temp directory for tests
-    ]
-    
-    # Check if path is within any allowed root
-    for root in allowed_roots:
-        try:
-            resolved.relative_to(root)
-            return resolved
-        except ValueError:
-            continue
-    
-    raise ValueError(f"LOG_PATH {path} is outside allowed directories. "
-                     f"Allowed: home/.local/share/torboxed, /data, /var/log, current directory")
 
 
 class RateLimitedLogHandler(RotatingFileHandler):
@@ -1448,34 +1494,6 @@ def log_result(action: str, title: str, details: Dict[str, Any] = None):
         logger.info("[%s] %s | %s", action.upper(), title, detail_str)
     else:
         logger.info("[%s] %s", action.upper(), title)
-
-
-def load_env() -> Dict[str, str]:
-    """Parse .env file manually (no python-dotenv dependency)."""
-    env = {}
-    if ENV_PATH.exists():
-        for line in ENV_PATH.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, value = line.split("=", 1)
-                env[key] = value
-    return env
-
-
-# Global cache for lazy-loaded API keys
-_env_cache: Optional[Dict[str, str]] = None
-
-
-def get_env() -> Dict[str, str]:
-    """Lazy-load environment variables from os.environ and .env file.
-
-    os.environ takes precedence over .env (for Docker compose overrides).
-    Native runs (no os.environ overrides) use .env values.
-    """
-    global _env_cache
-    if _env_cache is None:
-        _env_cache = {**load_env(), **os.environ}
-    return _env_cache
 
 
 def get_torbox_key() -> Optional[str]:

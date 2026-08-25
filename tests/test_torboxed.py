@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
 import tempfile
+import shutil
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -33,6 +34,8 @@ from torboxed import (
     build_search_result, normalize_search_query, encode_magnet_link, normalize_hash,
     # Constants
     COMPLETE_PACK_MIN_SIZE, RD_CACHE_CHECK_BATCH,
+    # Path configuration (issue #6)
+    _path_from_env,
     # WebDAV / torrent_files
     store_torrent_files, get_torrent_files, get_video_file_for_episode, get_subtitle_files,
     cleanup_orphan_torrent_files,
@@ -7135,6 +7138,88 @@ class TestMultiSeasonServiceLabel(unittest.TestCase):
         torboxed._apply_multi_season_updates(updates)
         rec = self._get_record('tt3333333', 'S05')
         self.assertEqual(rec['debrid_id'], 'existing-id')
+
+
+class TestPathConfiguration(unittest.TestCase):
+    """DB_PATH/LOG_PATH/ENV_PATH env var resolution and validation (issue #6).
+
+    Module-level constants are resolved at import time; these tests exercise
+    the helpers used for that resolution plus the VULN-004/BUG-007 validators.
+    """
+
+    def setUp(self):
+        """Isolate tests from the developer's real .env and environment."""
+        import torboxed
+        self.torboxed = torboxed
+        self._saved_env_cache = torboxed._env_cache
+        self._saved_environ = dict(os.environ)
+        self._saved_env_path = torboxed.ENV_PATH
+        self.temp_dir = tempfile.mkdtemp(prefix="torboxed-paths-")
+        os.environ.clear()
+        os.environ["PATH"] = self._saved_environ.get("PATH", "/usr/bin:/bin")
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._saved_environ)
+        self.torboxed._env_cache = self._saved_env_cache
+        self.torboxed.ENV_PATH = self._saved_env_path
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _write_env_file(self, content):
+        env_file = Path(self.temp_dir) / ".env"
+        env_file.write_text(content)
+        return env_file
+
+    def test_path_from_env_defaults_when_unset(self):
+        """Without DB_PATH/LOG_PATH anywhere, defaults are returned."""
+        self.assertEqual(_path_from_env("DB_PATH", "torboxed.db"), Path("torboxed.db"))
+        self.assertEqual(_path_from_env("LOG_PATH", "torboxed.log"), Path("torboxed.log"))
+
+    def test_path_from_env_os_environ_wins_over_dotenv(self):
+        """os.environ takes precedence over the .env file (matches get_env())."""
+        env_file = self._write_env_file("DB_PATH=/from/dotenv/torboxed.db\n")
+        self.torboxed.ENV_PATH = env_file
+        self.torboxed._env_cache = None
+        os.environ["DB_PATH"] = "/from/environ/torboxed.db"
+        self.assertEqual(
+            _path_from_env("DB_PATH", "torboxed.db"),
+            Path("/from/environ/torboxed.db"),
+        )
+
+    def test_path_from_env_reads_dotenv_file(self):
+        """A value defined only in the .env file is honored."""
+        env_file = self._write_env_file("LOG_PATH=/from/dotenv/torboxed.log\n")
+        self.torboxed.ENV_PATH = env_file
+        self.torboxed._env_cache = None
+        self.assertEqual(
+            _path_from_env("LOG_PATH", "torboxed.log"),
+            Path("/from/dotenv/torboxed.log"),
+        )
+
+    def test_validate_db_path_accepts_tempdir(self):
+        """Paths under allowed roots (tempdir) pass validation."""
+        candidate = Path(self.temp_dir) / "custom.db"
+        result = validate_db_path(candidate)
+        self.assertEqual(result, Path(os.path.realpath(candidate)))
+
+    def test_validate_db_path_rejects_outside_allowed_roots(self):
+        """VULN-004: paths outside all allowed roots raise ValueError."""
+        with self.assertRaises(ValueError):
+            validate_db_path(Path("/etc/passwd"))
+
+    def test_validate_db_path_rejects_symlink_escape(self):
+        """BUG-007: a symlink pointing outside allowed roots is rejected."""
+        link = Path(self.temp_dir) / "escape.db"
+        os.symlink("/etc/passwd", link)
+        with self.assertRaises(ValueError):
+            validate_db_path(link)
+
+    def test_validate_log_path_accepts_tempdir_and_rejects_outside(self):
+        """Log validator mirrors DB validator semantics."""
+        candidate = Path(self.temp_dir) / "custom.log"
+        self.assertEqual(validate_log_path(candidate), Path(os.path.realpath(candidate)))
+        with self.assertRaises(ValueError):
+            validate_log_path(Path("/etc/passwd"))
 
 
 class TestRecordProcessedHistoryPreservation(unittest.TestCase):
