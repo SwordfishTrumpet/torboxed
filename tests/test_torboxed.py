@@ -7222,6 +7222,44 @@ class TestPathConfiguration(unittest.TestCase):
             validate_log_path(Path("/etc/passwd"))
 
 
+class TestTelegramTokenNotLogged(unittest.TestCase):
+    """Regression test for issue #8: the bot token must never reach logs.
+
+    The failed-setup path of _setup_telegram_interactive() used to echo the
+    full bot token into the rotating log file via logger.info().
+    """
+
+    TOKEN = "123456789:ABCdefGHIjklMNOpqrstuvwxyz1234567890"
+    CHAT_ID = "987654321"
+
+    def _run_setup_failure(self):
+        import torboxed
+        answers = iter(["y", self.TOKEN, self.CHAT_ID])
+
+        class _FakeNotifier:
+            def is_configured(self):
+                return True
+
+            def _send_message(self, text):
+                return False  # simulate failed test message
+
+            def close(self):
+                pass
+
+        with patch("builtins.input", side_effect=answers), \
+             patch.object(torboxed, "TelegramNotifier", return_value=_FakeNotifier()):
+            with self.assertLogs("torboxed", level="INFO") as captured:
+                torboxed._setup_telegram_interactive()
+        return "\n".join(captured.output)
+
+    def test_failed_setup_does_not_log_token_or_chat_id(self):
+        output = self._run_setup_failure()
+        self.assertNotIn(self.TOKEN, output)
+        self.assertNotIn(self.CHAT_ID, output)
+        # User still gets actionable guidance
+        self.assertIn("--init", output)
+
+
 class TestLimiterMarkSuccessOnFailure(unittest.TestCase):
     """Regression test for issue #7 (timeout → 429 cascade on Real Debrid).
 
