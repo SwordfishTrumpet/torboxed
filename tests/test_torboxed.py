@@ -2983,6 +2983,9 @@ class TestTraktLikedLists(unittest.TestCase):
         mock_response = Mock()
         mock_response.status_code = 200
         mock_response.text = '[]'
+        # Issue #20: get_list_items now uses _fetch_paginated, which reads
+        # data.json() - the mock must return the actual parsed payload.
+        mock_response.json.return_value = []
         mock_request.return_value = mock_response
         
         result = self.client.get_list_items("testuser", "empty-list")
@@ -7266,11 +7269,53 @@ class TestTraktPagination(unittest.TestCase):
             (("get_watched_shows",), {"period": "yearly"}),
             (("get_collected_movies",), {}),
             (("get_collected_shows",), {}),
+            (("get_list_items",), {"username": "u", "list_id": "l"}),
         ]
         for (method_name,), kwargs in cases:
             with patch.object(client, "_fetch_paginated", return_value=[]) as fp:
                 getattr(client, method_name)(**kwargs)
                 self.assertEqual(fp.call_count, 1, method_name)
+
+    # =========================================================================
+    # Issue #20: get_list_items must inherit the shared pagination guardrails
+    # =========================================================================
+
+    def test_get_list_items_full_pages_forever_stops_at_cap(self):
+        """Adversarial API returning full pages without headers terminates
+        at TRAKT_MAX_PAGES instead of looping forever (old behavior)."""
+        import torboxed
+        full_page = [{"movie": {"title": "X"}} for _ in range(100)]
+        pages = {i: full_page for i in range(1, 11)}
+        client, state, p = self._patch_request(pages)  # no page-count header
+        with patch.object(torboxed, "TRAKT_MAX_PAGES", 3):
+            with p:
+                result = client.get_list_items("someuser", "some-list")
+        self.assertEqual(len(result), 300)
+        self.assertEqual(len(state["requested"]), 3)
+
+    def test_get_list_items_short_page_stops_early(self):
+        """A short final page terminates pagination without a header."""
+        pages = {
+            1: [{"show": {"title": f"S{i}"}} for i in range(100)],
+            2: [{"show": {"title": "LastOne"}}],
+        }
+        client, state, p = self._patch_request(pages)
+        with p:
+            result = client.get_list_items("someuser", "some-list")
+        self.assertEqual(len(result), 101)
+        self.assertEqual([pg for pg, _ in state["requested"]], [1, 2])
+
+    def test_get_list_items_header_page_count_honored(self):
+        """X-Pagination-Page-Count is respected as authoritative end signal."""
+        pages = {
+            1: [{"movie": {"title": f"M{i}"}} for i in range(100)],
+            2: [{"movie": {"title": f"M{i}"}} for i in range(100, 150)],
+        }
+        client, state, p = self._patch_request(pages, total_page_count=2)
+        with p:
+            result = client.get_list_items("someuser", "some-list")
+        self.assertEqual(len(result), 150)
+        self.assertEqual([pg for pg, _ in state["requested"]], [1, 2])
 
 
 class TestCleanupDuplicatesGrouping(unittest.TestCase):
