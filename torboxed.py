@@ -305,6 +305,12 @@ DISCOVERY_COMPLETENESS_THRESHOLD = 0.95
 # Large complete packs with unknown resolution metadata may still be high quality
 COMPLETE_PACK_MIN_SIZE = 10 * 1024**3  # 10 GB
 
+# SQLite busy timeout (seconds): how long a writer waits for the write lock
+# before failing. WebDAV (--serve) and cron syncs share one database; without
+# this, any write colliding with another connection's write lock fails with
+# "database is locked" and aborts an in-flight sync.
+DB_BUSY_TIMEOUT_SECONDS = 10.0
+
 # Trakt pagination
 TRAKT_PER_PAGE = 100           # Maximum items per page (Trakt API max)
 TRAKT_MAX_PAGES = 100          # Safety cap on pagination loops per source
@@ -1542,16 +1548,19 @@ def get_db():
     """Context manager for database connections with error handling.
     
     Uses WAL mode for concurrent read access (WebDAV + sync) and
-    check_same_thread=False for multi-threaded wsgidav.
+    check_same_thread=False for multi-threaded wsgidav. The explicit busy
+    timeout makes writers wait for the write lock instead of failing
+    instantly when a concurrent WebDAV cache write and sync write collide.
     """
     conn = None
     try:
-        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False,
+                               timeout=DB_BUSY_TIMEOUT_SECONDS)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         yield conn
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.error("Database error: %s", e)
         raise
     finally:
         if conn:
