@@ -4630,6 +4630,244 @@ class TestProcessSeasonWithExistingTorrents(unittest.TestCase):
         self.assertEqual(processed["debrid_id"], "new-tb-id")
 
 
+class TestCompletenessReconciliation(unittest.TestCase):
+    """Issue #18 regression tests: completeness-driven upgrades.
+
+    Two defects covered:
+    1. Cross-level additions duplicated coverage instead of replacing:
+       a Complete pack discovered after an S01-Sxx pack was stored under a
+       different season key, so the per-key lookup missed and both packs
+       accumulated in the debrid account.
+    2. Same-range multi-season packs bypassed the +500 quality threshold
+       because historical records classified as plain 'season' without
+       SeasonInfo context.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.test_db_path = Path(self.temp_dir.name) / "test.db"
+
+        import torboxed
+        self.original_db_path = torboxed.DB_PATH
+        torboxed.DB_PATH = self.test_db_path
+        torboxed.init_db()
+
+        self.mock_debrid = Mock()
+        self.mock_trakt = Mock()
+        self.engine = torboxed.SyncEngine(self.mock_debrid, self.mock_trakt, {
+            "sources": ["shows/trending"],
+            "filters": {"exclude": ["CAM", "TS", "HDCAM"], "min_resolution_score": 800}
+        })
+
+    def tearDown(self):
+        import torboxed
+        torboxed.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+
+    def _torrent(self, name, magnet, hash_hex, score, seasons=None,
+                 is_complete=False, label="S01"):
+        import torboxed
+        return torboxed.TorrentResult(
+            name=name,
+            magnet=magnet,
+            hash=hash_hex,
+            availability=True,
+            size=50000,
+            quality=torboxed.QualityInfo(resolution="1080p", source="Blu-ray",
+                                         codec="H.264", score=score),
+            season_info=torboxed.SeasonInfo(seasons=seasons or [1],
+                                            is_complete=is_complete,
+                                            season_label=label,
+                                            is_pack=True),
+        )
+
+    def test_ranged_key_classifies_as_multi_season(self):
+        """classify_media_level infers multi_season from ranged labels alone."""
+        import torboxed
+        self.assertEqual(torboxed.classify_media_level("S01-S05", "show"), "multi_season")
+        self.assertEqual(torboxed.classify_media_level("S02", "show"), "season")
+        self.assertEqual(torboxed.classify_media_level("S03E04", "show"), "episode")
+        self.assertEqual(torboxed.classify_media_level("Complete", "show"), "complete")
+
+    def test_complete_pack_replaces_multi_season_pack(self):
+        """Adding a Complete pack while an S01-Sxx pack exists replaces it.
+
+        DoD: one torrent in the account (old removed), all season rows
+        resolve through the new debrid_id.
+        """
+        import torboxed
+        torboxed.record_processed(
+            "tt1111111", "Coverage Show", 2024, "show", "added", "success",
+            debrid_id="old-multi-id", magnet="magnet:old",
+            quality_score=3000, quality_label="1080p BluRay",
+            season="S01-S05"
+        )
+
+        torrent = self._torrent(
+            name="Coverage.Show.Complete",
+            magnet="magnet:complete",
+            hash_hex="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            score=3000,
+            seasons=[1, 2, 3, 4, 5],
+            is_complete=True,
+            label="Complete",
+        )
+        self.mock_debrid.remove_torrent.return_value = True
+        self.mock_debrid.add_torrent.return_value = "new-complete-id"
+
+        result = self.engine._process_season(
+            "tt1111111", "Coverage Show", 2024, "Complete", torrent, {}
+        )
+
+        self.assertTrue(result)
+        # Old superseded torrent removed from the account
+        self.mock_debrid.remove_torrent.assert_called_with("old-multi-id")
+        self.mock_debrid.add_torrent.assert_called_once()
+        # New pack recorded under its own key
+        complete_row = torboxed.get_processed_item("tt1111111", "Complete")
+        self.assertEqual(complete_row["debrid_id"], "new-complete-id")
+        # Superseded season row re-pointed at the new pack's torrent
+        old_row = torboxed.get_processed_item("tt1111111", "S01-S05")
+        self.assertEqual(old_row["debrid_id"], "new-complete-id")
+        self.assertEqual(old_row["replaced_id"], "old-multi-id")
+
+    def test_equal_range_pack_respects_quality_threshold(self):
+        """Replacing an S01-S05 pack within the same range requires +500.
+
+        DoD: an equal-range replacement below the threshold is rejected even
+        though SeasonInfo classifies the new pack as multi_season.
+        """
+        import torboxed
+        torboxed.record_processed(
+            "tt2222222", "Threshold Show", 2024, "show", "added", "success",
+            debrid_id="existing-pack", magnet="magnet:existing",
+            quality_score=4000, quality_label="1080p BluRay",
+            season="S01-S05"
+        )
+
+        torrent = self._torrent(
+            name="Threshold.Show.S01-S05.720p.WEBRip",
+            magnet="magnet:worse",
+            hash_hex="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            score=4300,  # +300 only - below the +500 threshold
+            seasons=[1, 2, 3, 4, 5],
+            is_complete=False,
+            label="S01-S05",
+        )
+
+        result = self.engine._process_season(
+            "tt2222222", "Threshold Show", 2024, "S01-S05", torrent, {}
+        )
+
+        # Engine semantics: no upgrade performed -> False (consistent with
+        # the pre-existing current_better skip path in _handle_upgrade)
+        self.assertFalse(result)
+        self.mock_debrid.add_torrent.assert_not_called()
+        self.mock_debrid.remove_torrent.assert_not_called()
+        row = torboxed.get_processed_item("tt2222222", "S01-S05")
+        self.assertEqual(row["action"], "skipped")
+        self.assertEqual(row["reason"], "current_better")
+        self.assertEqual(row["debrid_id"], "existing-pack")
+
+    def test_lower_completeness_pack_skipped_when_complete_exists(self):
+        """A multi-season pack is not added alongside an existing Complete pack
+        stored under a different season key (no downgrade duplicates)."""
+        import torboxed
+        torboxed.record_processed(
+            "tt3333333", "Already Complete Show", 2024, "show", "added", "success",
+            debrid_id="complete-pack", magnet="magnet:complete",
+            quality_score=2500, quality_label="720p WEBRip",
+            season="Complete"
+        )
+
+        torrent = self._torrent(
+            name="Show.S01-S05.2160p.BluRay",
+            magnet="magnet:better-quality-narrower",
+            hash_hex="cccccccccccccccccccccccccccccccccccccccc",
+            score=5000,
+            seasons=[1, 2, 3, 4, 5],
+            is_complete=False,
+            label="S01-S05",
+        )
+
+        result = self.engine._process_season(
+            "tt3333333", "Already Complete Show", 2024, "S01-S05", torrent, {}
+        )
+
+        self.assertTrue(result)
+        self.mock_debrid.add_torrent.assert_not_called()
+        self.mock_debrid.remove_torrent.assert_not_called()
+        row = torboxed.get_processed_item("tt3333333", "S01-S05")
+        self.assertEqual(row["action"], "skipped")
+        self.assertEqual(row["reason"], "more_complete_exists")
+
+    def test_disjoint_multi_season_pack_is_not_blocked(self):
+        """An S06-S08 pack next to an existing S01-S05 pack is independent
+        content: no skip, no supersede, normal addition."""
+        import torboxed
+        torboxed.record_processed(
+            "tt5555555", "Long Show", 2024, "show", "added", "success",
+            debrid_id="early-pack", magnet="magnet:s01-s05",
+            quality_score=4000, season="S01-S05"
+        )
+
+        torrent = self._torrent(
+            name="Long.Show.S06-S08.1080p.BluRay",
+            magnet="magnet:s06-s08",
+            hash_hex="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            score=3800,
+            seasons=[6, 7, 8],
+            is_complete=False,
+            label="S06-S08",
+        )
+        self.mock_debrid.add_torrent.return_value = "late-pack-id"
+
+        result = self.engine._process_season(
+            "tt5555555", "Long Show", 2024, "S06-S08", torrent, {}
+        )
+
+        self.assertTrue(result)
+        self.mock_debrid.remove_torrent.assert_not_called()
+        self.mock_debrid.add_torrent.assert_called_once()
+        row = torboxed.get_processed_item("tt5555555", "S06-S08")
+        self.assertEqual(row["action"], "added")
+        # Early pack untouched
+        early = torboxed.get_processed_item("tt5555555", "S01-S05")
+        self.assertEqual(early["debrid_id"], "early-pack")
+
+    def test_supersede_aborts_when_old_removal_fails(self):
+        """If the superseded torrent cannot be removed, the add is aborted
+        (remove-before-add contract: never leave both packs in the account)."""
+        import torboxed
+        torboxed.record_processed(
+            "tt4444444", "Stuck Show", 2024, "show", "added", "success",
+            debrid_id="stuck-old-id", magnet="magnet:old",
+            quality_score=3000, season="S01-S05"
+        )
+
+        torrent = self._torrent(
+            name="Stuck.Show.Complete",
+            magnet="magnet:complete",
+            hash_hex="dddddddddddddddddddddddddddddddddddddddd",
+            score=3500,
+            seasons=[1, 2, 3, 4, 5],
+            is_complete=True,
+            label="Complete",
+        )
+        self.mock_debrid.remove_torrent.return_value = False
+
+        result = self.engine._process_season(
+            "tt4444444", "Stuck Show", 2024, "Complete", torrent, {}
+        )
+
+        self.assertFalse(result)
+        self.mock_debrid.remove_torrent.assert_called_once_with("stuck-old-id")
+        self.mock_debrid.add_torrent.assert_not_called()
+        row = torboxed.get_processed_item("tt4444444", "Complete")
+        self.assertEqual(row["action"], "skipped")
+        self.assertEqual(row["reason"], "remove_old_failed")
+
+
 class TestHandleNewAdditionFallback(unittest.TestCase):
     """TEST-013: _handle_new_addition falls back to next torrent if first fails."""
     
@@ -6383,18 +6621,22 @@ class TestWebDAVAndTorrentFiles(unittest.TestCase):
         self.assertEqual(result["debrid_id"], "id-complete")
 
     def test_get_best_debrid_for_season_multi_season_wins_over_season(self):
-        """_get_best_debrid_for_season: without SeasonInfo objects,
-        classify_media_level returns 'season' for both single and multi-season
-        keys, so higher quality_score wins at the same completeness level."""
+        """_get_best_debrid_for_season prefers a multi-season pack (S01-S05)
+        over an individual season pack, even at lower quality.
+
+        Regression coverage for issue #18: ranged labels previously classified
+        as plain 'season' without SeasonInfo context, so completeness was lost
+        for historical records.
+        """
         seasons = [
             {"season": "S01", "quality_score": 5000, "debrid_id": "id-s01"},
             {"season": "S01-S05", "quality_score": 4000, "debrid_id": "id-multi"},
         ]
         result = _get_best_debrid_for_season(seasons, "S01", 1)
         self.assertIsNotNone(result)
-        # Both classify as "season" (completeness=2) without season_info,
-        # so higher quality_score wins
-        self.assertEqual(result["debrid_id"], "id-s01")
+        # S01-S05 now classifies as multi_season (completeness=3) vs season (2),
+        # so the broader pack wins regardless of quality score
+        self.assertEqual(result["debrid_id"], "id-multi")
 
     def test_get_best_debrid_for_season_same_level_higher_quality(self):
         """_get_best_debrid_for_season within same completeness picks higher quality."""
