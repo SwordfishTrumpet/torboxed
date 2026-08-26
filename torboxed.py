@@ -4587,6 +4587,58 @@ class RealDebridClient(DebridClient):
 # DEBRID DISCOVERY
 # ============================================================================
 
+_TITLE_TOKEN_MIN_LEN = 3
+_TITLE_SIGNATURE_LEN = 4
+
+
+def _title_tokens(text: str) -> List[str]:
+    """Lowercase alphanumeric tokens of a title/release name."""
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def _build_title_match_index(db_by_title_year: Dict[str, Any]) -> Dict[str, Set[str]]:
+    """Build an inverted index from token signature -> db title:year keys.
+
+    Issue #19 performance fix: matching a torrent against every DB row is
+    O(n*m) on large libraries. Candidates are pre-narrowed by shared token
+    prefixes (first _TITLE_SIGNATURE_LEN chars, min length _TITLE_TOKEN_MIN_LEN)
+    so inflectional variants like "alien"/"aliens" still collide while the
+    candidate set stays orders of magnitude smaller than the full row set.
+    Exact match semantics are applied afterwards by the callers.
+    """
+    index: Dict[str, Set[str]] = {}
+    for key in db_by_title_year:
+        title_part = key.rsplit(":", 1)[0]
+        seen_sigs: Set[str] = set()
+        for tok in _title_tokens(title_part):
+            sig = tok[:_TITLE_SIGNATURE_LEN]
+            if len(tok) >= _TITLE_TOKEN_MIN_LEN and sig not in seen_sigs:
+                seen_sigs.add(sig)
+                index.setdefault(sig, set()).add(key)
+        if not seen_sigs:
+            # Title has no long-enough tokens; fall back to whole-string sigs
+            for tok in _title_tokens(title_part):
+                index.setdefault(tok[:_TITLE_SIGNATURE_LEN], set()).add(key)
+    return index
+
+
+def _candidate_title_keys(torrent_name: str,
+                          title_index: Dict[str, Set[str]]) -> Set[str]:
+    """Return DB keys whose titles share a token signature with torrent_name.
+
+    Cheap pre-filter that runs BEFORE guessit: torrents with no candidate
+    keys can skip parsing entirely (they cannot name-match anything).
+    Callers must still apply full substring/year checks on candidates -
+    this function over-approximates, never under-approximates realistic
+    release-name matches.
+    """
+    candidates: Set[str] = set()
+    for tok in _title_tokens(torrent_name):
+        for key in title_index.get(tok[:_TITLE_SIGNATURE_LEN], ()):
+            candidates.add(key)
+    return candidates
+
+
 def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Dict[str, str], Set[str], Dict[str, str]]]:
     """Discover all torrents currently in the debrid account.
     
@@ -4607,6 +4659,7 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
         or ({}, set(), {}) if account is empty
     """
     logger.info("Discovering existing torrents in debrid account...")
+    discovery_start = time.monotonic()
     my_torrents = debrid_client.get_my_torrents()
     
     # Check if API call failed (None) vs empty account ([])
@@ -4679,6 +4732,10 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
         if key not in db_by_title_year:
             db_by_title_year[key] = []
         db_by_title_year[key].append((row['imdb_id'], row['season'], row['content_type']))
+
+    # Issue #19 performance fix: bucketed candidate index so each torrent is
+    # matched against a small candidate set instead of all DB rows
+    title_match_index = _build_title_match_index(db_by_title_year)
     
     imdb_to_debrid = {}
     account_hashes = set()  # All hashes in account for duplicate prevention
@@ -4687,6 +4744,7 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
     name_matches = 0
     unmatched = []
     multi_season_updates = []  # Track multi-season packs that need DB updates
+    guessit_parses = 0  # Issue #19: track expensive parse count
     
     for torrent in my_torrents:
         debrid_id = str(torrent.get("id", ""))
@@ -4716,9 +4774,18 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
             unmatched.append(torrent)
             continue
         
+        # Issue #19 performance fix: cheap token-signature pre-filter BEFORE
+        # guessit. Torrents with no candidate DB keys cannot name-match and
+        # skip the expensive parse entirely.
+        candidate_keys = _candidate_title_keys(torrent_name, title_match_index)
+        if not candidate_keys:
+            unmatched.append(torrent)
+            continue
+
         # Parse torrent name to extract title, year, and season info
         try:
             parsed = guessit(torrent_name)
+            guessit_parses += 1
             torrent_title = parsed.get("title", "").lower()
             torrent_year = parsed.get("year", None)
             # Handle case where guessit returns a list for year
@@ -4739,7 +4806,8 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
         
         # Try to match against database items by title + year
         matched = False
-        for key, show_records in db_by_title_year.items():
+        for key in candidate_keys:
+            show_records = db_by_title_year[key]
             db_title, db_year = key.rsplit(":", 1)
             db_year = int(db_year) if db_year.isdigit() else None
             
@@ -4797,6 +4865,9 @@ def discover_existing_torrents(debrid_client: DebridClient) -> Optional[Tuple[Di
         _apply_multi_season_updates(multi_season_updates)
     
     total_matches = id_matches + name_matches
+    discovery_elapsed = time.monotonic() - discovery_start
+    logger.info("Discovery completed in %.2fs (%d torrents scanned, %d guessit parses)",
+                discovery_elapsed, len(my_torrents), guessit_parses)
     if unmatched:
         logger.debug("%d torrents could not be matched to database (manual adds)", len(unmatched))
     
@@ -5041,6 +5112,9 @@ def cleanup_duplicate_torrents(force: bool = False) -> None:
             db_by_title_year[key] = []
         db_by_title_year[key].append(dict(row))
 
+    # Issue #19 performance fix: bucketed candidate index (same as discovery)
+    title_match_index = _build_title_match_index(db_by_title_year)
+
     # Match each torrent and group by (imdb_id, season)
     groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     unmatched: List[Dict[str, Any]] = []
@@ -5082,6 +5156,13 @@ def cleanup_duplicate_torrents(force: bool = False) -> None:
                 unmatched.append(torrent)
                 continue
 
+            # Issue #19 performance fix: skip full DB scan when the cheap
+            # token-signature pre-filter finds no candidates
+            candidate_keys = _candidate_title_keys(torrent_name, title_match_index)
+            if not candidate_keys:
+                unmatched.append(torrent)
+                continue
+
             season_info = parse_season_info(torrent_name)
             if season_info:
                 # Use the full season label (S01, S01E02, S01-S03, Complete) so
@@ -5091,7 +5172,8 @@ def cleanup_duplicate_torrents(force: bool = False) -> None:
                 season = season_info.season_label
 
             matched = False
-            for key, show_records in db_by_title_year.items():
+            for key in candidate_keys:
+                show_records = db_by_title_year[key]
                 db_title, db_year = key.rsplit(":", 1)
                 db_year = int(db_year) if db_year.isdigit() else None
                 title_match = db_title in torrent_title or torrent_title in db_title
@@ -7354,12 +7436,20 @@ def _get_db_listing(parent_path: str, resolved: Dict[str, Any]) -> List[str]:
             return []
         
         # Collect unique season numbers from torrent_files
+        # Issue #19 performance fix: dedupe debrid_ids first - multi-season
+        # packs share one debrid_id across many season rows, so without this
+        # the same torrent file listing was fetched once per season record.
         season_nums = set()
+        distinct_debrid_ids = []
+        seen_ids = set()
         for s in seasons:
             debrid_id = s.get("debrid_id")
-            if not debrid_id:
+            if not debrid_id or debrid_id in seen_ids:
                 continue
-            files = get_torrent_files(str(debrid_id))
+            seen_ids.add(debrid_id)
+            distinct_debrid_ids.append(str(debrid_id))
+        for debrid_id in distinct_debrid_ids:
+            files = get_torrent_files(debrid_id)
             for f in files:
                 if f.get("is_video") and f.get("episode_season"):
                     season_nums.add(f["episode_season"])
