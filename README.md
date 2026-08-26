@@ -250,6 +250,11 @@ uv run torboxed.py --stats
 
 # See recently added items
 uv run torboxed.py --recent 20
+
+# Choose which Trakt lists to sync (config only - persists, no sync)
+uv run torboxed.py --sources "movies/trending,shows/trending"
+# then run a normal sync with the new selection:
+uv run torboxed.py
 ```
 
 ---
@@ -280,14 +285,19 @@ Recent upgrades:
 
 ## 🔧 Simple Configuration
 
-**The defaults work great**, but you can customize:
+**The defaults work great**, but you can customize.
+
+By default TorBoxed syncs the **curated lists only** (trending, popular, anticipated for movies & shows). The bigger community lists (most watched/collected) are available but are **opt-in**: they return up to 10,000 items each, which balloons a sync to 160k+ items and pushes TV shows weeks out of reach. Enable them only if you really want the long tail.
 
 ```bash
-# Use only specific sources (e.g., just trending)
-sqlite3 torboxed.db "UPDATE config SET sources = '[\"movies/trending\", \"shows/trending\"]' WHERE id = 1;"
+# Select which Trakt lists to sync (config only - persists, no sync)
+uv run torboxed.py --sources "movies/trending,shows/trending"
 
 # Include your Trakt liked lists (requires access token)
-sqlite3 torboxed.db "UPDATE config SET sources = '[\"users/liked\", \"movies/trending\"]' WHERE id = 1;"
+uv run torboxed.py --sources "users/liked,movies/trending"
+
+# Or edit the database directly
+sqlite3 torboxed.db "UPDATE config SET sources = '[\"movies/trending\", \"shows/trending\"]' WHERE id = 1;"
 ```
 
 **Available sources include:**

@@ -46,7 +46,8 @@ from torboxed import (
     _classify_file, get_webdav_config, backfill_torrent_files,
     strip_pending_sentinel, PENDING_SENTINEL_ID,
     DB_BUSY_TIMEOUT_SECONDS,
-    classify_media_level, COMPLETENESS_ORDER
+    classify_media_level, COMPLETENESS_ORDER,
+    DEFAULT_SOURCES, ALL_SOURCES, validate_sources, update_sources,
 )
 
 
@@ -466,6 +467,46 @@ class TestDatabase(unittest.TestCase):
             limits = json.loads(row["limits"])
             self.assertIsInstance(sources, list)
             self.assertIsInstance(limits, dict)
+
+    def test_default_sources_are_curated_only(self):
+        """Default sources must be the curated lists, not the 160k-item full set."""
+        init_db()
+
+        with get_db() as conn:
+            row = conn.execute("SELECT sources FROM config WHERE id=1").fetchone()
+        sources = json.loads(row["sources"])
+        self.assertEqual(sources, DEFAULT_SOURCES)
+        # No giant watched/collected lists in the default
+        self.assertFalse(any(s.startswith(("movies/watched", "movies/collected",
+                                            "shows/watched", "shows/collected")) for s in sources))
+        self.assertEqual(len(sources), 6)
+
+    def test_validate_sources(self):
+        """validate_sources accepts valid sources and rejects invalid/empty."""
+        self.assertIsNone(validate_sources(["movies/trending", "shows/popular"]))
+        self.assertIsNone(validate_sources(["users/liked"]))
+        self.assertIsNotNone(validate_sources([]))
+        self.assertIsNotNone(validate_sources(["movies/trendings"]))  # typo
+        self.assertIsNotNone(validate_sources(["movies/popular", "bogus/list"]))
+        # The full 24-source set is valid
+        self.assertIsNone(validate_sources(ALL_SOURCES))
+
+    def test_all_sources_cover_every_list(self):
+        """ALL_SOURCES contains all 24 valid Trakt source strings."""
+        self.assertEqual(len(ALL_SOURCES), 24)
+        self.assertIn("movies/boxoffice", ALL_SOURCES)
+        self.assertIn("movies/watched/all", ALL_SOURCES)
+        self.assertIn("shows/collected/weekly", ALL_SOURCES)
+        self.assertIn("users/liked", ALL_SOURCES)
+        self.assertIn("shows/anticipated", ALL_SOURCES)
+
+    def test_update_sources_persists(self):
+        """update_sources writes the selection to the config table."""
+        init_db()
+        update_sources(["users/liked", "movies/trending"])
+        with get_db() as conn:
+            row = conn.execute("SELECT sources FROM config WHERE id=1").fetchone()
+        self.assertEqual(json.loads(row["sources"]), ["users/liked", "movies/trending"])
 
 
 class TestScoreConstants(unittest.TestCase):

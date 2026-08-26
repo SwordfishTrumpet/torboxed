@@ -521,12 +521,14 @@ This prevents your account from being banned and ensures reliable syncing.
 
 **To customize:**
 ```bash
-# Use only specific sources (e.g., just trending)
-sqlite3 torboxed.db "UPDATE config SET sources = '[\"movies/trending\", \"shows/trending\"]' WHERE id = 1;"
+# Select which Trakt lists to sync (config only - persists, no sync)
+uv run torboxed.py --sources "movies/trending,shows/trending"
 
 # Include your Trakt liked lists
-sqlite3 torboxed.db "UPDATE config SET sources = '[\"users/liked\", \"movies/trending\"]' WHERE id = 1;"
+uv run torboxed.py --sources "users/liked,movies/trending"
 ```
+
+**Note:** The default is the curated lists only (`movies/trending`, `movies/popular`, `movies/anticipated`, `shows/trending`, `shows/popular`, `shows/anticipated`). The `watched/*` and `collected/*` lists each return up to 10,000 items (Trakt pagination cap), so enabling all 23 public lists yields 160k+ items and starves TV shows — enable them deliberately with `--sources`.
 
 ### Q: How do I get a Trakt access token for liked lists?
 

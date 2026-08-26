@@ -322,6 +322,36 @@ ZILEAN_DEFAULT_DB_URL = "postgresql://zilean:zilean_password@postgres:5432/zilea
 # Valid time periods for Trakt API endpoints
 VALID_PERIODS = ["weekly", "monthly", "yearly", "all"]
 
+# Trakt source selection
+# DEFAULT_SOURCES: curated lists only. The full 24-source set (including the
+# giant watched/collected lists that return ~10k items each) is available but
+# deliberately NOT enabled by default: an 80k+ item queue starves TV shows
+# (processed in order after movies) and makes syncs effectively never complete.
+DEFAULT_SOURCES = [
+    "movies/trending", "movies/popular", "movies/anticipated",
+    "shows/trending", "shows/popular", "shows/anticipated",
+]
+
+# Every valid source string (used for --sources validation)
+ALL_SOURCES = [
+    # Movies
+    "movies/trending", "movies/popular",
+    "movies/watched/weekly", "movies/watched/monthly",
+    "movies/watched/yearly", "movies/watched/all",
+    "movies/collected/weekly", "movies/collected/monthly",
+    "movies/collected/yearly", "movies/collected/all",
+    "movies/anticipated", "movies/boxoffice",
+    # Shows
+    "shows/trending", "shows/popular",
+    "shows/watched/weekly", "shows/watched/monthly",
+    "shows/watched/yearly", "shows/watched/all",
+    "shows/collected/weekly", "shows/collected/monthly",
+    "shows/collected/yearly", "shows/collected/all",
+    "shows/anticipated",
+    # Personal (requires TRAKT_ACCESS_TOKEN)
+    "users/liked",
+]
+
 # Video file extensions for filtering torrent files
 VIDEO_EXTENSIONS = {'.mkv', '.mp4', '.avi', '.mov', '.wmv', '.m4v', '.webm', '.ts'}
 
@@ -1808,23 +1838,46 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_torrent_files_lookup ON torrent_files(debrid_id, episode_season, episode_number);
             CREATE INDEX IF NOT EXISTS idx_torrent_files_video ON torrent_files(debrid_id, is_video);
             CREATE INDEX IF NOT EXISTS idx_torrent_files_media ON torrent_files(debrid_id, is_video, is_subtitle);
-            
-            -- Insert default config if empty
-            INSERT OR IGNORE INTO config (id, sources, limits, quality_prefs, filters, telegram_settings)
-            VALUES (1, 
-                '["movies/trending", "movies/popular", "movies/watched/weekly", "movies/watched/monthly", "movies/watched/yearly", "movies/watched/all", "movies/collected/weekly", "movies/collected/monthly", "movies/collected/yearly", "movies/collected/all", "movies/anticipated", "movies/boxoffice", "shows/trending", "shows/popular", "shows/watched/weekly", "shows/watched/monthly", "shows/watched/yearly", "shows/watched/all", "shows/collected/weekly", "shows/collected/monthly", "shows/collected/yearly", "shows/collected/all", "shows/anticipated"]',
-                '{}',
-                '{"preferred": "1080p", "min_seeds": 5}',
-                '{"min_year": 1900, "exclude": ["CAM", "TS", "HDCAM"], "min_resolution_score": 800}',
-                '{"notify_added": true, "notify_upgraded": false, "notify_summary": true, "notify_error": true}'
-            );
         ''')
+
+        # Insert default config if empty (parameterized so DEFAULT_SOURCES stays single-sourced)
+        conn.execute(
+            "INSERT OR IGNORE INTO config (id, sources, limits, quality_prefs, filters, telegram_settings) "
+            "VALUES (1, ?, ?, ?, ?, ?)",
+            (json.dumps(DEFAULT_SOURCES), '{}',
+             '{"preferred": "1080p", "min_seeds": 5}',
+             '{"min_year": 1900, "exclude": ["CAM", "TS", "HDCAM"], "min_resolution_score": 800}',
+             '{"notify_added": true, "notify_upgraded": false, "notify_summary": true, "notify_error": true}')
+        )
         conn.commit()
     
     # Check if migration needed
     migrate_db()
     
     logger.info("Database initialized successfully.")
+
+
+def validate_sources(sources: List[str]) -> Optional[str]:
+    """Validate a list of Trakt source strings.
+
+    Returns an error message string, or None if all sources are valid.
+    """
+    valid = set(ALL_SOURCES)
+    invalid = [s for s in sources if s not in valid]
+    if invalid:
+        return ("Invalid source(s): %s. Valid sources: %s"
+                % (", ".join(sorted(invalid)), ", ".join(sorted(valid))))
+    if not sources:
+        return "No sources provided"
+    return None
+
+
+def update_sources(sources: List[str]) -> None:
+    """Persist the sources selection to the config table (id=1)."""
+    with get_db() as conn:
+        conn.execute("UPDATE config SET sources=? WHERE id=1",
+                     (json.dumps(sources),))
+        conn.commit()
 
 
 def get_config() -> Dict[str, Any]:
@@ -8178,6 +8231,7 @@ Examples:
   %(prog)s --recent            # Show last 10 processed items
   %(prog)s --reset tt1234567   # Reset item for re-processing
   %(prog)s --cleanup-unmatched # Remove untracked torrents (orphaned)
+  %(prog)s --sources "movies/trending,shows/trending"  # Select which Trakt lists to sync
         """
     )
     
@@ -8209,14 +8263,27 @@ Examples:
                        help="Start WebDAV server for Infuse streaming")
     parser.add_argument("--backfill-files", action="store_true",
                        help="Backfill torrent file cache for all existing debrid torrents")
+    parser.add_argument("--sources", metavar="LIST",
+                       help="Comma-separated Trakt sources to sync, e.g. 'movies/trending,shows/trending'. "
+                            "Persists to the database config for future runs. Does NOT start a sync "
+                            "(run 'torboxed.py' after to sync with the new selection).")
     
     args = parser.parse_args()
     
+    # Parse/validate --sources override early (shared by --init and config-only paths)
+    sources_override = None
+    if args.sources:
+        sources_override = [s.strip() for s in args.sources.split(",") if s.strip()]
+        err = validate_sources(sources_override)
+        if err:
+            logger.error(err)
+            sys.exit(1)
+
     # Setup logging early (before any output)
     setup_logging(verbose=args.verbose)
     
     # Check for overlapping runs (but skip for non-sync commands)
-    skip_lock_commands = {'--init', '--test', '--cron-setup', '--cron-status', '--stats', '--recent', '--reset', '--cleanup-unmatched', '--cleanup-duplicates', '--serve', '--backfill-files'}
+    skip_lock_commands = {'--init', '--test', '--cron-setup', '--cron-status', '--stats', '--recent', '--reset', '--cleanup-unmatched', '--cleanup-duplicates', '--serve', '--backfill-files', '--sources'}
     if not any(getattr(args, cmd.lstrip('-').replace('-', '_'), False) for cmd in skip_lock_commands):
         if not check_and_acquire_lock():
             logger.warning("Another instance of torboxed is already running. Exiting.")
@@ -8225,9 +8292,23 @@ Examples:
     # Initialize
     if args.init:
         init_db()
+        if sources_override:
+            update_sources(sources_override)
+            logger.info("Sources set: %s", ", ".join(sources_override))
         _setup_telegram_interactive()
         return
     
+    # --sources: config-only selection (persists to DB; does NOT start a sync)
+    if sources_override:
+        if not DB_PATH.exists():
+            logger.error("Database not found. Run: python torboxed.py --init")
+            sys.exit(1)
+        migrate_db()
+        update_sources(sources_override)
+        logger.info("Sources set: %s", ", ".join(sources_override))
+        logger.info("Run 'torboxed.py' to sync with these sources.")
+        return
+
     # Self-test (no API keys needed)
     if args.test:
         success = run_self_test()
