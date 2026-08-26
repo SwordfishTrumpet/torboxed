@@ -2497,6 +2497,36 @@ def _count_seasons_in_key(season_key: str) -> int:
     return 1
 
 
+def _parse_season_key_range(season_key: str) -> Optional[Set[int]]:
+    """Return the set of season numbers covered by a season key label.
+
+    Returns None for "Complete" or unparseable labels, meaning "covers
+    everything" - conservatively assumed to overlap any other range.
+
+    Examples:
+        "S01" -> {1}
+        "S01-S03" -> {1, 2, 3}
+        "S02E05" -> {2}   (episode keys map to their season)
+        "Complete", "unknown", garbage -> None
+    """
+    if not season_key:
+        return None
+    if season_key == "Complete":
+        return None
+    if 'E' in season_key:
+        m = re.match(r'S(\d+)', season_key)
+        return {int(m.group(1))} if m else None
+    parts = season_key.split('-')
+    start_m = re.fullmatch(r'S(\d+)', parts[0])
+    if len(parts) == 2 and start_m:
+        end_m = re.fullmatch(r'S(\d+)', parts[1])
+        if end_m:
+            return set(range(int(start_m.group(1)), int(end_m.group(1)) + 1))
+    if start_m:
+        return {int(parts[0][1:])}
+    return None
+
+
 def classify_media_level(season_key: str, content_type: str, season_info: Optional[SeasonInfo] = None) -> str:
     """Classify the media type level of a torrent for upgrade comparison.
     
@@ -2522,6 +2552,13 @@ def classify_media_level(season_key: str, content_type: str, season_info: Option
     if 'E' in season_key:
         return "episode"
     if season_key.startswith('S'):
+        # Issue #18 fix: a ranged label like "S01-S05" IS a multi-season pack
+        # even without SeasonInfo context. Historical records are classified
+        # from their stored label alone; without this check they collapsed to
+        # plain "season", letting equal-range replacements bypass the quality
+        # threshold via the "upgrade to more complete" branch.
+        if _count_seasons_in_key(season_key) > 1:
+            return "multi_season"
         if season_info and not season_info.is_complete and len(season_info.seasons) > 1:
             return "multi_season"
         return "season"
@@ -5721,8 +5758,148 @@ class SyncEngine:
             return True
         
         # Pass as list to support fallback torrents
+        # Issue #18 fix: cross-key completeness reconciliation. A pack at a
+        # higher completeness level must replace overlapping lower-completeness
+        # torrents instead of being added alongside them (the exact-key lookup
+        # above cannot see records stored under different season keys).
+        new_level_name = classify_media_level(season_key, content_type, torrent.season_info)
+        if new_level_name in ("multi_season", "complete"):
+            return self._replace_with_broader_pack(imdb_id, title, year, season_key, torrent)
         return self._handle_new_addition(imdb_id, title, year, content_type, [torrent], 0, season_key)
     
+    def _find_show_coverage(self, imdb_id: str) -> Dict[str, Tuple[int, Optional[Set[int]]]]:
+        """Map each distinct debrid torrent for a show to its coverage.
+
+        Season rows associated with the same pack share its debrid_id (see
+        _apply_multi_season_updates), so levels are max-merged per torrent id:
+        the torrent is represented by the most complete classification among
+        its rows. Rows without debrid_id carry no account state and are skipped.
+
+        Args:
+            imdb_id: Show IMDB ID
+
+        Returns:
+            Dict mapping debrid_id -> (COMPLETENESS_ORDER level, covered
+            season numbers). A None season set means "covers everything"
+            (Complete packs, or labels that cannot be parsed - conservatively
+            assumed to overlap any new pack).
+        """
+        coverage: Dict[str, Tuple[int, Optional[Set[int]]]] = {}
+        for row in get_processed_show_seasons(imdb_id):
+            did = row.get("debrid_id")
+            if not did:
+                continue
+            season_label = row.get("season") or "unknown"
+            level = COMPLETENESS_ORDER.get(classify_media_level(season_label, "show"), 0)
+            seasons = _parse_season_key_range(season_label)
+            if did not in coverage:
+                coverage[did] = (level, seasons)
+            else:
+                prev_level, prev_seasons = coverage[did]
+                # Conflicting labels for one torrent: any unparseable/Complete
+                # label forces the conservative "covers everything" reading
+                if seasons is None or prev_seasons is None:
+                    merged_seasons = None
+                else:
+                    merged_seasons = prev_seasons | seasons
+                coverage[did] = (max(level, prev_level), merged_seasons)
+        return coverage
+
+    def _replace_with_broader_pack(self, imdb_id: str, title: str, year: int,
+                                   season_key: str, torrent: TorrentResult) -> bool:
+        """Add a multi-season/complete pack, superseding overlapping coverage.
+
+        Issue #18 fix: without reconciliation, a Complete pack discovered after
+        an S01-Sxx pack was added alongside it (different season keys never
+        matched), duplicating coverage and wasting debrid quota.
+
+        Semantics:
+        - Only torrents whose coverage OVERLAPS the new pack participate;
+          disjoint packs (e.g. S06-S08 next to S01-S05) are independent
+          content and are neither skipped nor superseded.
+        - If any overlapping torrent covers this range equally or more
+          completely, skip the new pack entirely (never downgrade completeness).
+        - Otherwise remove strictly-lower-completeness overlapping torrents
+          FIRST (same remove-before-add contract as _handle_upgrade so a
+          failed add can never leave both old and new packs in the account),
+          then add the new pack. On success, superseded season rows are
+          re-pointed at the new torrent so every covered season resolves
+          through it.
+        """
+        content_type = "show"
+        display_title = self._display_title(title, content_type, season_key)
+        new_level = COMPLETENESS_ORDER[
+            classify_media_level(season_key, content_type, torrent.season_info)]
+
+        # Season numbers the new pack covers; None = covers everything
+        if torrent.season_info is not None and torrent.season_info.is_complete:
+            new_seasons: Optional[Set[int]] = None
+        elif torrent.season_info is not None and torrent.season_info.seasons:
+            new_seasons = set(torrent.season_info.seasons)
+        else:
+            new_seasons = _parse_season_key_range(season_key)
+
+        def _overlaps(entry: Tuple[int, Optional[Set[int]]]) -> bool:
+            _, existing_seasons = entry
+            if new_seasons is None or existing_seasons is None:
+                return True
+            return bool(new_seasons & existing_seasons)
+
+        coverage = self._find_show_coverage(imdb_id)
+        overlapping = {did: entry for did, entry in coverage.items() if _overlaps(entry)}
+
+        # Equal or better overlapping coverage already present -> nothing to do
+        if overlapping and max(level for level, _ in overlapping.values()) >= new_level:
+            logger.info("Skipping %s: existing library coverage is equally or more complete",
+                        display_title)
+            log_result("skipped", display_title, {"reason": "more_complete_exists"})
+            record_processed(imdb_id, title, year, content_type, "skipped",
+                             "more_complete_exists",
+                             quality_score=torrent.quality.score, season=season_key)
+            self._increment_stats("skipped", content_type)
+            return True
+
+        superseded = [(did, lvl) for did, (lvl, _) in overlapping.items()
+                      if lvl < new_level]
+
+        removed: List[str] = []
+        for did, old_lvl in sorted(superseded):
+            if not self.debrid.remove_torrent(did):
+                logger.warning(
+                    "Failed to remove superseded torrent %s for %s - aborting to avoid duplicates",
+                    str(did)[:16], display_title)
+                log_result("skipped", display_title, {"reason": "remove_old_failed"})
+                record_processed(imdb_id, title, year, content_type, "skipped",
+                                 "remove_old_failed",
+                                 quality_score=torrent.quality.score, season=season_key)
+                self._increment_stats("skipped", content_type)
+                return False
+            logger.info("Removing superseded coverage (level %d) for %s: %s",
+                        old_lvl, display_title, str(did)[:16])
+            removed.append(did)
+
+        added = self._handle_new_addition(imdb_id, title, year, content_type,
+                                          [torrent], 0, season_key)
+        if not added:
+            return False
+
+        # Re-point superseded season rows at the new pack's torrent so all
+        # covered seasons resolve through it (mirrors _apply_multi_season_updates).
+        new_rec = get_processed_item(imdb_id, season_key)
+        new_id = (new_rec or {}).get("debrid_id")
+        if new_id:
+            for did in removed:
+                for row in get_processed_show_seasons(imdb_id):
+                    if row.get("debrid_id") == did and row["season"] != season_key:
+                        record_processed(imdb_id, title, year, content_type, "upgraded",
+                                         "superseded_by_broader_pack",
+                                         debrid_id=new_id,
+                                         quality_score=torrent.quality.score,
+                                         quality_label=torrent.quality.label,
+                                         replaced_id=did,
+                                         season=row["season"])
+        return True
+
     def _handle_new_addition(self, imdb_id: str, title: str, year: int,
                               content_type: str, cached: List[TorrentResult],
                               torrent_index: int, season_key: str = "unknown") -> bool:
