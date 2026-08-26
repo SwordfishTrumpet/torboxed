@@ -1506,6 +1506,62 @@ class TestDiscoverExistingTorrents(unittest.TestCase):
         self.assertEqual(search_query, "Test Movie 2024")
 
 
+    def test_name_match_prefilter_skips_guessit_for_unmatchable_torrents(self):
+        """Issue #19: torrents sharing no token signature with any DB title
+        skip guessit entirely and land in unmatched (hash still collected)."""
+        import torboxed
+
+        torboxed.record_processed(
+            "tt1234567", "Test Movie", 2024, "movie", "added", "success",
+            debrid_id="tb-id-123", magnet="magnet:test",
+            quality_score=2500, quality_label="1080p BluRay"
+        )
+
+        self.mock_debrid.get_my_torrents.return_value = [
+            {
+                "id": "tb-unmatched",
+                "name": "Qzxwv.Jklmnop.Frst.2019.720p.WEBRip.x264",
+                "hash": "no-match-hash",
+            }
+        ]
+
+        parse_calls = []
+        def _fail_guessit(name):
+            parse_calls.append(name)
+            raise AssertionError("guessit must not run when no candidates exist")
+
+        with patch.object(torboxed, "guessit", side_effect=_fail_guessit):
+            result = torboxed.discover_existing_torrents(self.mock_debrid)
+
+        imdb_to_debrid, account_hashes, hash_to_imdb = result
+        self.assertEqual(imdb_to_debrid, {})
+        self.assertIn("no-match-hash", account_hashes)
+        self.assertNotIn("no-match-hash", hash_to_imdb)
+        self.assertEqual(parse_calls, [])
+
+    def test_title_match_index_candidates(self):
+        """_build_title_match_index/_candidate_title_keys find token-sharing
+        titles (including inflectional prefixes like alien/aliens) and skip
+        non-overlapping ones."""
+        import torboxed
+        db = {
+            "breaking bad:2008": [],
+            "aliens:1986": [],
+            "up:2009": [],
+        }
+        index = torboxed._build_title_match_index(db)
+
+        # Exact-token overlap
+        self.assertIn("breaking bad:2008", torboxed._candidate_title_keys(
+            "Breaking.Bad.S01.1080p.BluRay", index))
+        # Prefix collision catches inflections (alien vs aliens)
+        self.assertIn("aliens:1986", torboxed._candidate_title_keys(
+            "Alien.Covenant.2017.2160p.WEB-DL", index))
+        # No overlap -> no candidates -> guessit skipped upstream
+        self.assertEqual(torboxed._candidate_title_keys(
+            "Qzxwv.Jklmnop.2019.720p", index), set())
+
+
 class TestMaxQuality(unittest.TestCase):
     """Test max quality threshold - skip searching for content with max quality."""
 
