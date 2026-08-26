@@ -3254,44 +3254,19 @@ class TraktClient:
         Returns:
             List of items from the list with type, movie/show data, and IDs
         """
-        all_items = []
-        page = 1
-        per_page = TRAKT_PER_PAGE
-        
-        while True:
-            try:
-                # Build URL with pagination - can use slug or numeric ID
-                url = f"/users/{username}/lists/{list_id}/items/{item_types}?page={page}&limit={per_page}"
-                data = self._request("GET", url)
-                
-                if data is None:
-                    if page == 1:
-                        logger.debug("No data returned for list %s/%s", username, list_id)
-                    break
-                
-                # Validate response
-                validated = validate_list_response(
-                    data,
-                    context=f"Trakt list items ({username}/{list_id})"
-                )
-                
-                if not validated:
-                    break
-                
-                all_items.extend(validated)
-                
-                # Check if we got fewer items than requested (no more pages)
-                if len(validated) < per_page:
-                    break
-                
-                page += 1
-                
-            except APIError as e:
-                logger.warning("Error fetching list %s/%s page %d: %s", username, list_id, page, e)
-                break
-        
-        logger.debug("Fetched %d items from list %s/%s", len(all_items), username, list_id)
-        return all_items
+        # Issue #20 fix: reuse the shared pagination implementation instead of
+        # a divergent hand-rolled loop. This inherits the TRAKT_MAX_PAGES
+        # safety cap, X-Pagination-Page-Count header termination, short-page
+        # detection, and APIError handling that get_list_items previously
+        # lacked (a full-page-forever API response previously looped forever).
+        # Auth is attached only when a token is configured so public lists
+        # keep working anonymously.
+        return self._fetch_paginated(
+            f"/users/{username}/lists/{list_id}/items/{item_types}",
+            None,
+            use_auth=bool(getattr(self, "access_token", None)),
+            context=f"Trakt list items ({username}/{list_id})",
+        )
     
     def get_liked_list_items(self) -> List[Dict[str, Any]]:
         """Get all items from all liked lists.
