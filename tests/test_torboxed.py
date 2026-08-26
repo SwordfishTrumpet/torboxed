@@ -6,6 +6,8 @@ import sys
 import os
 import sqlite3
 import json
+import threading
+import time
 from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
 import tempfile
@@ -43,6 +45,7 @@ from torboxed import (
     resolve_path, resolve_debrid_id_for_path, _get_db_listing, _get_best_debrid_for_season,
     _classify_file, get_webdav_config, backfill_torrent_files,
     strip_pending_sentinel, PENDING_SENTINEL_ID,
+    DB_BUSY_TIMEOUT_SECONDS,
     classify_media_level, COMPLETENESS_ORDER
 )
 
@@ -7000,7 +7003,7 @@ class TestPendingSentinelCache(unittest.TestCase):
 
     @patch('torboxed.guessit')
     def test_store_torrent_files_sentinel_only_does_not_purge_self(self, mock_guessit):
-        "store_torrent_files with only a sentinel payload keeps exactly one sentinel."""
+        """store_torrent_files with only a sentinel payload keeps exactly one sentinel."""
         mock_guessit.return_value = {}
         store_torrent_files("deb_keep", "torbox", [
             {"name": PENDING_SENTINEL_ID, "path": PENDING_SENTINEL_ID,
@@ -7107,7 +7110,7 @@ class TestPendingSentinelCache(unittest.TestCase):
     @patch('torboxed.get_debrid_client_for_service')
     def test_serve_path_no_cache_and_failed_fetch_is_503_not_404(self, mock_factory,
                                                                   mock_guessit):
-        "Uncached listing whose first fetch fails serves 503 (retryable), never 404."""
+        """Uncached listing whose first fetch fails serves 503 (retryable), never 404."""
         mock_guessit.return_value = {}
         mock_client = Mock()
         mock_client.get_torrent_files.return_value = []
@@ -7130,6 +7133,97 @@ class TestPendingSentinelCache(unittest.TestCase):
             self.assertEqual(status, "503 Service Unavailable")
             self.assertIn(("Retry-After", "60"), start_response.call_args[0][1])
             self.assertNotEqual(body, [b"File not found in torrent"])
+
+
+class TestDatabaseConcurrency(unittest.TestCase):
+    """SQLite lock handling for concurrent WebDAV + sync writes (#21)."""
+
+    def setUp(self):
+        """Create temporary database for testing."""
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.test_db_path = Path(self.temp_dir.name) / "test.db"
+
+        import torboxed
+        self.original_db_path = torboxed.DB_PATH
+        torboxed.DB_PATH = self.test_db_path
+        torboxed.init_db()
+
+    def tearDown(self):
+        """Clean up temporary database."""
+        import torboxed
+        torboxed.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+
+    def test_busy_timeout_is_configured(self):
+        """get_db passes an explicit busy timeout so writers wait, never fail instantly."""
+        with patch("torboxed.sqlite3.connect", wraps=sqlite3.connect) as mock_connect:
+            with get_db() as conn:
+                conn.execute("SELECT 1")
+            _, kwargs = mock_connect.call_args
+            self.assertEqual(kwargs.get("timeout"), DB_BUSY_TIMEOUT_SECONDS)
+            self.assertGreater(DB_BUSY_TIMEOUT_SECONDS, 0)
+
+    def test_writer_waits_for_concurrent_write_lock(self):
+        """A write colliding with another connection's write lock waits and succeeds,
+        instead of raising 'database is locked' immediately (pre-fix behavior)."""
+        # Hold the write lock on an independent connection (simulates a long
+        # WebDAV cache write in another wsgidav thread).
+        holder = sqlite3.connect(str(self.test_db_path))
+        holder.execute("BEGIN IMMEDIATE")
+        holder.execute(
+            "INSERT INTO processed (imdb_id, season, title, action) "
+            "VALUES ('tt8888888', 'unknown', 'Lock Holder', 'added')"
+        )
+
+        outcome = {}
+
+        def writer():
+            try:
+                with get_db() as conn:
+                    conn.execute(
+                        "INSERT INTO processed (imdb_id, season, title, action) "
+                        "VALUES ('tt9999999', 'unknown', 'Blocked Writer', 'added')"
+                    )
+                    conn.commit()
+                outcome["ok"] = True
+            except Exception as e:  # noqa: BLE001 - recorded for assertion
+                outcome["error"] = e
+
+        t = threading.Thread(target=writer)
+        t.start()
+        try:
+            time.sleep(0.3)
+            # Without a busy timeout the writer would already have failed with
+            # OperationalError; with it, it must still be waiting.
+            if "error" in outcome:
+                self.fail(f"Writer failed while waiting for lock: {outcome['error']}")
+            self.assertFalse(outcome.get("ok", False),
+                             "Writer completed before the lock was released")
+        finally:
+            holder.commit()  # release the write lock
+            t.join(timeout=DB_BUSY_TIMEOUT_SECONDS + 5)
+            holder.close()
+
+        self.assertNotIn("error", outcome)
+        self.assertTrue(outcome.get("ok"), "Writer did not complete after release")
+
+        # The blocked writer's row landed once it acquired the lock
+        check = sqlite3.connect(str(self.test_db_path))
+        row = check.execute(
+            "SELECT imdb_id FROM processed WHERE imdb_id = 'tt9999999'"
+        ).fetchone()
+        check.close()
+        self.assertIsNotNone(row)
+
+    def test_db_error_logged_via_logger_not_print(self):
+        """sqlite errors inside get_db are logged via logger.error, never print()."""
+        with patch("torboxed.logger") as mock_logger:
+            with self.assertRaises(sqlite3.OperationalError):
+                with get_db() as conn:
+                    raise sqlite3.OperationalError("database is locked")
+            mock_logger.error.assert_called_once()
+            msg = str(mock_logger.error.call_args)
+            self.assertIn("database is locked", msg)
 
 
 class TestRedirectMiddlewareAuth(unittest.TestCase):
