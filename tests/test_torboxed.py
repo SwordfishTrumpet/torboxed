@@ -42,6 +42,7 @@ from torboxed import (
     extract_imdb_from_filename, build_movie_filename, build_episode_filename, build_subtitle_filename,
     resolve_path, resolve_debrid_id_for_path, _get_db_listing, _get_best_debrid_for_season,
     _classify_file, get_webdav_config, backfill_torrent_files,
+    strip_pending_sentinel, PENDING_SENTINEL_ID,
     classify_media_level, COMPLETENESS_ORDER
 )
 
@@ -6866,6 +6867,269 @@ class TestWebDAVAndTorrentFiles(unittest.TestCase):
         """extract_imdb_from_filename finds imdb tag amid other tokens."""
         result = extract_imdb_from_filename("Show Name {imdb-tt9999999} S01E01.en.srt")
         self.assertEqual(result, "tt9999999")
+
+
+class TestPendingSentinelCache(unittest.TestCase):
+    """__pending__ sentinel rows must not permanently poison the file cache (#16).
+
+    A sentinel is written when a WebDAV-triggered listing fetch returns no files
+    (torrent still processing). It must read as a cache MISS so later requests
+    refetch, and it must be purged once real files are stored.
+    """
+
+    def setUp(self):
+        """Create temporary database for testing."""
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.test_db_path = Path(self.temp_dir.name) / "test.db"
+
+        import torboxed
+        self.original_db_path = torboxed.DB_PATH
+        torboxed.DB_PATH = self.test_db_path
+        torboxed.init_db()
+
+    def tearDown(self):
+        """Clean up temporary database."""
+        import torboxed
+        torboxed.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+
+    # =========================================================================
+    # strip_pending_sentinel helper tests
+    # =========================================================================
+
+    def test_strip_pending_sentinel_no_sentinel(self):
+        """strip_pending_sentinel returns all rows unchanged when no sentinel present."""
+        files = [
+            {"file_id": "f1", "file_name": "a.mkv"},
+            {"file_id": "f2", "file_name": "b.srt"},
+        ]
+        real, had_sentinel = strip_pending_sentinel(files)
+        self.assertEqual(len(real), 2)
+        self.assertFalse(had_sentinel)
+
+    def test_strip_pending_sentinel_with_sentinel(self):
+        """strip_pending_sentinel separates the sentinel row from real rows."""
+        files = [
+            {"file_id": PENDING_SENTINEL_ID, "file_name": PENDING_SENTINEL_ID},
+            {"file_id": "f1", "file_name": "a.mkv"},
+        ]
+        real, had_sentinel = strip_pending_sentinel(files)
+        self.assertEqual(len(real), 1)
+        self.assertEqual(real[0]["file_id"], "f1")
+        self.assertTrue(had_sentinel)
+
+    def test_strip_pending_sentinel_only(self):
+        """strip_pending_sentinel on a sentinel-only result set yields an empty list."""
+        real, had_sentinel = strip_pending_sentinel(
+            [{"file_id": PENDING_SENTINEL_ID}]
+        )
+        self.assertEqual(real, [])
+        self.assertTrue(had_sentinel)
+
+    # =========================================================================
+    # _fetch_and_cache_torrent_files sentinel behavior
+    # =========================================================================
+
+    @patch('torboxed.guessit')
+    @patch('torboxed.get_debrid_client_for_service')
+    def test_fetch_and_cache_stores_sentinel_on_empty_fetch(self, mock_factory, mock_guessit):
+        """Empty debrid fetch stores one __pending__ sentinel and reports failure."""
+        mock_client = Mock()
+        mock_client.get_torrent_files.return_value = []
+        mock_factory.return_value = mock_client
+
+        import torboxed
+        result = torboxed._fetch_and_cache_torrent_files("deb_pending", "torbox")
+        self.assertFalse(result)
+
+        stored = get_torrent_files("deb_pending")
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["file_id"], PENDING_SENTINEL_ID)
+
+        _, had_sentinel = strip_pending_sentinel(get_torrent_files("deb_pending"))
+        self.assertTrue(had_sentinel)
+
+    @patch('torboxed.guessit')
+    @patch('torboxed.get_debrid_client_for_service')
+    def test_fetch_and_cache_real_files_replace_sentinel(self, mock_factory, mock_guessit):
+        """A later successful fetch replaces the sentinel with real files."""
+        mock_guessit.return_value = {}
+        mock_client = Mock()
+        mock_client.get_torrent_files.return_value = [
+            {"name": "Movie.mkv", "path": "Movie.mkv", "size": 1000, "id": "f1"},
+        ]
+        mock_factory.return_value = mock_client
+
+        import torboxed
+        # Seed the poisoned state: sentinel-only cache
+        store_torrent_files("deb_recover", "torbox", [
+            {"name": PENDING_SENTINEL_ID, "path": PENDING_SENTINEL_ID,
+             "size": 0, "id": PENDING_SENTINEL_ID},
+        ])
+
+        result = torboxed._fetch_and_cache_torrent_files("deb_recover", "torbox")
+        self.assertTrue(result)
+
+        stored, had_sentinel = strip_pending_sentinel(get_torrent_files("deb_recover"))
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["file_id"], "f1")
+        self.assertFalse(had_sentinel)
+
+    # =========================================================================
+    # store_torrent_files purge behavior
+    # =========================================================================
+
+    @patch('torboxed.guessit')
+    def test_store_torrent_files_purges_sentinel_when_real_files_arrive(self, mock_guessit):
+        """store_torrent_files deletes __pending__ rows once real files are cached."""
+        mock_guessit.return_value = {}
+        store_torrent_files("deb_purge", "torbox", [
+            {"name": PENDING_SENTINEL_ID, "path": PENDING_SENTINEL_ID,
+             "size": 0, "id": PENDING_SENTINEL_ID},
+        ])
+        self.assertEqual(len(get_torrent_files("deb_purge")), 1)
+
+        store_torrent_files("deb_purge", "torbox", [
+            {"name": "Real.Movie.mkv", "path": "Real.Movie.mkv",
+             "size": 2000, "id": "r1"},
+        ])
+
+        stored = get_torrent_files("deb_purge")
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["file_id"], "r1")
+
+    @patch('torboxed.guessit')
+    def test_store_torrent_files_sentinel_only_does_not_purge_self(self, mock_guessit):
+        "store_torrent_files with only a sentinel payload keeps exactly one sentinel."""
+        mock_guessit.return_value = {}
+        store_torrent_files("deb_keep", "torbox", [
+            {"name": PENDING_SENTINEL_ID, "path": PENDING_SENTINEL_ID,
+             "size": 0, "id": PENDING_SENTINEL_ID},
+        ])
+        store_torrent_files("deb_keep", "torbox", [
+            {"name": PENDING_SENTINEL_ID, "path": PENDING_SENTINEL_ID,
+             "size": 0, "id": PENDING_SENTINEL_ID},
+        ])
+
+        stored = get_torrent_files("deb_keep")
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["file_id"], PENDING_SENTINEL_ID)
+
+    # =========================================================================
+    # Serve-path semantics: 503 vs permanent 404 vs recovered 302
+    # =========================================================================
+
+    def _make_middleware(self):
+        """Instantiate RedirectMiddleware without running its __init__."""
+        import torboxed
+        return torboxed.RedirectMiddleware.__new__(torboxed.RedirectMiddleware)
+
+    @patch('torboxed.guessit')
+    @patch('torboxed.get_debrid_client_for_service')
+    def test_serve_path_sentinel_then_empty_fetch_returns_503(self, mock_factory, mock_guessit):
+        """Sentinel-only cache refetches; when the torrent is still empty -> 503 Retry-After."""
+        mock_guessit.return_value = {}
+        mock_client = Mock()
+        mock_client.get_torrent_files.return_value = []
+        mock_factory.return_value = mock_client
+
+        import torboxed
+        torboxed.record_processed(
+            "tt1112222", "Pending Movie", 2024, "movie", "added", "success",
+            debrid_id="deb_503", magnet="magnet:503",
+            quality_score=2500, quality_label="1080p",
+            debrid_service="torbox"
+        )
+        # First failed request wrote a sentinel
+        store_torrent_files("deb_503", "torbox", [
+            {"name": PENDING_SENTINEL_ID, "path": PENDING_SENTINEL_ID,
+             "size": 0, "id": PENDING_SENTINEL_ID},
+        ])
+
+        mw = self._make_middleware()
+        start_response = Mock()
+        resolved = {"type": "movie_file", "imdb_id": "tt1112222"}
+        body = mw._serve_file_redirect({}, start_response, "GET", "/Movies/x.mkv", resolved)
+
+        status = start_response.call_args[0][0]
+        headers = start_response.call_args[0][1]
+        self.assertEqual(status, "503 Service Unavailable")
+        self.assertIn(("Retry-After", "60"), headers)
+        self.assertEqual(body, [b"Torrent file listing not cached. Try again later."])
+
+        # The retry attempt happened despite the sentinel being present
+        self.assertTrue(mock_client.get_torrent_files.called)
+
+    @patch('torboxed.guessit')
+    @patch('torboxed._resolve_direct_url')
+    @patch('torboxed.get_debrid_client_for_service')
+    def test_serve_path_recovers_after_files_become_available(self, mock_factory,
+                                                              mock_resolve_url,
+                                                              mock_guessit):
+        """Sentinel-only cache + later successful fetch yields a 302, not a permanent 404."""
+        mock_guessit.return_value = {}
+        mock_client = Mock()
+        mock_client.get_torrent_files.return_value = [
+            {"name": "Movie.mkv", "path": "Movie.mkv", "size": 1000, "id": "f1"},
+        ]
+        mock_factory.return_value = mock_client
+        mock_resolve_url.return_value = "https://cdn.example.com/stream"
+
+        import torboxed
+        torboxed.record_processed(
+            "tt3334444", "Recovering Movie", 2024, "movie", "added", "success",
+            debrid_id="deb_recover302", magnet="magnet:r2",
+            quality_score=2500, quality_label="1080p",
+            debrid_service="torbox"
+        )
+        # Poisoned state from an earlier empty fetch
+        store_torrent_files("deb_recover302", "torbox", [
+            {"name": PENDING_SENTINEL_ID, "path": PENDING_SENTINEL_ID,
+             "size": 0, "id": PENDING_SENTINEL_ID},
+        ])
+
+        mw = self._make_middleware()
+        start_response = Mock()
+        resolved = {"type": "movie_file", "imdb_id": "tt3334444"}
+        mw._serve_file_redirect({}, start_response, "GET", "/Movies/x.mkv", resolved)
+
+        status = start_response.call_args[0][0]
+        headers = start_response.call_args[0][1]
+        self.assertEqual(status, "302 Found")
+        self.assertIn(("Location", "https://cdn.example.com/stream"), headers)
+
+        # Sentinel purged; only the real file row remains
+        stored, had_sentinel = strip_pending_sentinel(get_torrent_files("deb_recover302"))
+        self.assertFalse(had_sentinel)
+        self.assertEqual(len(stored), 1)
+
+    @patch('torboxed.guessit')
+    @patch('torboxed.get_debrid_client_for_service')
+    def test_serve_path_no_cache_and_failed_fetch_is_503_not_404(self, mock_factory,
+                                                                  mock_guessit):
+        "Uncached listing whose first fetch fails serves 503 (retryable), never 404."""
+        mock_guessit.return_value = {}
+        mock_client = Mock()
+        mock_client.get_torrent_files.return_value = []
+        mock_factory.return_value = mock_client
+
+        import torboxed
+        torboxed.record_processed(
+            "tt5556666", "Empty Movie", 2024, "movie", "added", "success",
+            debrid_id="deb_first", magnet="magnet:f1",
+            quality_score=2500, quality_label="1080p",
+            debrid_service="torbox"
+        )
+
+        mw = self._make_middleware()
+        resolved = {"type": "movie_file", "imdb_id": "tt5556666"}
+        for _ in range(2):  # repeated retries keep returning 503 while processing
+            start_response = Mock()
+            body = mw._serve_file_redirect({}, start_response, "GET", "/Movies/x.mkv", resolved)
+            status = start_response.call_args[0][0]
+            self.assertEqual(status, "503 Service Unavailable")
+            self.assertIn(("Retry-After", "60"), start_response.call_args[0][1])
+            self.assertNotEqual(body, [b"File not found in torrent"])
 
 
 class TestRedirectMiddlewareAuth(unittest.TestCase):
