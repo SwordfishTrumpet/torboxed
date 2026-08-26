@@ -7043,8 +7043,11 @@ def resolve_path(path: str) -> Optional[Dict[str, Any]]:
                 result["type"] = "show_folder"
                 return result
             
-            if segments[0] == "TV Shows" and len(segments) >= 3:
+            if segments[0] == "TV Shows" and len(segments) == 3:
                 # /TV Shows/Show Name/Season 1/
+                # NOTE: must be == 3 (not >= 3) so that 4+-segment paths fall
+                # through to the episode_file branch below instead of being
+                # misclassified as season folders.
                 result["type"] = "season_folder"
                 # Parse season number from segment
                 season_match = re.search(r'Season\s+(\d+)', segments[2], re.IGNORECASE)
