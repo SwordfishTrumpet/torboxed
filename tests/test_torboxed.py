@@ -6210,15 +6210,20 @@ class TestWebDAVAndTorrentFiles(unittest.TestCase):
         self.assertEqual(result["season_key"], "S01")
 
     def test_resolve_path_episode_file(self):
-        """resolve_path with episode path: currently the >=3 TV Shows check
-        fires before the >=4 check, so a 4-segment TV Shows path returns
-        'season_folder' rather than 'episode_file'."""
+        """resolve_path with episode path returns type="episode_file".
+
+        Regression test for issue #15: the season-folder check previously used
+        len(segments) >= 3, which matched 4-segment file paths first and made
+        the episode_file branch unreachable (WebDAV served 0-byte responses).
+        """
         path = "/TV Shows/Breaking Bad/Season 1/Breaking Bad {imdb-tt0903747} S01E01.mkv"
         result = resolve_path(path)
-        # The len(segments) >= 3 check fires first and returns season_folder
-        self.assertEqual(result["type"], "season_folder")
+        self.assertEqual(result["type"], "episode_file")
+        self.assertEqual(result["show_title"], "Breaking Bad")
         self.assertEqual(result["season_number"], 1)
+        self.assertEqual(result["episode_number"], 1)
         self.assertEqual(result["season_key"], "S01")
+        self.assertEqual(result["imdb_id"], "tt0903747")
 
     def test_resolve_path_unknown(self):
         """resolve_path with unrecognized path returns type="unknown"."""
@@ -6535,9 +6540,11 @@ class TestWebDAVAndTorrentFiles(unittest.TestCase):
         result = resolve_path(
             "/TV Shows/Specials Show/Season 0/Specials Show {imdb-tt9999999} S00E01.mkv"
         )
-        self.assertEqual(result["type"], "season_folder")
+        self.assertEqual(result["type"], "episode_file")
         self.assertEqual(result["season_number"], 0)
+        self.assertEqual(result["episode_number"], 1)
         self.assertEqual(result["season_key"], "S00")
+        self.assertEqual(result["imdb_id"], "tt9999999")
 
     def test_subtitle_files_no_episode(self):
         """get_subtitle_files with no season/episode returns all subtitles."""
@@ -6708,6 +6715,101 @@ class TestRedirectMiddlewareAuth(unittest.TestCase):
                 self.middleware(self._environ(path), self._start_response)
                 self.assertEqual(self.app_calls, [path], f"path {path} should pass through")
                 self.assertEqual(self.start_calls[0][0], "200 OK", f"path {path} not challenged")
+
+
+class TestRedirectMiddlewareEpisodePlayback(unittest.TestCase):
+    """GET/HEAD on TV episode paths must flow through the 302 CDN redirect.
+
+    Regression tests for issue #15: resolve_path() misclassified 4-segment
+    episode paths as season_folder, so RedirectMiddleware never intercepted
+    them and wsgidav served a 0-byte virtual file instead of playback.
+    """
+
+    EPISODE_PATH = "/TV Shows/Breaking Bad/Season 1/Breaking Bad {imdb-tt0903747} S01E01.mkv"
+    CDN_URL = "https://cdn.example.com/episode.mkv"
+
+    def setUp(self):
+        import torboxed
+        self.torboxed = torboxed
+        self.middleware = torboxed.RedirectMiddleware(lambda e, s: self._fail_downstream(e, s))
+        self.start_calls = []
+
+    def _fail_downstream(self, environ, start_response):
+        raise AssertionError(
+            f"episode request must be intercepted for redirect, reached {environ.get('PATH_INFO')}"
+        )
+
+    def _start_response(self, status, headers):
+        self.start_calls.append((status, list(headers)))
+        return lambda body: None
+
+    def _basic_header(self):
+        import base64
+        encoded = base64.b64encode(b"admin:secret").decode("ascii")
+        return f"Basic {encoded}"
+
+    def _environ(self, method="GET"):
+        return {
+            "REQUEST_METHOD": method,
+            "PATH_INFO": self.EPISODE_PATH,
+            "HTTP_AUTHORIZATION": self._basic_header(),
+        }
+
+    def _patch_env(self):
+        env = {"WEBDAV_AUTH_USER": "admin", "WEBDAV_PASS": "", "WEBDAV_AUTH_PASS": "secret"}
+        return patch.object(self.torboxed, "get_env", return_value=env)
+
+    @patch("torboxed._resolve_direct_url")
+    @patch("torboxed.get_video_file_for_episode")
+    @patch("torboxed.get_torrent_files")
+    @patch("torboxed.resolve_debrid_id_for_path")
+    def test_get_episode_path_returns_302_redirect(self, mock_db_info, mock_files,
+                                                    mock_episode, mock_url):
+        """Authenticated GET on an episode path returns 302 to the CDN URL."""
+        mock_db_info.return_value = {
+            "debrid_id": "deb-ep-1",
+            "debrid_service": "torbox",
+            "imdb_id": "tt0903747",
+        }
+        mock_files.return_value = [{"file_id": "f1", "is_video": True}]
+        mock_episode.return_value = {"file_id": "ep-file-7", "is_video": True}
+        mock_url.return_value = self.CDN_URL
+
+        with self._patch_env():
+            self.middleware(self._environ(method="GET"), self._start_response)
+
+        status, headers = self.start_calls[0]
+        self.assertEqual(status, "302 Found")
+        self.assertIn(("Location", self.CDN_URL), headers)
+        # Episode lookup used the parsed season/episode from resolve_path()
+        args, kwargs = mock_episode.call_args
+        self.assertEqual(args[1], 1)  # season_number
+        self.assertEqual(args[2], 1)  # episode_number
+
+    @patch("torboxed._resolve_direct_url")
+    @patch("torboxed.get_video_file_for_episode")
+    @patch("torboxed.get_torrent_files")
+    @patch("torboxed.resolve_debrid_id_for_path")
+    def test_head_episode_path_behaves_identically(self, mock_db_info, mock_files,
+                                                   mock_episode, mock_url):
+        """HEAD on an episode path also gets the 302 (no 0-byte 200 response)."""
+        mock_db_info.return_value = {"debrid_id": "deb-ep-1", "debrid_service": "torbox"}
+        mock_files.return_value = [{"file_id": "f1", "is_video": True}]
+        mock_episode.return_value = {"file_id": "ep-file-7", "is_video": True}
+        mock_url.return_value = self.CDN_URL
+
+        with self._patch_env():
+            self.middleware(self._environ(method="HEAD"), self._start_response)
+
+        status, headers = self.start_calls[0]
+        self.assertEqual(status, "302 Found")
+        self.assertIn(("Location", self.CDN_URL), headers)
+
+    def test_season_folder_still_resolves_as_directory(self):
+        """The fix must not change resolution of genuine 3-segment paths."""
+        result = self.torboxed.resolve_path("/TV Shows/Breaking Bad/Season 1/")
+        self.assertEqual(result["type"], "season_folder")
+        self.assertNotIn("episode_number", result)
 
 
 class TestTraktPagination(unittest.TestCase):
