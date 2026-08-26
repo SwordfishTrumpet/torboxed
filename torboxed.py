@@ -2067,6 +2067,19 @@ def store_torrent_files(debrid_id: str, debrid_service: str, files: List[Dict[st
     if not files:
         return
     
+    # Purge any stale __pending__ sentinel rows once real files arrive, so the
+    # cache no longer reads as "pending" (issue #16).
+    if any(str(f.get("id", "")) != PENDING_SENTINEL_ID for f in files):
+        try:
+            with get_db() as conn:
+                conn.execute(
+                    "DELETE FROM torrent_files WHERE debrid_id = ? AND file_id = ?",
+                    (str(debrid_id), PENDING_SENTINEL_ID),
+                )
+                conn.commit()
+        except sqlite3.Error as e:
+            logger.debug("Error purging pending sentinel for %s: %s", debrid_id, e)
+
     with get_db() as conn:
         for f in files:
             name = f.get("name", "")
@@ -7079,8 +7092,9 @@ def backfill_torrent_files(debrid_client: DebridClient) -> Tuple[int, int]:
         debrid_id = row["debrid_id"]
         debrid_service = row["debrid_service"] or "torbox"
         
-        # Skip if already cached
-        existing = get_torrent_files(debrid_id)
+        # Skip if already cached. A lone __pending__ sentinel row does not
+        # count as cached: retry the fetch so the real listing is stored (#16).
+        existing, _had_sentinel = strip_pending_sentinel(get_torrent_files(debrid_id))
         if existing:
             logger.debug("[%d/%d] Torrent %s already cached (%d files)", 
                         i + 1, len(rows), debrid_id, len(existing))
@@ -7526,6 +7540,24 @@ def _get_best_debrid_for_season(seasons: List[Dict[str, Any]], season_key: str,
     return best
 
 
+# Sentinel file_id written when a WebDAV-triggered listing fetch returned no
+# files yet (torrent still processing on the debrid side).
+PENDING_SENTINEL_ID = "__pending__"
+
+
+def strip_pending_sentinel(files: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], bool]:
+    """Separate __pending__ sentinel rows from real cached file rows.
+
+    Args:
+        files: Rows as returned by get_torrent_files()
+
+    Returns:
+        (files_without_sentinel, True if a sentinel row was present)
+    """
+    real = [f for f in files if f.get("file_id") != PENDING_SENTINEL_ID]
+    return real, len(real) != len(files)
+
+
 # Thread-safe inflight fetch deduplication for cache miss handling
 _inflight_fetches: Set[str] = set()
 _inflight_lock = threading.Lock()
@@ -7559,10 +7591,10 @@ def _fetch_and_cache_torrent_files(debrid_id: str, debrid_service: str) -> bool:
             else:
                 # Write sentinel to prevent repeated re-fetches
                 store_torrent_files(debrid_id, debrid_service, [{
-                    "name": "__pending__",
-                    "path": "__pending__",
+                    "name": PENDING_SENTINEL_ID,
+                    "path": PENDING_SENTINEL_ID,
                     "size": 0,
-                    "id": "__pending__",
+                    "id": PENDING_SENTINEL_ID,
                 }])
                 return False
         finally:
@@ -7834,8 +7866,10 @@ class RedirectMiddleware:
         debrid_id = str(db_info.get("debrid_id", ""))
         debrid_service = db_info.get("debrid_service", "torbox")
         
-        # Get cached files
-        files = get_torrent_files(debrid_id)
+        # Get cached files. A lone __pending__ sentinel row means an earlier
+        # fetch found no files yet (torrent still processing): treat it as a
+        # cache miss so the listing is retried instead of 404ing forever (#16).
+        files, _had_sentinel = strip_pending_sentinel(get_torrent_files(debrid_id))
         if not files:
             if not _fetch_and_cache_torrent_files(debrid_id, debrid_service):
                 start_response("503 Service Unavailable", [
@@ -7843,15 +7877,13 @@ class RedirectMiddleware:
                     ("Retry-After", "60"),
                 ])
                 return [b"Torrent file listing not cached. Try again later."]
-            files = get_torrent_files(debrid_id)
+            files, _ = strip_pending_sentinel(get_torrent_files(debrid_id))
             if not files:
                 start_response("503 Service Unavailable", [
                     ("Content-Type", "text/plain"),
+                    ("Retry-After", "60"),
                 ])
                 return [b"Failed to retrieve torrent file listing"]
-        
-        # Filter sentinel entries
-        files = [f for f in files if f.get("file_id") != "__pending__"]
         
         # Find the target file
         if is_subtitle:
