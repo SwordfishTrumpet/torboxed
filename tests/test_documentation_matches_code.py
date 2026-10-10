@@ -89,5 +89,16 @@ class TestAgentGuideClaims(unittest.TestCase):
         )
 
 
+class TestRollbackProcedureIsDocumented(unittest.TestCase):
+    """A release that breaks setup needs a written way back (issue #29)."""
+
+    def test_readme_names_the_rollback_steps(self):
+        text = (REPO_ROOT / "README.md").read_text()
+        self.assertIn("Rolling Back a Release", text)
+        self.assertIn("git revert", text)
+        self.assertIn("torboxed.py --test", text)
+        self.assertIn("data/torboxed.db", text)
+
+
 if __name__ == "__main__":
     unittest.main()

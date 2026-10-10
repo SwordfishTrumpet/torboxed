@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## 2026-10-10
+## Version 1.1.1 (2026-10-10, revision ca844e1)
 
 ### Fixed
 
@@ -26,7 +26,7 @@ All notable changes to this project are documented here.
 
 - Version bumped to 1.1.1.
 
-## 2026-08-26
+## Version 1.1.0 (2026-08-26, revision 4ae6fa7)
 
 ### Added
 - New `--sources` CLI flag to select which Trakt lists to sync, e.g.
