@@ -8042,6 +8042,11 @@ class TestTelegramTokenNotLogged(unittest.TestCase):
         import torboxed
         answers = iter(["y", self.TOKEN, self.CHAT_ID])
 
+        # The setup only prompts when a terminal is attached (issue #23), so the
+        # regression path under test needs one.
+        tty_stdin = Mock()
+        tty_stdin.isatty.return_value = True
+
         class _FakeNotifier:
             def is_configured(self):
                 return True
@@ -8052,7 +8057,8 @@ class TestTelegramTokenNotLogged(unittest.TestCase):
             def close(self):
                 pass
 
-        with patch("builtins.input", side_effect=answers), \
+        with patch.object(sys, "stdin", tty_stdin), \
+             patch("builtins.input", side_effect=answers), \
              patch.object(torboxed, "TelegramNotifier", return_value=_FakeNotifier()):
             with self.assertLogs("torboxed", level="INFO") as captured:
                 torboxed._setup_telegram_interactive()

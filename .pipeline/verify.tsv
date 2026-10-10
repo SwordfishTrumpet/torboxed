@@ -1,0 +1,4 @@
+# Registered reproductions for closed fixes, re-run by verify.sh against the default branch.
+# Format: issue<TAB>command<TAB>expected-exit<TAB>area
+22	uv run --extra webdav python -m pytest tests/test_webdav_startup.py -q	0	correctness
+23	uv run python -m pytest tests/test_noninteractive_prompts.py -q	0	correctness
