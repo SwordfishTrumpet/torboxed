@@ -2,7 +2,7 @@
 
 **Your Trakt Watchlist, Automatically in Your Debrid Service**
 
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 
@@ -448,7 +448,7 @@ TorBoxed uses a cascading search strategy:
 5. **SQLite Database** - tracks state for idempotency and upgrades
 
 **Requirements:**
-- Python 3.9+
+- Python 3.10+
 - `httpx` (HTTP client)
 - `guessit` (quality parsing)
 - Optional: `psycopg` for Zilean database support

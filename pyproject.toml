@@ -4,7 +4,7 @@ version = "1.1.1"
 description = "Sync Trakt.tv curated movies/shows to your debrid service (Torbox/Real Debrid) with intelligent quality-based auto-upgrades"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.24.0",
     "guessit>=3.7.0",

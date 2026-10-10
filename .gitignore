@@ -63,3 +63,7 @@ AGENTS.md
 
 # Docs directory
 docs/
+
+# Pipeline runtime state (never committed; see pipeline core rules)
+LEDGER.tsv
+.pipeline/evidence
