@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here.
 
+## 2026-10-10
+
+### Fixed
+
+- Setting up from a script or a container no longer stops with an error. `--init`,
+  `--cron-setup`, and the cleanup commands asked their questions by reading the keyboard
+  directly, so a run with no keyboard attached (the documented `docker run ... --init`, a
+  scheduled job, a shell pipeline) ended in an `EOFError` traceback. Each question now
+  falls back to a safe default when there is no terminal (cleanup cancels, cron and Telegram
+  setup skip), and the log records which default was used.
+- Running the test suite no longer writes fake errors into your real log file. Tests log to
+  a temporary file, so `torboxed.log` only holds what an actual run did.
+- `--test` now checks the debrid service you configured. It looked only for a Torbox key, so
+  a Real Debrid user always saw the environment check fail; it now looks for
+  `REAL_DEBRID_API_KEY` when `DEBRID_SERVICE=real_debrid`, and it reads settings from the
+  process environment as well as from the `.env` file.
+- Documentation corrected: the WebDAV section no longer mentions the removed
+  `WEBDAV_ENABLED` switch, and the security note now states that `/health` is the one path
+  that answers without credentials (media paths still require them).
+
+### Changed
+
+- Version bumped to 1.1.1.
+
 ## 2026-08-26
 
 ### Added
