@@ -1508,6 +1508,32 @@ def log_result(action: str, title: str, details: Dict[str, Any] = None):
         logger.info("[%s] %s", action.upper(), title)
 
 
+def prompt_or_default(prompt: str, default: str = "") -> str:
+    """Ask the user for one line of input, falling back to `default` without a terminal.
+
+    Interactive prompts used to call input() directly, so any non-interactive run
+    - the documented Docker --init, a cleanup command without --yes, a cron job -
+    died with an EOFError traceback instead of finishing (issue #23). When stdin is
+    not an interactive terminal the default is used and logged, so the command
+    cancels or skips safely instead of crashing.
+
+    Args:
+        prompt: Text shown to the user.
+        default: Answer used when no interactive terminal is attached.
+
+    Returns:
+        The line the user typed, or `default`.
+    """
+    if not sys.stdin.isatty():
+        logger.info("%sUsing default answer '%s' (no interactive terminal).", prompt, default)
+        return default
+    try:
+        return input(prompt)
+    except EOFError:
+        logger.info("No input available; using default answer '%s'.", default)
+        return default
+
+
 def get_torbox_key() -> Optional[str]:
     """Get Torbox API key (lazy-loaded)."""
     return get_env().get("TORBOX_API_KEY")
@@ -5082,7 +5108,7 @@ def cleanup_unmatched_torrents(force: bool = False) -> None:
     
     # Require confirmation unless --yes was passed
     if not force:
-        response = input("\nType 'REMOVE' to delete these torrents (or anything else to cancel): ")
+        response = prompt_or_default("\nType 'REMOVE' to delete these torrents (or anything else to cancel): ", "")
         if response.strip() != 'REMOVE':
             print("\nCancelled. No torrents were removed.")
             return
@@ -5332,7 +5358,7 @@ def cleanup_duplicate_torrents(force: bool = False) -> None:
 
     # Require confirmation unless --yes
     if not force:
-        response = input("\nType 'REMOVE' to delete these duplicate torrents: ")
+        response = prompt_or_default("\nType 'REMOVE' to delete these duplicate torrents: ", "")
         if response.strip() != 'REMOVE':
             print("\nCancelled. No torrents were removed.")
             return
@@ -6621,7 +6647,7 @@ def setup_cron():
     logger.info("")
     
     # Get user choice
-    choice = input("Enter choice [1/2/3]: ").strip() or "3"
+    choice = prompt_or_default("Enter choice [1/2/3]: ", "3").strip() or "3"
     
     if choice == "1":
         _setup_cron_crontab(cwd, uv_path)
@@ -6651,7 +6677,7 @@ def _setup_cron_crontab(cwd: Path, uv_path: str):
     logger.info("  5. Custom (you'll enter the cron expression)")
     logger.info("")
     
-    schedule_choice = input("Choose schedule [1/2/3/4/5]: ").strip() or "1"
+    schedule_choice = prompt_or_default("Choose schedule [1/2/3/4/5]: ", "1").strip() or "1"
     
     schedules = {
         "1": "0 2 * * *",
@@ -6664,7 +6690,7 @@ def _setup_cron_crontab(cwd: Path, uv_path: str):
         schedule = schedules[schedule_choice]
     elif schedule_choice == "5":
         # VULN-002: Validate custom cron expression to prevent injection
-        custom_schedule = input("Enter cron expression (e.g., '0 2 * * *'): ").strip()
+        custom_schedule = prompt_or_default("Enter cron expression (e.g., '0 2 * * *'): ", "").strip()
         if not custom_schedule:
             schedule = "0 2 * * *"
         elif not _validate_cron_expression(custom_schedule):
@@ -6699,7 +6725,7 @@ def _setup_cron_crontab(cwd: Path, uv_path: str):
     logger.info("  %s", cron_line)
     logger.info("")
     
-    confirm = input("Add this to crontab? [y/N]: ").strip().lower()
+    confirm = prompt_or_default("Add this to crontab? [y/N]: ", "n").strip().lower()
     
     if confirm == "y":
         try:
@@ -6714,7 +6740,7 @@ def _setup_cron_crontab(cwd: Path, uv_path: str):
             # Check if entry already exists
             if "torboxed.py" in current_crontab:
                 logger.warning("TorBoxed cron job already exists!")
-                replace = input("Replace existing? [y/N]: ").strip().lower()
+                replace = prompt_or_default("Replace existing? [y/N]: ", "n").strip().lower()
                 if replace != "y":
                     logger.info("Cancelled.")
                     return
@@ -6752,7 +6778,7 @@ def _setup_cron_crontab(cwd: Path, uv_path: str):
 
 def _setup_systemd_timer(cwd: Path, uv_path: str):
     """Show systemd timer setup instructions."""
-    service_name = input("Service name [torboxed]: ").strip() or "torboxed"
+    service_name = prompt_or_default("Service name [torboxed]: ", "torboxed").strip() or "torboxed"
     
     service_content = f"""[Unit]
 Description=TorBoxed Sync
@@ -6837,8 +6863,14 @@ def _setup_telegram_interactive():
     logger.info("2. Copy the bot token provided")
     logger.info("3. Message @userinfobot to get your Chat ID")
     logger.info("")
-    
-    choice = input("Set up Telegram notifications now? [y/N]: ").strip().lower()
+
+    if not sys.stdin.isatty():
+        logger.info("No interactive terminal attached; skipping optional Telegram setup.")
+        logger.info("Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to your .env later to enable it.")
+        logger.info("See README.md for manual configuration instructions.")
+        return
+
+    choice = prompt_or_default("Set up Telegram notifications now? [y/N]: ", "n").strip().lower()
     
     if choice != "y":
         logger.info("Skipping Telegram setup. You can add it later to your .env file.")
@@ -6846,13 +6878,13 @@ def _setup_telegram_interactive():
         return
     
     logger.info("")
-    bot_token = input("Enter your Telegram Bot Token: ").strip()
+    bot_token = prompt_or_default("Enter your Telegram Bot Token: ", "").strip()
     
     if not bot_token:
         logger.warning("No bot token provided. Skipping Telegram setup.")
         return
     
-    chat_id = input("Enter your Telegram Chat ID: ").strip()
+    chat_id = prompt_or_default("Enter your Telegram Chat ID: ", "").strip()
     
     if not chat_id:
         logger.warning("No chat ID provided. Skipping Telegram setup.")
@@ -6861,7 +6893,7 @@ def _setup_telegram_interactive():
     # Validate the token format (should be numbers:alphanumeric)
     if ":" not in bot_token or len(bot_token) < 20:
         logger.warning("Bot token format looks invalid. Expected format: 123456789:ABCdef...")
-        confirm = input("Continue anyway? [y/N]: ").strip().lower()
+        confirm = prompt_or_default("Continue anyway? [y/N]: ", "n").strip().lower()
         if confirm != "y":
             return
     
