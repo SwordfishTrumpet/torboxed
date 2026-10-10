@@ -1,7 +1,14 @@
 # TorBoxed Docker Image
 # Uses uv for Python package management
 
-FROM python:3.12-slim
+# Base image pinned by index digest so a rebuild produces the same image and a
+# retagged upstream image cannot run in this build. Version: python:3.12-slim
+# (index digest resolved 2026-08-26).
+#
+# To move it on purpose:
+#   docker buildx imagetools inspect python:3.12-slim
+# and replace the digest below with the new index digest.
+FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -10,7 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv
-RUN pip install --no-cache-dir uv
+# uv pinned to a fixed release: an unpinned install would silently change
+# resolution and venv behavior under the same image tag.
+RUN pip install --no-cache-dir uv==0.13.0
 
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash torboxed
