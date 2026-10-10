@@ -3,3 +3,4 @@
 22	uv run --extra webdav python -m pytest tests/test_webdav_startup.py -q	0	correctness
 23	uv run python -m pytest tests/test_noninteractive_prompts.py -q	0	correctness
 24	uv run python -m pytest tests/test_log_isolation.py -q	0	testing
+25	uv run python -m pytest tests/test_self_test_env.py -q	0	correctness

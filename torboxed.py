@@ -6420,7 +6420,7 @@ def run_self_test():
     
     This allows users to verify their setup before running actual syncs.
     Tests include:
-    1. Environment file validation
+    1. Environment settings (os.environ or .env, whichever the app uses)
     2. Database connectivity
     3. Dependencies check
     4. Configuration validation
@@ -6436,29 +6436,31 @@ def run_self_test():
     logger.info("TorBoxed Self-Test")
     logger.info("="*60)
     
-    # Test 1: Environment file
-    logger.info("\n[1/6] Checking environment file...")
-    if ENV_PATH.exists():
-        env = load_env()
-        has_torbox = bool(env.get("TORBOX_API_KEY"))
-        has_trakt_id = bool(env.get("TRAKT_CLIENT_ID"))
-        has_trakt_secret = bool(env.get("TRAKT_CLIENT_SECRET"))
-        
-        if has_torbox and has_trakt_id:
-            logger.info("  ✓ .env file exists with API keys")
-            results.append(("Environment file", True, "Found with API keys"))
-        else:
-            missing = []
-            if not has_torbox:
-                missing.append("TORBOX_API_KEY")
-            if not has_trakt_id:
-                missing.append("TRAKT_CLIENT_ID")
-            logger.warning("  ⚠ .env exists but missing: %s", ", ".join(missing))
-            results.append(("Environment file", False, f"Missing: {', '.join(missing)}"))
-            all_passed = False
+    # Test 1: Environment settings, read the same way the rest of the app reads them
+    # (issue #25: hand-reading .env treated Torbox as the only debrid service and
+    # ignored values supplied as real environment variables).
+    logger.info("\n[1/6] Checking environment settings...")
+    env = get_env()
+    debrid_service = get_debrid_service()
+    debrid_key_name = "REAL_DEBRID_API_KEY" if debrid_service == "real_debrid" else "TORBOX_API_KEY"
+    required_keys = (
+        debrid_key_name,
+        "TRAKT_CLIENT_ID",
+        "TRAKT_CLIENT_SECRET",
+    )
+    missing = [key for key in required_keys if not env.get(key)]
+
+    if not missing:
+        logger.info("  ✓ Environment configured for %s", debrid_service)
+        results.append(("Environment file", True, f"Configured for {debrid_service}"))
     else:
-        logger.error("  ✗ .env file not found")
-        results.append(("Environment file", False, "File not found"))
+        logger.error("  ✗ Environment missing: %s", ", ".join(missing))
+        if not ENV_PATH.exists():
+            logger.info(
+                "  No %s file found; settings may also come from the process environment.",
+                ENV_PATH,
+            )
+        results.append(("Environment file", False, f"Missing: {', '.join(missing)}"))
         all_passed = False
     
     # Test 2: Database
@@ -6595,7 +6597,7 @@ def run_self_test():
             logger.info("\nRecommendations:")
             if not any(r[0] == "Environment file" and r[1] for r in results):
                 logger.info("  • Create .env file: cat > .env << 'EOF'")
-                logger.info("      TORBOX_API_KEY=your_key_here")
+                logger.info("      %s=your_key_here", debrid_key_name)
                 logger.info("      TRAKT_CLIENT_ID=your_id_here")
                 logger.info("      TRAKT_CLIENT_SECRET=your_secret_here")
                 logger.info("      EOF")
