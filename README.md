@@ -352,6 +352,57 @@ docker run --rm -v $(pwd)/data:/data torboxed:latest --stats
 
 ---
 
+## ⏪ Rolling Back a Release
+
+If a new release breaks something, you can put the last good one back. Every release is a
+commit on `main` titled `Release: ...`, so each one has a name you can point at:
+
+| Released | Version | Name | What it changed |
+|---|---|---|---|
+| 2026-10-10 | 1.1.1 | `ca844e1` | First-run setup works without a keyboard, tests stay out of your log file, `--test` reads your debrid settings |
+| 2026-08-26 | 1.1.0 | `4ae6fa7` | `--sources` chooses which Trakt lists to sync |
+
+`CHANGELOG.md` names the same revisions, so you can look up the one you want there too.
+
+### Put the last release back
+
+1. See what shipped, newest first:
+   `git log --oneline --grep='Release:' origin/main`
+2. Undo one of them: `git revert ca844e1` (use the name from step 1). Git adds a new
+   commit that reverses that release. It never rewrites history, so nothing already on
+   GitHub is lost.
+3. Push the reversal: `git push origin main`.
+4. If you run Docker, rebuild the image: `docker compose up -d --build`.
+5. Check it: `uv run torboxed.py --test` (native) or
+   `docker compose run --rm torboxed --test` (Docker) should end with `All tests passed!`.
+
+If a step fails, nothing is half-done: the revert is a normal commit, so you can undo the
+undo with `git revert` again or `git reset --hard` before you push.
+
+### Your data is not in git
+
+Reverting the code never touches your database or your keys, and it never brings back data
+that a newer release already changed. Both live outside git:
+
+- the database at `data/torboxed.db` (Docker) or `torboxed.db` next to `torboxed.py`
+  (native);
+- your `.env` file next to `torboxed.py`, mounted as `data/.env` in the Docker setup.
+
+Before you run a new release for the first time, keep a copy of each:
+
+```bash
+cp data/torboxed.db data/torboxed.db.before-1.1.1
+cp .env .env.before-1.1.1
+```
+
+If the older version cannot read your database after a rollback, put the copy back:
+
+```bash
+cp data/torboxed.db.before-1.1.1 data/torboxed.db
+```
+
+---
+
 ## 🌐 WebDAV Server (NEW)
 
 TorBoxed now includes a built-in WebDAV server that exposes your synced content as a virtual filesystem. Compatible with Infuse and other WebDAV clients.

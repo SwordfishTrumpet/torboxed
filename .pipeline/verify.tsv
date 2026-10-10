@@ -6,3 +6,4 @@
 25	uv run python -m pytest tests/test_self_test_env.py -q	0	correctness
 26	uv run python -m pytest tests/test_documentation_matches_code.py -q	0	documentation
 30	uv run --frozen python -m pytest tests/test_dependency_floor.py -q	0	dependency
+29	uv run --frozen python -m pytest tests/test_documentation_matches_code.py -q	0	reliability
