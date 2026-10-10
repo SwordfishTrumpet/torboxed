@@ -379,7 +379,7 @@ uv run torboxed.py --serve
 
 ### Authentication & Security
 
-All requests — including the 302 media redirects — require HTTP Basic authentication when `WEBDAV_AUTH_USER` / `WEBDAV_AUTH_PASS` are set. The 302 redirect layer enforces the same credentials as the WebDAV app itself, so unauthenticated clients cannot obtain CDN links. Without credentials configured, the server refuses to start unless `WEBDAV_ALLOW_ANONYMOUS=true` is explicitly set (which disables all authentication).
+All media paths — including the 302 media redirects — require HTTP Basic authentication when `WEBDAV_AUTH_USER` / `WEBDAV_AUTH_PASS` are set. The one public path is `/health`, so a monitor can check that the server is alive without credentials. The 302 redirect layer enforces the same credentials as the WebDAV app itself, so unauthenticated clients cannot obtain CDN links. Without credentials configured, the server refuses to start unless `WEBDAV_ALLOW_ANONYMOUS=true` is explicitly set (which disables all authentication).
 
 ### Infuse Setup
 
@@ -393,8 +393,7 @@ All requests — including the 302 media redirects — require HTTP Basic authen
 Add to your `.env` file:
 
 ```bash
-# WebDAV Server (optional)
-WEBDAV_ENABLED=true
+# WebDAV Server (optional; start it with: uv run torboxed.py --serve)
 WEBDAV_HOST=0.0.0.0
 WEBDAV_PORT=8080
 WEBDAV_AUTH_USER=your_username
